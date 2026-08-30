@@ -11,6 +11,16 @@ import (
 	"strings"
 )
 
+// SymlinkError reports a module-owned Go source path that is a symbolic link.
+// Discovery fails closed rather than following a link that may escape the module.
+type SymlinkError struct {
+	Path string
+}
+
+func (e *SymlinkError) Error() string {
+	return "modfiles: module-owned Go file is a symbolic link: " + e.Path
+}
+
 // Files returns absolute paths to every module-owned Go source file below root.
 // Build constraints are deliberately ignored so tagged production files remain
 // visible to dependency and formatting checks.
@@ -38,14 +48,17 @@ func Files(root string) ([]string, error) {
 			}
 			return nil
 		}
-		if entry.IsDir() || ignoredFile(entry.Name()) {
+		if entry.IsDir() || ignoredFile(entry.Name()) || !strings.HasSuffix(entry.Name(), ".go") {
 			return nil
 		}
 		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
-		if info.Mode().IsRegular() && strings.HasSuffix(entry.Name(), ".go") {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return &SymlinkError{Path: path}
+		}
+		if info.Mode().IsRegular() {
 			files = append(files, path)
 		}
 		return nil

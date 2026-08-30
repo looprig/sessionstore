@@ -1,6 +1,7 @@
 package sessionstore_test
 
 import (
+	"errors"
 	"go/parser"
 	"go/token"
 	"os"
@@ -115,6 +116,25 @@ func TestProductionImportScanRemainsNonvacuous(t *testing.T) {
 	}
 	if productionFiles != 0 {
 		t.Fatalf("production files = %d, want 0", productionFiles)
+	}
+}
+
+func TestProductionImportScanRejectsGoSymlink(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	targetRoot := t.TempDir()
+	writeGoFixture(t, root, "go.mod", "module github.com/looprig/sessionstore\n")
+	writeGoFixture(t, targetRoot, "target.go", "package target\n")
+	link := filepath.Join(root, "linked.go")
+	if err := os.Symlink(filepath.Join(targetRoot, "target.go"), link); err != nil {
+		t.Fatalf("create Go file symlink: %v", err)
+	}
+
+	_, _, err := productionImportViolations(root)
+	var symlinkErr *modfiles.SymlinkError
+	if !errors.As(err, &symlinkErr) {
+		t.Fatalf("productionImportViolations() error = %v, want *modfiles.SymlinkError", err)
 	}
 }
 
