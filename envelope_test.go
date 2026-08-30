@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -108,6 +109,13 @@ func TestEnvelopeGoldenFrames(t *testing.T) {
 				t.Fatalf("DecodeEnvelope() error = %v", err)
 			}
 			assertEnvelopeEqual(t, decoded, tt.env)
+			reencoded, err := EncodeEnvelope(decoded)
+			if err != nil {
+				t.Fatalf("EncodeEnvelope(decoded) error = %v", err)
+			}
+			if !bytes.Equal(reencoded, want) {
+				t.Fatalf("accepted frame is not canonical:\n decoded/re-encoded %x\n want               %x", reencoded, want)
+			}
 		})
 	}
 }
@@ -281,6 +289,58 @@ func TestDecodeRejectsWireShapeViolations(t *testing.T) {
 			_, err := DecodeEnvelope(tt.input)
 			assertEnvelopeErrorCode(t, err, tt.code)
 		})
+	}
+}
+
+func TestDecodeRejectsEveryForbiddenKnownTagEvenWhenZero(t *testing.T) {
+	t.Parallel()
+
+	zeroValue := map[uint8][]byte{
+		tagIdentity:         {},
+		tagPublicInline:     {},
+		tagPublicReference:  {},
+		tagRuntimeInline:    {},
+		tagRuntimeReference: {},
+		tagLeaseEpoch:       make([]byte, 8),
+		tagRuntimeCommandID: make([]byte, 16),
+		tagCommandKind:      {},
+	}
+	baseFields := map[EnvelopeKind][]testWireField{
+		EnvelopeKindPublicEvent: {
+			{tagIdentity, []byte("event")},
+			{tagPublicInline, []byte(`{}`)},
+		},
+		EnvelopeKindRuntimeControl: {
+			{tagIdentity, []byte("record")},
+			{tagRuntimeInline, []byte("runtime")},
+		},
+		EnvelopeKindOpeningFence: {
+			{tagLeaseEpoch, []byte{0, 0, 0, 0, 0, 0, 0, 1}},
+		},
+		EnvelopeKindApplicationPrefix: {
+			{tagIdentity, []byte("command")},
+			{tagLeaseEpoch, []byte{0, 0, 0, 0, 0, 0, 0, 1}},
+			{tagRuntimeCommandID, bytes.Repeat([]byte{1}, 16)},
+			{tagCommandKind, []byte("input")},
+		},
+	}
+	forbidden := map[EnvelopeKind][]uint8{
+		EnvelopeKindPublicEvent:       {tagLeaseEpoch, tagRuntimeCommandID, tagCommandKind},
+		EnvelopeKindRuntimeControl:    {tagPublicInline, tagPublicReference, tagLeaseEpoch, tagRuntimeCommandID, tagCommandKind},
+		EnvelopeKindOpeningFence:      {tagIdentity, tagPublicInline, tagPublicReference, tagRuntimeInline, tagRuntimeReference, tagRuntimeCommandID, tagCommandKind},
+		EnvelopeKindApplicationPrefix: {tagPublicInline, tagPublicReference, tagRuntimeInline, tagRuntimeReference},
+	}
+
+	for kind, tags := range forbidden {
+		for _, tag := range tags {
+			name := fmt.Sprintf("kind_%d_tag_%d", kind, tag)
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				fields := insertTestWireField(baseFields[kind], testWireField{tag: tag, value: zeroValue[tag]})
+				_, err := DecodeEnvelope(testFrame(kind, fields...))
+				assertEnvelopeErrorCode(t, err, EnvelopeErrorField)
+			})
+		}
 	}
 }
 
@@ -527,4 +587,20 @@ func testFrame(kind EnvelopeKind, fields ...testWireField) []byte {
 		frame = append(frame, field.value...)
 	}
 	return frame
+}
+
+func insertTestWireField(fields []testWireField, extra testWireField) []testWireField {
+	result := make([]testWireField, 0, len(fields)+1)
+	inserted := false
+	for _, field := range fields {
+		if !inserted && extra.tag < field.tag {
+			result = append(result, extra)
+			inserted = true
+		}
+		result = append(result, field)
+	}
+	if !inserted {
+		result = append(result, extra)
+	}
+	return result
 }

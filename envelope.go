@@ -45,6 +45,19 @@ const (
 	tagCommandKind      uint8 = 8
 )
 
+type envelopeFieldSet uint8
+
+const (
+	fieldIdentity         envelopeFieldSet = 1 << (tagIdentity - 1)
+	fieldPublicInline     envelopeFieldSet = 1 << (tagPublicInline - 1)
+	fieldPublicReference  envelopeFieldSet = 1 << (tagPublicReference - 1)
+	fieldRuntimeInline    envelopeFieldSet = 1 << (tagRuntimeInline - 1)
+	fieldRuntimeReference envelopeFieldSet = 1 << (tagRuntimeReference - 1)
+	fieldLeaseEpoch       envelopeFieldSet = 1 << (tagLeaseEpoch - 1)
+	fieldRuntimeCommandID envelopeFieldSet = 1 << (tagRuntimeCommandID - 1)
+	fieldCommandKind      envelopeFieldSet = 1 << (tagCommandKind - 1)
+)
+
 const bodyReferenceAlgorithmSHA256 uint8 = 1
 
 // BodySlot is one independent inline or object-backed body. A nil Inline is
@@ -266,6 +279,7 @@ func DecodeEnvelope(frame []byte) (Envelope, error) {
 	env := Envelope{Kind: kind}
 	offset := envelopeHeaderBytes
 	previousTag := uint8(0)
+	var fieldsSeen envelopeFieldSet
 	for i := 0; i < fieldCount; i++ {
 		if len(frame)-offset < 5 {
 			return Envelope{}, envelopeError(EnvelopeErrorLength, "field", nil)
@@ -289,6 +303,11 @@ func DecodeEnvelope(frame []byte) (Envelope, error) {
 		}
 		value := frame[offset : offset+length]
 		offset += length
+		field := envelopeFieldSet(1 << (tag - 1))
+		fieldsSeen |= field
+		if field&allowedEnvelopeFields(kind) == 0 {
+			continue
+		}
 		if err := decodeField(&env, tag, value); err != nil {
 			return Envelope{}, err
 		}
@@ -299,10 +318,83 @@ func DecodeEnvelope(frame []byte) (Envelope, error) {
 	if offset > len(frame) {
 		return Envelope{}, envelopeError(EnvelopeErrorLength, "fields", nil)
 	}
+	if err := validateDecodedFields(kind, fieldsSeen); err != nil {
+		return Envelope{}, err
+	}
 	if err := validateEnvelope(env); err != nil {
 		return Envelope{}, err
 	}
 	return env, nil
+}
+
+func allowedEnvelopeFields(kind EnvelopeKind) envelopeFieldSet {
+	switch kind {
+	case EnvelopeKindPublicEvent:
+		return fieldIdentity | fieldPublicInline | fieldPublicReference | fieldRuntimeInline | fieldRuntimeReference
+	case EnvelopeKindRuntimeControl:
+		return fieldIdentity | fieldRuntimeInline | fieldRuntimeReference
+	case EnvelopeKindOpeningFence:
+		return fieldLeaseEpoch
+	case EnvelopeKindApplicationPrefix:
+		return fieldIdentity | fieldLeaseEpoch | fieldRuntimeCommandID | fieldCommandKind
+	default:
+		return 0
+	}
+}
+
+func validateDecodedFields(kind EnvelopeKind, fields envelopeFieldSet) error {
+	if fields&^allowedEnvelopeFields(kind) != 0 {
+		return envelopeError(EnvelopeErrorField, "record_shape", nil)
+	}
+	require := func(field envelopeFieldSet, tag uint8) error {
+		if fields&field == 0 {
+			return envelopeError(EnvelopeErrorMissing, fieldName(tag), nil)
+		}
+		return nil
+	}
+	exactlyOne := func(first, second envelopeFieldSet, name string, required bool) error {
+		present := fields & (first | second)
+		if present == first|second {
+			return envelopeError(EnvelopeErrorField, name, nil)
+		}
+		if required && present == 0 {
+			return envelopeError(EnvelopeErrorMissing, name, nil)
+		}
+		return nil
+	}
+
+	switch kind {
+	case EnvelopeKindPublicEvent:
+		if err := require(fieldIdentity, tagIdentity); err != nil {
+			return err
+		}
+		if err := exactlyOne(fieldPublicInline, fieldPublicReference, "public_body", true); err != nil {
+			return err
+		}
+		return exactlyOne(fieldRuntimeInline, fieldRuntimeReference, "runtime_body", false)
+	case EnvelopeKindRuntimeControl:
+		if err := require(fieldIdentity, tagIdentity); err != nil {
+			return err
+		}
+		return exactlyOne(fieldRuntimeInline, fieldRuntimeReference, "runtime_body", true)
+	case EnvelopeKindOpeningFence:
+		return require(fieldLeaseEpoch, tagLeaseEpoch)
+	case EnvelopeKindApplicationPrefix:
+		for _, required := range []struct {
+			field envelopeFieldSet
+			tag   uint8
+		}{
+			{fieldIdentity, tagIdentity},
+			{fieldLeaseEpoch, tagLeaseEpoch},
+			{fieldRuntimeCommandID, tagRuntimeCommandID},
+			{fieldCommandKind, tagCommandKind},
+		} {
+			if err := require(required.field, required.tag); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func decodeField(env *Envelope, tag uint8, value []byte) error {
