@@ -89,3 +89,55 @@ type InvalidBackgroundWorkError struct{}
 func (*InvalidBackgroundWorkError) Error() string {
 	return "sessionstore: background work function is nil"
 }
+
+// ObjectErrorCode classifies redacted object operation failures.
+//
+// Digest and Integrity are deliberately distinct: Digest means the caller's own
+// metadata is self-inconsistent (its Digest field disagrees with the digest
+// inside its ObjectID), while Integrity means bytes or a stored key did not
+// match what the object identity promised.
+type ObjectErrorCode string
+
+const (
+	ObjectErrorInvalid   ObjectErrorCode = "invalid"
+	ObjectErrorSize      ObjectErrorCode = "size"
+	ObjectErrorDigest    ObjectErrorCode = "digest"
+	ObjectErrorSource    ObjectErrorCode = "source"
+	ObjectErrorBackend   ObjectErrorCode = "backend"
+	ObjectErrorConflict  ObjectErrorCode = "conflict"
+	ObjectErrorIntegrity ObjectErrorCode = "integrity"
+	ObjectErrorCanceled  ObjectErrorCode = "canceled"
+)
+
+// ObjectError is a typed, redacted object operation failure. Field names the
+// offending input or stage and never carries a provider path, key, or payload.
+//
+// Terminating an object stream can produce more than one failure at once — the
+// cause that ended the stream, a read error observed by a racing reader, and a
+// provider Close error — and those are reported as an errors.Join tree, so a
+// returned error may contain several *ObjectError values. The FIRST one found
+// by errors.As is the primary classification: it is the failure that caused
+// termination, and later ones are subsidiary consequences of it. A caller that
+// genuinely needs every code can walk the tree itself through the
+// `Unwrap() []error` that errors.Join returns; the package deliberately does
+// not export a set extractor, because classifying on the primary cause is the
+// supported contract and an exported extractor would freeze the join shape.
+type ObjectError struct {
+	Code  ObjectErrorCode
+	Field string
+	Cause error
+}
+
+func (e *ObjectError) Error() string {
+	message := "sessionstore: object " + string(e.Code)
+	if e.Field != "" {
+		message += " (" + e.Field + ")"
+	}
+	return message
+}
+
+func (e *ObjectError) Unwrap() error { return e.Cause }
+
+func objectErr(code ObjectErrorCode, field string, cause error) error {
+	return &ObjectError{Code: code, Field: field, Cause: cause}
+}

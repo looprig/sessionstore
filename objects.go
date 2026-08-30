@@ -69,39 +69,6 @@ type GetObjectRequest struct {
 	Metadata     sessionwire.ObjectMetadata
 }
 
-// ObjectErrorCode classifies redacted object operation failures.
-type ObjectErrorCode string
-
-const (
-	ObjectErrorInvalid   ObjectErrorCode = "invalid"
-	ObjectErrorSize      ObjectErrorCode = "size"
-	ObjectErrorDigest    ObjectErrorCode = "digest"
-	ObjectErrorSource    ObjectErrorCode = "source"
-	ObjectErrorBackend   ObjectErrorCode = "backend"
-	ObjectErrorConflict  ObjectErrorCode = "conflict"
-	ObjectErrorIntegrity ObjectErrorCode = "integrity"
-	ObjectErrorCanceled  ObjectErrorCode = "canceled"
-)
-
-// ObjectError is a typed, redacted object operation failure.
-type ObjectError struct {
-	Code  ObjectErrorCode
-	Field string
-	Cause error
-}
-
-func (e *ObjectError) Error() string {
-	message := "sessionstore: object " + string(e.Code)
-	if e.Field != "" {
-		message += " (" + e.Field + ")"
-	}
-	return message
-}
-func (e *ObjectError) Unwrap() error { return e.Cause }
-func objectErr(code ObjectErrorCode, field string, cause error) error {
-	return &ObjectError{Code: code, Field: field, Cause: cause}
-}
-
 // objectEntropy is the process-wide source of object generation randomness. It
 // is a variable only so tests can substitute a faulting source; production code
 // never rebinds it and the package exposes no way to inject one.
@@ -515,7 +482,7 @@ func (v *exactVerifier) finishRead(n int, err error) (int, error) {
 			return n, v.failure
 		}
 		if !equalBytes(v.hash.Sum(nil), v.digest[:]) {
-			v.failure = objectErr(ObjectErrorDigest, "stream", nil)
+			v.failure = objectErr(ObjectErrorIntegrity, "stream", nil)
 			return n, v.failure
 		}
 		v.verified = true

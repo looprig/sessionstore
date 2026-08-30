@@ -235,7 +235,7 @@ func TestPutObjectRequiresProviderDrainAndPostVerify(t *testing.T) {
 			corrupt := append([]byte(nil), body...)
 			corrupt[0] ^= 1
 			return io.NopCloser(bytes.NewReader(corrupt)), nil
-		}, wantCode: ObjectErrorDigest},
+		}, wantCode: ObjectErrorIntegrity},
 		{name: "persisted close failure", put: drainPut, get: func(string) (io.ReadCloser, error) {
 			return &errorCloseReader{Reader: bytes.NewReader(body)}, nil
 		}, wantCode: ObjectErrorBackend},
