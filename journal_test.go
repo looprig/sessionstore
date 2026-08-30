@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
@@ -688,8 +689,10 @@ func TestAppendRefusesAfterLeaseLost(t *testing.T) {
 
 	_, err := writer.Append(context.Background(), publicEvent("event-1", `{"n":1}`))
 	requireJournalCode(t, err, JournalErrorLeaseLost)
-	// The failure latches: a lease that somehow looked live again cannot revive
-	// a writer that already lost ownership.
+	// A second append reports the same loss. This test does NOT distinguish the
+	// latch from a fresh lease check — the released lease stays lost, so both
+	// would fail here. TestLeaseLostWriterStaysFailedWhenTheLeaseLooksLiveAgain
+	// is what separates them.
 	_, err = writer.Append(context.Background(), publicEvent("event-2", `{"n":2}`))
 	requireJournalCode(t, err, JournalErrorLeaseLost)
 	if records := readLedger(t, backend, journalName(t, store)); len(records) != 1 {
@@ -1043,7 +1046,7 @@ func requireConcurrentFailure(t *testing.T, err error) {
 		return
 	}
 	switch journalErr.Code {
-	case JournalErrorFenced, JournalErrorUnknown, JournalErrorLeaseLost, JournalErrorFailed:
+	case JournalErrorFenced, JournalErrorUnknown, JournalErrorLeaseLost:
 	default:
 		t.Errorf("concurrent failure code = %q, want a terminal ownership failure", journalErr.Code)
 	}
@@ -1184,6 +1187,211 @@ func TestAppendRejectsPublicBodyAboveTheInlineCeiling(t *testing.T) {
 	}
 	if got := log.count("blob_put"); got != 0 {
 		t.Fatalf("uploaded %d objects for a rejected body, want 0", got)
+	}
+	if records := readLedger(t, backend, journalName(t, store)); len(records) != 1 {
+		t.Fatalf("ledger = %d records, want only the fence", len(records))
+	}
+}
+
+// TestOpenJournalRacesStoreClose covers the registration handshake between a
+// writer's shutdown hook and the shutdown that may already be in flight.
+// context.AfterFunc runs its callback in a NEW goroutine immediately when the
+// context is already done, so the callback can reach the writer's own fields
+// before the constructor has finished publishing them.
+//
+// The assertion is the race detector plus a bounded, error-free second Close:
+// every admission a successful or failed open took must have been handed back,
+// or shutdown would never drain.
+func TestOpenJournalRacesStoreClose(t *testing.T) {
+	for iteration := 0; iteration < 100; iteration++ {
+		backend := memstore.New()
+		backend.Leaser = newPermissiveLeaser()
+		store, err := Open(context.Background(), backend)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		for w := 0; w < 4; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				writer, err := store.OpenJournal(context.Background(), OpenJournalRequest{TenantID: testTenant, SessionID: testSession})
+				if err != nil {
+					requireShutdownRaceFailure(t, err)
+					return
+				}
+				_ = writer.Close(context.Background())
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = store.Close(closeCtx)
+		}()
+		wg.Wait()
+
+		drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := store.Close(drainCtx); err != nil {
+			cancel()
+			t.Fatalf("iteration %d: shutdown did not drain: %v", iteration, err)
+		}
+		cancel()
+	}
+}
+
+// requireShutdownRaceFailure accepts the outcomes an open may legitimately have
+// while the Store is shutting down underneath it: refused admission, or an
+// operation whose context was canceled mid-flight.
+func requireShutdownRaceFailure(t *testing.T, err error) {
+	t.Helper()
+	if errors.As(err, new(*StoreClosedError)) {
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	// Concurrent grants legitimately fence or refuse one another too; the test
+	// asserts the handshake, not which opener wins.
+	var journalError *JournalError
+	if errors.As(err, &journalError) {
+		switch journalError.Code {
+		case JournalErrorBackend, JournalErrorFenced, JournalErrorUnknown, JournalErrorLeaseHeld:
+			return
+		}
+	}
+	t.Errorf("open during shutdown failed with %T %v, want a typed shutdown outcome", err, err)
+}
+
+// revivableLease is a grant whose ownership can be lost and then made to look
+// live again. Real leases never do that, but it is the only way to observe the
+// difference between a writer that re-checks its lease on every append and one
+// that has permanently latched an ownership loss.
+type revivableLease struct {
+	epoch uint64
+
+	mu   sync.Mutex
+	lost chan struct{}
+}
+
+func newRevivableLease(epoch uint64) *revivableLease {
+	return &revivableLease{epoch: epoch, lost: make(chan struct{})}
+}
+
+func (l *revivableLease) Epoch() uint64 { return l.epoch }
+
+func (l *revivableLease) Lost() <-chan struct{} {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lost
+}
+
+func (l *revivableLease) Release(context.Context) error {
+	l.lose()
+	return nil
+}
+
+func (l *revivableLease) lose() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	select {
+	case <-l.lost:
+	default:
+		close(l.lost)
+	}
+}
+
+// revive hands out a fresh, open loss channel, so a writer that consults its
+// lease again sees ownership restored.
+func (l *revivableLease) revive() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lost = make(chan struct{})
+}
+
+// staticLeaser always grants the same lease.
+type staticLeaser struct{ lease storage.Lease }
+
+func (l staticLeaser) Acquire(_ context.Context, name string) (storage.Lease, error) {
+	if err := storage.ValidateName(name); err != nil {
+		return nil, err
+	}
+	return l.lease, nil
+}
+
+// TestFencedWriterStopsTouchingTheProvider pins the latch's observable effect
+// rather than merely its error code. The CAS alone would re-fail a second
+// append, so a test that only checks the code cannot tell a latched writer from
+// an unlatched one. What separates them is what reaches the provider: a writer
+// that has not latched re-runs the whole append path, uploading a fresh
+// overflow object nobody will ever reference.
+func TestFencedWriterStopsTouchingTheProvider(t *testing.T) {
+	backend := memstore.New()
+	log := &callLog{}
+	blobs := &loggingBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}, log: log}
+	backend.Blobs = blobs
+	backend.Ledger = &scriptedLedger{Ledger: backend.Ledger, log: log}
+	backend.Leaser = newPermissiveLeaser()
+	store := openJournalStore(t, backend)
+	store.overflowThreshold = 16
+
+	stale := openTestJournal(t, store)
+	openTestJournal(t, store) // the successor fence spends the stale writer's tip
+
+	_, err := stale.Append(context.Background(), publicEvent("stale-1", `{"n":1}`))
+	requireJournalCode(t, err, JournalErrorFenced)
+	before := log.snapshot()
+
+	oversized := publicEvent("stale-2", `{"body":"`+strings.Repeat("x", 128)+`"}`)
+	_, err = stale.Append(context.Background(), oversized)
+	requireJournalCode(t, err, JournalErrorFenced)
+
+	after := log.snapshot()
+	if strings.Join(after, ",") != strings.Join(before, ",") {
+		t.Fatalf("fenced writer performed provider I/O %v after losing the stream", after[len(before):])
+	}
+	scope, err := store.deriveSessionScope(testTenant, testSession)
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	keys, err := backend.Blobs.List(context.Background(), scope.BlobPrefix)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("fenced writer uploaded %d unreferenced objects: %v", len(keys), keys)
+	}
+}
+
+// TestLeaseLostWriterStaysFailedWhenTheLeaseLooksLiveAgain is the counterpart
+// for the ownership guard. Without the latch the writer would consult the lease
+// afresh, find it live, and resume appending onto a stream it no longer owns.
+func TestLeaseLostWriterStaysFailedWhenTheLeaseLooksLiveAgain(t *testing.T) {
+	backend := memstore.New()
+	log := &callLog{}
+	blobs := &loggingBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}, log: log}
+	backend.Blobs = blobs
+	backend.Ledger = &scriptedLedger{Ledger: backend.Ledger, log: log}
+	lease := newRevivableLease(4)
+	backend.Leaser = staticLeaser{lease: lease}
+	store := openJournalStore(t, backend)
+	store.overflowThreshold = 16
+	writer := openTestJournal(t, store)
+
+	lease.lose()
+	_, err := writer.Append(context.Background(), publicEvent("event-1", `{"n":1}`))
+	requireJournalCode(t, err, JournalErrorLeaseLost)
+	before := log.snapshot()
+
+	lease.revive()
+	oversized := publicEvent("event-2", `{"body":"`+strings.Repeat("y", 128)+`"}`)
+	_, err = writer.Append(context.Background(), oversized)
+	requireJournalCode(t, err, JournalErrorLeaseLost)
+
+	if after := log.snapshot(); strings.Join(after, ",") != strings.Join(before, ",") {
+		t.Fatalf("writer resumed provider I/O %v after ownership was lost", after[len(before):])
 	}
 	if records := readLedger(t, backend, journalName(t, store)); len(records) != 1 {
 		t.Fatalf("ledger = %d records, want only the fence", len(records))

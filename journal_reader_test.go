@@ -16,6 +16,7 @@ import (
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
 
@@ -284,8 +285,10 @@ func TestPublicPageFailsClosedOnMissingOverflowObject(t *testing.T) {
 	if err := backend.Blobs.Delete(context.Background(), keys[0]); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	if _, err := store.ReadPublicJournal(context.Background(), ReadPublicJournalRequest{TenantID: testTenant, SessionID: testSession}); err == nil {
-		t.Fatal("ReadPublicJournal succeeded with a dangling public reference")
+	_, err = store.ReadPublicJournal(context.Background(), ReadPublicJournalRequest{TenantID: testTenant, SessionID: testSession})
+	var objectError *ObjectError
+	if !errors.As(err, &objectError) || objectError.Code != ObjectErrorBackend {
+		t.Fatalf("error = %T %v, want a typed object backend failure", err, err)
 	}
 }
 
@@ -399,6 +402,9 @@ func TestPublicPageCursorRejectsForgedTokens(t *testing.T) {
 			}
 		})},
 		{name: "inflated captured tip", cursor: mutate(func(b []byte) { b[len(b)-8] = 0xff })},
+		// A start beyond one past the snapshot's end: every other field is
+		// intact, so only the span check rejects it.
+		{name: "start beyond the snapshot", cursor: mutate(func(b []byte) { b[len(b)-9] = 100 })},
 		{name: "trailing byte", cursor: sessionwire.Cursor(base64.RawURLEncoding.EncodeToString(append(append([]byte(nil), valid...), 0)))},
 		// Unpadded base64's final character carries slack bits that the decoder
 		// discards, so this string decodes to the SAME token as the valid
@@ -535,7 +541,9 @@ func TestJournalReadsRejectInvalidLimit(t *testing.T) {
 	store := openJournalStore(t, backend)
 	mixedSession(t, store)
 
-	for _, limit := range []int{-1, 1_000_001} {
+	// The upper case is the exact first rejected value, so a gate weakened to
+	// any multiple of the ceiling still fails this test.
+	for _, limit := range []int{-1, storage.MaxOrderedPageLimit + 1} {
 		t.Run(fmt.Sprint(limit), func(t *testing.T) {
 			_, err := store.ReadPublicJournal(context.Background(), ReadPublicJournalRequest{
 				TenantID: testTenant, SessionID: testSession, Limit: limit,
@@ -744,4 +752,78 @@ func noncanonicalTail(cursor string) string {
 	// significant bits and four slack bits. Flipping the lowest slack bit
 	// leaves the decoded bytes unchanged.
 	return string(alphabet[index^1])
+}
+
+// TestResolvePublicBodyRejectsAnAbsentSlot exercises the helper's precondition
+// directly. The public read path cannot present this slot — the envelope
+// decoder rejects a public event that carries neither body half — so the guard
+// is only reachable from here, and this is what stops it from being dead code
+// that merely looks load-bearing.
+func TestResolvePublicBodyRejectsAnAbsentSlot(t *testing.T) {
+	backend := memstore.New()
+	blobs := &loggingBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}}
+	backend.Blobs = blobs
+	store := openJournalStore(t, backend)
+	mixedSession(t, store)
+
+	body, err := store.resolvePublicBody(context.Background(), testTenant, testSession, BodySlot{})
+	if body != nil {
+		t.Fatalf("body = %q, want none", body)
+	}
+	journalError := requireJournalCode(t, err, JournalErrorIntegrity)
+	if journalError.Field != "public_body" {
+		t.Fatalf("Field = %q, want public_body", journalError.Field)
+	}
+	if got := blobs.getCount(); got != 0 {
+		t.Fatalf("opened %d object streams for an absent slot, want 0", got)
+	}
+
+	// The decoder really does refuse the record that would reach it, which is
+	// why the guard above is the helper's precondition and not a second copy of
+	// the envelope rule.
+	if _, err := EncodeEnvelope(Envelope{Kind: EnvelopeKindPublicEvent, EventID: "event-1"}); err == nil {
+		t.Fatal("EncodeEnvelope accepted a public event with no body")
+	}
+}
+
+// TestJournalReadsFailClosedOnACorruptStoredFrame covers the other integrity
+// path: a ledger record this package did not write, or one that has been
+// damaged in place, must stop the walk rather than be skipped or zero-valued.
+func TestJournalReadsFailClosedOnACorruptStoredFrame(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "foreign bytes", frame: []byte("not an envelope at all")},
+		{name: "empty record", frame: nil},
+		{name: "truncated header", frame: []byte("LRJE")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := memstore.New()
+			store := openJournalStore(t, backend)
+			writer := openTestJournal(t, store)
+			appendOrFail(t, writer, publicEvent("event-1", `{"n":1}`))
+			name := journalName(t, store)
+			if err := backend.Ledger.Append(context.Background(), name, 2, tt.frame); err != nil {
+				t.Fatalf("Append: %v", err)
+			}
+
+			_, err := store.ReadPublicJournal(context.Background(), ReadPublicJournalRequest{
+				TenantID: testTenant, SessionID: testSession,
+			})
+			publicError := requireJournalCode(t, err, JournalErrorIntegrity)
+			if publicError.Field != "record" {
+				t.Fatalf("Field = %q, want record", publicError.Field)
+			}
+			var envelopeError *EnvelopeError
+			if !errors.As(err, &envelopeError) {
+				t.Fatalf("cause = %v, want a wrapped *EnvelopeError", err)
+			}
+			_, err = store.ReadRuntimeJournal(context.Background(), ReadRuntimeJournalRequest{
+				TenantID: testTenant, SessionID: testSession,
+			})
+			requireJournalCode(t, err, JournalErrorIntegrity)
+		})
+	}
 }

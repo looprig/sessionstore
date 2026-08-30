@@ -246,16 +246,14 @@ func (s *Store) GetObject(ctx context.Context, req GetObjectRequest) (io.ReadClo
 		underlying: reader,
 		release:    release,
 	}
-	stopCancel := context.AfterFunc(opCtx, func() {
-		result.beginTermination(objectErr(ObjectErrorCanceled, "stream", opCtx.Err()))
-	})
-	result.mu.Lock()
-	result.stopCancel = stopCancel
-	done := result.done
-	result.mu.Unlock()
-	if done {
-		stopCancel()
-	}
+	bindCancelHandle(opCtx,
+		func() { result.beginTermination(objectErr(ObjectErrorCanceled, "stream", opCtx.Err())) },
+		func(stop func() bool) bool {
+			result.mu.Lock()
+			defer result.mu.Unlock()
+			result.stopCancel = stop
+			return result.done
+		})
 	return result, nil
 }
 

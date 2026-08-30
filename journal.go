@@ -38,7 +38,6 @@ const (
 	JournalErrorLeaseLost JournalErrorCode = "lease_lost"
 	JournalErrorFenced    JournalErrorCode = "fenced"
 	JournalErrorUnknown   JournalErrorCode = "unknown"
-	JournalErrorFailed    JournalErrorCode = "failed"
 	JournalErrorClosed    JournalErrorCode = "closed"
 	JournalErrorBackend   JournalErrorCode = "backend"
 	JournalErrorIntegrity JournalErrorCode = "integrity"
@@ -182,10 +181,27 @@ func (s *Store) OpenJournal(ctx context.Context, req OpenJournalRequest) (*Journ
 		release: release,
 		tracked: tip + 1,
 	}
-	writer.stopShutdown = context.AfterFunc(lifeCtx, func() {
-		_ = writer.Close(context.Background())
-	})
+	if writer.bindShutdown(lifeCtx) {
+		// Shutdown closed this writer before its handle could be published, so
+		// the fence is durable but the grant is already handed back. Report the
+		// refusal rather than returning a writer that would refuse every append.
+		return nil, &StoreClosedError{}
+	}
 	return writer, nil
+}
+
+// bindShutdown wires Store shutdown to close this writer and reports whether
+// shutdown had already closed it while the handle was being published.
+func (w *JournalWriter) bindShutdown(lifeCtx context.Context) bool {
+	closed := false
+	bindCancelHandle(lifeCtx, func() { _ = w.Close(context.Background()) }, func(stop func() bool) bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.stopShutdown = stop
+		closed = w.closed
+		return closed
+	})
+	return closed
 }
 
 // Epoch returns the fencing epoch of this writer's lease grant.
@@ -340,6 +356,14 @@ func (w *JournalWriter) leaseHeld() bool {
 // comparing the contested record against the exact bytes this writer offered,
 // so a ConflictError here means a foreign record genuinely holds the sequence —
 // unrelated bytes are never adopted as this writer's own.
+//
+// Storage's documented caveat carries over (storage v0.6.0 appenddefinite.go):
+// two writers offering BYTE-IDENTICAL frames are indistinguishable to that
+// comparison. This package does not widen the exposure. An opening fence is
+// distinguished by its lease epoch, which the leaser makes strictly increasing
+// per grant, and every other record kind carries a caller-chosen identity; two
+// writers can collide only by offering the same identity and the same bytes,
+// which is the case where either outcome is equivalent anyway.
 func classifyAppendError(err error, field string) error {
 	var conflict *storage.ConflictError
 	if errors.As(err, &conflict) {
@@ -404,6 +428,24 @@ func (s *Store) journalOverflowThreshold() int {
 		threshold = MaxInlineBodyBytes
 	}
 	return threshold
+}
+
+// bindCancelHandle is the one cancellation-registration handshake in this
+// package. Both the object stream and the journal writer need it, and a second
+// subtly different copy of it is precisely the kind of restatement that hides a
+// race: context.AfterFunc runs hook in a NEW goroutine immediately when signal
+// is already done, so hook can reach the caller's fields before the returned
+// deregistration handle has been stored.
+//
+// publish therefore stores the handle under the same mutex hook contends for
+// and reports whether hook's effect has already happened. When it has, the
+// handle is released here rather than left registered for a hook that can no
+// longer do anything.
+func bindCancelHandle(signal context.Context, hook func(), publish func(stop func() bool) bool) {
+	stop := context.AfterFunc(signal, hook)
+	if publish(stop) {
+		stop()
+	}
 }
 
 // withCancelOn derives a context canceled by either caller or signal, and a

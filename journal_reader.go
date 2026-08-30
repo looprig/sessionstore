@@ -132,6 +132,14 @@ func (s *Store) resolvePublicBody(
 	if slot.Inline != nil {
 		return bytes.Clone(slot.Inline), nil
 	}
+	// A slot with neither half is not reachable through the read path:
+	// DecodeEnvelope runs validateDecodedFields, which requires a public event
+	// to carry exactly one of the two public slots, so every envelope this
+	// reader is handed already has one. The guard is a real precondition of
+	// this helper rather than dead weight — it is what stops a future envelope
+	// schema change from turning an absent body into a nil JSON document that
+	// only fails later, at the Core contract boundary — and it is exercised
+	// directly by TestResolvePublicBodyRejectsAnAbsentSlot.
 	if slot.Reference == nil {
 		return nil, journalErr(JournalErrorIntegrity, "public_body", nil)
 	}

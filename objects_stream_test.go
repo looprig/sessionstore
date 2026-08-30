@@ -702,3 +702,101 @@ func TestGetObjectRejectsProviderErrorWrappingEOF(t *testing.T) {
 		t.Fatalf("Close = %T %v, want a backend failure, not success on unverified data", closeErr, closeErr)
 	}
 }
+
+// gatedBlobs holds a Get inside the provider until the test releases it, so a
+// test can place Store shutdown at an exact point in GetObject rather than
+// hoping the scheduler lands it there.
+type gatedBlobs struct {
+	lifecycleBlobs
+	gate chan struct{}
+	// awaitCancel additionally holds the Get until the OPERATION context is
+	// cancelled. Store shutdown propagates to that context through its own
+	// context.AfterFunc goroutine, so releasing on the Store context alone
+	// still usually reaches the constructor with a live operation context.
+	awaitCancel atomic.Bool
+}
+
+func (b *gatedBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	<-b.gate
+	if b.awaitCancel.Load() {
+		<-ctx.Done()
+	}
+	return b.Blobs.Get(context.WithoutCancel(ctx), key)
+}
+
+// TestGetObjectRacesStoreClose guards the object stream's half of the shared
+// cancellation handshake (bindCancelHandle). GetObject registers a shutdown
+// hook that reaches into the reader it is still constructing, and
+// context.AfterFunc runs that hook in a NEW goroutine immediately when the
+// operation context is already done — so the hook's completeTermination can
+// read stopCancel before the constructor has published it.
+//
+// The window is placed deterministically: the provider Get is held open until
+// shutdown has demonstrably cancelled the Store context, so registration always
+// happens against an already-done context. Probabilistic scheduling does not
+// reach this reliably — an earlier version of this test looped a hundred times
+// without once exposing an unsynchronized publish.
+func TestGetObjectRacesStoreClose(t *testing.T) {
+	body := []byte("streamed during shutdown")
+	digest := sha256.Sum256(body)
+	backend := memstore.New()
+	gate := make(chan struct{})
+	backend.Blobs = &gatedBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}, gate: gate}
+	store, err := Open(context.Background(), backend)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	close(gate)
+	metadata, err := store.PutObject(context.Background(), PutObjectRequest{
+		TenantID: "tenant", SessionID: "session", Kind: ObjectKindArtifact,
+		SizeBytes: uint64(len(body)), SHA256: digest, Body: bytes.NewReader(body),
+	})
+	if err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	gate = make(chan struct{})
+	blobs := backend.Blobs.(*gatedBlobs)
+	blobs.gate = gate
+	blobs.awaitCancel.Store(true)
+	// Many readers are released into the window at once: the hook goroutine and
+	// the constructor that must publish its handle are only a few instructions
+	// apart, so a single reader almost always wins the assignment and hides the
+	// unsynchronized publish behind the mutex it takes next.
+	var wg sync.WaitGroup
+	for reader := 0; reader < 64; reader++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			stream, err := store.GetObject(context.Background(), GetObjectRequest{
+				TenantID: "tenant", SessionID: "session", ExpectedKind: ObjectKindArtifact, Metadata: metadata,
+			})
+			if err != nil {
+				return
+			}
+			_, _ = io.Copy(io.Discard, stream)
+			_ = stream.Close()
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = store.Close(closeCtx)
+	}()
+	// Close cancels the Store context before it waits for admitted work, so this
+	// returns while the reader is still parked inside the provider. The parked
+	// Get then waits for its own operation context, so the hook is always
+	// registered against an already-done context.
+	<-store.ctx.Done()
+	close(gate)
+	wg.Wait()
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := store.Close(drainCtx); err != nil {
+		t.Fatalf("shutdown did not drain: %v", err)
+	}
+}
