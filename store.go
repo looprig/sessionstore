@@ -29,9 +29,16 @@ type Store struct {
 	ioAdapter        *ioProviderAdapter
 	keys             keyspace
 	objectGeneration func() ([16]byte, error)
-	closeOnce        sync.Once
-	closeDone        chan struct{}
-	closeErr         error
+
+	// overflowThreshold and maxPageBytes are the journal's size policy. They
+	// are unexported and fixed at their documented defaults: there is no
+	// deployment knob for them yet, and tests set them directly rather than
+	// paying for megabyte fixtures.
+	overflowThreshold int
+	maxPageBytes      int
+	closeOnce         sync.Once
+	closeDone         chan struct{}
+	closeErr          error
 }
 
 // Open constructs a Store over a complete storage composite whose Blobs
@@ -77,18 +84,20 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 
 	ownedCtx, cancel := context.WithCancel(ctx)
 	return &Store{
-		backend:          backend,
-		limits:           cfg.limits,
-		clock:            cfg.clock,
-		logger:           cfg.logger,
-		shutdownTimeout:  cfg.shutdownTimeout,
-		ctx:              ownedCtx,
-		cancel:           cancel,
-		providerClose:    cfg.providerClose,
-		ioAdapter:        cfg.ioAdapter,
-		keys:             keys,
-		objectGeneration: randomObjectGeneration,
-		closeDone:        make(chan struct{}),
+		backend:           backend,
+		limits:            cfg.limits,
+		clock:             cfg.clock,
+		logger:            cfg.logger,
+		shutdownTimeout:   cfg.shutdownTimeout,
+		ctx:               ownedCtx,
+		cancel:            cancel,
+		providerClose:     cfg.providerClose,
+		ioAdapter:         cfg.ioAdapter,
+		keys:              keys,
+		objectGeneration:  randomObjectGeneration,
+		overflowThreshold: DefaultJournalOverflowThresholdBytes,
+		maxPageBytes:      DefaultJournalPageBytes,
+		closeDone:         make(chan struct{}),
 	}, nil
 }
 

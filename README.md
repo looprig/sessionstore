@@ -61,3 +61,46 @@ served as, another object. Reclaiming orphans is the store operator's
 responsibility, over the tenant- and session-scoped blob prefix; SessionStore's
 only enumeration path is internal and unexported, so no caller-facing garbage
 collector exists yet.
+
+## Journal ownership: no rebasing after a fence conflict
+
+`OpenJournal` acquires the session lease, reads the ledger tip exactly once, and
+appends an opening fence at precisely that tip stamped with the grant's epoch. If
+that CAS conflicts, the grant is spent: the lease is released and a typed
+`*JournalError` with code `fenced` is returned. The caller may acquire a fresh,
+strictly higher epoch and reopen.
+
+It deliberately does not refresh the tip and retry. A retry loop lets a writer
+reorder itself behind records it never observed, under an epoch that a
+predecessor may still believe it holds; failing the grant instead makes epoch
+order and ledger order agree.
+
+After a successful open the writer tracks only its own committed sequence and
+CASes every later append on it. It never re-reads the tip, so a successor's
+opening fence permanently fails it. An append whose outcome could not be
+resolved — an unresolved ambiguous ack, or a contested record that could not be
+read back — is equally terminal (code `unknown`): the writer latches the failure
+rather than rebasing onto whatever is now durable. A *definite* backend failure
+is not terminal, because it left the tracked tip untouched and the same record
+can simply be offered again.
+
+An over-threshold body is uploaded and verified as an immutable object before its
+reference is appended. If the append then fails, the verified object is left
+behind as an orphan for the same reason `PutObject` leaves one.
+
+## Public journal reads
+
+`ReadPublicJournal` returns only a public event's stored canonical public body
+and its Core metadata. Runtime control records, ownership fences, and application
+prefixes are withheld entirely: they contribute nothing to a page except an
+advance of `covered_through`, the authenticated watermark that lets a client
+close a sequence gap without learning the kind or bytes of what filled it. A
+public body held in an object is resolved through the ordinary verified object
+path; a private runtime object is never fetched by a public read.
+
+Page cursors are opaque and bound to the projection they were issued for, to the
+exact tenant and session, and to the tip captured by the first page — a runtime
+cursor cannot be replayed into a public read, a cursor cannot be moved between
+sessions, and an inflated captured tip cannot widen the snapshot a walk covers.
+`ReadRuntimeJournal` is the privileged counterpart and returns every record as
+stored, leaving object-backed bodies unresolved for the caller to fetch.

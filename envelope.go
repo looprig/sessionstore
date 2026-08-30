@@ -476,11 +476,8 @@ func validateEnvelope(env Envelope) error {
 		if !env.Public.present() {
 			return envelopeError(EnvelopeErrorMissing, "public_body", nil)
 		}
-		if env.Public.Inline != nil {
-			body := bytes.Clone(env.Public.Inline)
-			if err := (sessionwire.JournalEvent{EventID: env.EventID, JournalSeq: 1, Body: json.RawMessage(body)}).Validate(); err != nil {
-				return envelopeError(EnvelopeErrorInvalid, "public_inline", err)
-			}
+		if err := validatePublicBody(env.EventID, env.Public.Inline); err != nil {
+			return err
 		}
 		if env.RecordID != "" || env.CommandID != "" || !env.RuntimeCommandID.IsZero() || env.LeaseEpoch != 0 || env.CommandKind != "" {
 			return envelopeError(EnvelopeErrorField, "record_shape", nil)
@@ -527,6 +524,24 @@ func validateEnvelope(env Envelope) error {
 		if env.EventID != "" || env.RecordID != "" || env.Public.present() || env.Runtime.present() {
 			return envelopeError(EnvelopeErrorField, "record_shape", nil)
 		}
+	}
+	return nil
+}
+
+// validatePublicBody is the single canonical-public-body rule. Both the
+// envelope validator and the journal writer's pre-upload check call it, so a
+// body that is about to become an object reference is held to exactly the
+// same rule as one that stays inline; there is no second copy to drift.
+//
+// A nil body is absent, not invalid: only the record-shape rules decide
+// whether a public body is required.
+func validatePublicBody(eventID sessionwire.EventID, body []byte) error {
+	if body == nil {
+		return nil
+	}
+	event := sessionwire.JournalEvent{EventID: eventID, JournalSeq: 1, Body: json.RawMessage(bytes.Clone(body))}
+	if err := event.Validate(); err != nil {
+		return envelopeError(EnvelopeErrorInvalid, "public_inline", err)
 	}
 	return nil
 }
