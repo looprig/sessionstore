@@ -23,7 +23,11 @@ func FuzzParseObjectMetadata(f *testing.F) {
 			t.Fatalf("canonical seed rejected: %v", err)
 		}
 		if err == nil {
-			roundTrip := objectMetadataFor(parsed.kind, parsedGeneration(parsed.generation), parsed.size, parsed.digest, metadata.MediaType)
+			generation, decodeErr := decodeObjectGeneration(parsed.generation)
+			if decodeErr != nil {
+				t.Fatalf("accepted generation %q that does not decode: %v", parsed.generation, decodeErr)
+			}
+			roundTrip := objectMetadataFor(parsed.kind, generation, parsed.size, parsed.digest, metadata.MediaType)
 			if roundTrip != metadata {
 				t.Fatalf("accepted noncanonical metadata: got=%+v canonical=%+v", metadata, roundTrip)
 			}

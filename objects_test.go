@@ -379,6 +379,28 @@ func TestParseObjectMetadataRejectsNoncanonicalForms(t *testing.T) {
 			m.Digest = "sha256:" + p[3]
 		},
 		"digest mismatch": func(m *sessionwire.ObjectMetadata) { m.Digest = "sha256:" + strings.Repeat("0", 64) },
+		// The metadata Digest field stays canonical in these four, so only the
+		// canonicality of the ObjectID components themselves can reject them.
+		"uppercase digest inside object id only": func(m *sessionwire.ObjectMetadata) {
+			p := strings.Split(m.Reference.ObjectID, ":")
+			p[3] = strings.ToUpper(p[3])
+			m.Reference.ObjectID = strings.Join(p, ":")
+		},
+		"short digest": func(m *sessionwire.ObjectMetadata) {
+			p := strings.Split(m.Reference.ObjectID, ":")
+			p[3] = p[3][:62]
+			m.Reference.ObjectID = strings.Join(p, ":")
+		},
+		"short generation": func(m *sessionwire.ObjectMetadata) {
+			p := strings.Split(m.Reference.ObjectID, ":")
+			p[2] = p[2][:24]
+			m.Reference.ObjectID = strings.Join(p, ":")
+		},
+		"long generation": func(m *sessionwire.ObjectMetadata) {
+			p := strings.Split(m.Reference.ObjectID, ":")
+			p[2] += "vvvvvvvv"
+			m.Reference.ObjectID = strings.Join(p, ":")
+		},
 	}
 	for name, mutate := range mutations {
 		t.Run(name, func(t *testing.T) {
@@ -388,6 +410,63 @@ func TestParseObjectMetadataRejectsNoncanonicalForms(t *testing.T) {
 				t.Fatal("accepted")
 			}
 		})
+	}
+}
+
+// TestAdministrativeListRejectsNoncanonicalPhysicalKeys pins the parser side of
+// the key grammar: a listed key that the store could not have written must fail
+// closed instead of resolving to some reference.
+func TestAdministrativeListRejectsNoncanonicalPhysicalKeys(t *testing.T) {
+	var generationBytes [16]byte
+	for i := range generationBytes {
+		generationBytes[i] = 0xfe
+	}
+	reference := objectMetadata(ObjectKindArtifact, generationBytes, 1, sha256.Sum256([]byte("x")), "").Reference
+	parts := strings.Split(reference.ObjectID, ":")
+	generation, digest := parts[2], parts[3]
+	for name, suffix := range map[string]string{
+		"uppercase digest":     strings.ToUpper(digest) + "/" + generation,
+		"uppercase generation": digest + "/" + strings.ToUpper(generation),
+		"swapped components":   generation + "/" + digest,
+		"extra segment":        digest + "/" + generation + "/extra",
+		"missing generation":   digest,
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := memstore.New()
+			admin := &adminRecordingBlobs{Blobs: base.Blobs}
+			base.Blobs = admin
+			store, err := Open(context.Background(), base)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close(context.Background())
+			body := []byte("bind")
+			bodyDigest := sha256.Sum256(body)
+			if _, err := store.PutObject(context.Background(), PutObjectRequest{TenantID: "tenant", SessionID: "session", Kind: ObjectKindAttachment, SizeBytes: uint64(len(body)), SHA256: bodyDigest, Body: bytes.NewReader(body)}); err != nil {
+				t.Fatal(err)
+			}
+			admin.listFn = func(prefix string) []string { return []string{prefix + suffix} }
+			refs, err := store.listObjectReferences(context.Background(), "tenant", "session", ObjectKindArtifact)
+			var objErr *ObjectError
+			if refs != nil || !errors.As(err, &objErr) || objErr.Code != ObjectErrorIntegrity || objErr.Field != "list_key" {
+				t.Fatalf("refs=%+v err=%T %v, want integrity/list_key", refs, err, err)
+			}
+		})
+	}
+}
+
+// TestExactVerifierRejectsOverlongReaderCount covers the overflow arm of the
+// reader-count guard: a source claiming more bytes than the slice it was handed
+// must not be trusted, and none of those bytes may reach the caller.
+func TestExactVerifierRejectsOverlongReaderCount(t *testing.T) {
+	body := []byte("exact")
+	verifier := newExactVerifier(context.Background(), readerFunc(func(p []byte) (int, error) {
+		return len(p) + 1, nil
+	}), uint64(len(body)), sha256.Sum256(body))
+	n, err := verifier.Read(make([]byte, len(body)))
+	var objErr *ObjectError
+	if n != 0 || !errors.As(err, &objErr) || objErr.Code != ObjectErrorSource {
+		t.Fatalf("Read = %d, %T %v, want 0 and a source failure", n, err, err)
 	}
 }
 

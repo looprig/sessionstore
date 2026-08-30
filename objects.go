@@ -217,6 +217,91 @@ func (s *Store) GetObject(ctx context.Context, req GetObjectRequest) (io.ReadClo
 	return result, nil
 }
 
+// Object identity grammar, stated exactly once.
+//
+//	ObjectID = "v1:" kind ":" generation ":" digest
+//	blob key = <session blob prefix> "v1/" kind "/" digest "/" generation
+//
+// The generation is the 128-bit instance generation in padding-free base32hex
+// and the digest is the SHA-256 of the content in hex, both lowercase and both
+// canonical: parsing rejects any other spelling of the same bytes. The digest
+// precedes the generation in the physical key so that every instance of one
+// content digest is adjacent under a List prefix.
+const (
+	objectSchemeV1     = "v1"
+	objectDigestPrefix = "sha256:"
+)
+
+// objectGenerationEncoding is the one base32 alphabet generations are spelled
+// in; nothing else in the package may choose an encoding.
+var objectGenerationEncoding = base32.HexEncoding.WithPadding(base32.NoPadding)
+
+// errNoncanonicalObjectComponent reports an ObjectID component that decodes but
+// is not spelled the one canonical way.
+var errNoncanonicalObjectComponent = errors.New("sessionstore: noncanonical object component")
+
+func encodeObjectGeneration(generation [16]byte) string {
+	return strings.ToLower(objectGenerationEncoding.EncodeToString(generation[:]))
+}
+
+// decodeObjectGeneration is the inverse of encodeObjectGeneration and rejects
+// any noncanonical spelling, including uppercase and a wrong length.
+func decodeObjectGeneration(value string) ([16]byte, error) {
+	decoded, err := objectGenerationEncoding.DecodeString(strings.ToUpper(value))
+	if err != nil {
+		return [16]byte{}, err
+	}
+	// A wrong decoded length needs no separate check: copy leaves the
+	// remainder zero or truncates, and the canonical re-encode below then
+	// disagrees with the input.
+	var generation [16]byte
+	copy(generation[:], decoded)
+	if encodeObjectGeneration(generation) != value {
+		return [16]byte{}, errNoncanonicalObjectComponent
+	}
+	return generation, nil
+}
+
+// decodeObjectDigest rejects a noncanonical or all-zero content digest. An
+// all-zero digest is never minted, so accepting one would name a key the store
+// cannot have written.
+func decodeObjectDigest(value string) ([32]byte, error) {
+	var digest [32]byte
+	if _, err := hex.Decode(digest[:], []byte(value)); err != nil {
+		return [32]byte{}, err
+	}
+	if hex.EncodeToString(digest[:]) != value || digest == ([32]byte{}) {
+		return [32]byte{}, errNoncanonicalObjectComponent
+	}
+	return digest, nil
+}
+
+// objectIDFor states the ObjectID grammar; parseObjectReference is its inverse.
+func objectIDFor(kind ObjectKind, generation, digest string) sessionwire.ObjectReference {
+	return sessionwire.ObjectReference{ObjectID: objectSchemeV1 + ":" + string(kind) + ":" + generation + ":" + digest}
+}
+
+// objectKindPrefix is the List prefix holding every object of one kind in one
+// session.
+func objectKindPrefix(scope sessionScope, kind ObjectKind) string {
+	return scope.BlobPrefix + objectSchemeV1 + "/" + string(kind) + "/"
+}
+
+// objectKeySuffix and splitObjectKeySuffix are inverses and are the only
+// statements of the digest-before-generation key ordering. Keep them adjacent:
+// changing one without the other makes written keys unresolvable.
+func objectKeySuffix(digest, generation string) string {
+	return digest + "/" + generation
+}
+
+func splitObjectKeySuffix(suffix string) (digest, generation string, ok bool) {
+	fields := strings.Split(suffix, "/")
+	if len(fields) != 2 {
+		return "", "", false
+	}
+	return fields[0], fields[1], true
+}
+
 type parsedObject struct {
 	kind       ObjectKind
 	generation string
@@ -224,12 +309,14 @@ type parsedObject struct {
 	size       uint64
 }
 
+// parseObjectMetadata validates that caller-supplied metadata is internally
+// consistent and canonical, and returns the fields the physical key needs.
 func parseObjectMetadata(metadata sessionwire.ObjectMetadata) (parsedObject, error) {
 	parsed, err := parseObjectReference(metadata.Reference)
 	if err != nil {
 		return parsedObject{}, err
 	}
-	if metadata.Digest != "sha256:"+hex.EncodeToString(parsed.digest[:]) {
+	if metadata.Digest != objectDigestPrefix+hex.EncodeToString(parsed.digest[:]) {
 		return parsedObject{}, objectErr(ObjectErrorDigest, "digest", nil)
 	}
 	if err := validateMediaType(metadata.MediaType); err != nil {
@@ -239,46 +326,46 @@ func parseObjectMetadata(metadata sessionwire.ObjectMetadata) (parsedObject, err
 	return parsed, nil
 }
 
+// parseObjectReference is the inverse of objectIDFor. It accepts only the
+// canonical spelling of an identity: lowercase base32hex for the generation and
+// lowercase hex for the digest, so one object has exactly one ObjectID and
+// therefore exactly one blob key. Component lengths are not restated here; a
+// wrong length cannot survive the canonical round trip.
 func parseObjectReference(reference sessionwire.ObjectReference) (parsedObject, error) {
 	if err := reference.Validate(); err != nil {
 		return parsedObject{}, objectErr(ObjectErrorInvalid, "object_id", err)
 	}
 	parts := strings.Split(reference.ObjectID, ":")
-	if len(parts) != 4 || parts[0] != "v1" {
+	if len(parts) != 4 || parts[0] != objectSchemeV1 {
 		return parsedObject{}, objectErr(ObjectErrorInvalid, "object_id", nil)
 	}
 	kind := ObjectKind(parts[1])
 	if !kind.valid() {
 		return parsedObject{}, objectErr(ObjectErrorInvalid, "kind", nil)
 	}
-	if len(parts[2]) != 26 {
-		return parsedObject{}, objectErr(ObjectErrorInvalid, "generation", nil)
-	}
-	gen, err := base32.HexEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(parts[2]))
-	if err != nil || len(gen) != 16 || strings.ToLower(base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(gen)) != parts[2] {
+	if _, err := decodeObjectGeneration(parts[2]); err != nil {
 		return parsedObject{}, objectErr(ObjectErrorInvalid, "generation", err)
 	}
-	if len(parts[3]) != 64 {
-		return parsedObject{}, objectErr(ObjectErrorInvalid, "digest", nil)
-	}
-	var digest [32]byte
-	if _, err := hex.Decode(digest[:], []byte(parts[3])); err != nil || hex.EncodeToString(digest[:]) != parts[3] {
+	digest, err := decodeObjectDigest(parts[3])
+	if err != nil {
 		return parsedObject{}, objectErr(ObjectErrorInvalid, "digest", err)
-	}
-	if digest == ([32]byte{}) {
-		return parsedObject{}, objectErr(ObjectErrorInvalid, "digest", nil)
 	}
 	return parsedObject{kind: kind, generation: parts[2], digest: digest}, nil
 }
 
+// objectMetadataFor mints the metadata for one freshly identified object.
 func objectMetadataFor(kind ObjectKind, generation [16]byte, size uint64, digest [32]byte, mediaType string) sessionwire.ObjectMetadata {
-	g := strings.ToLower(base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(generation[:]))
-	d := hex.EncodeToString(digest[:])
-	return sessionwire.ObjectMetadata{Reference: sessionwire.ObjectReference{ObjectID: "v1:" + string(kind) + ":" + g + ":" + d}, SizeBytes: size, MediaType: mediaType, Digest: "sha256:" + d}
+	encodedDigest := hex.EncodeToString(digest[:])
+	return sessionwire.ObjectMetadata{
+		Reference: objectIDFor(kind, encodeObjectGeneration(generation), encodedDigest),
+		SizeBytes: size,
+		MediaType: mediaType,
+		Digest:    objectDigestPrefix + encodedDigest,
+	}
 }
 
 func objectKey(scope sessionScope, object parsedObject) string {
-	return scope.BlobPrefix + "v1/" + string(object.kind) + "/" + hex.EncodeToString(object.digest[:]) + "/" + object.generation
+	return objectKindPrefix(scope, object.kind) + objectKeySuffix(hex.EncodeToString(object.digest[:]), object.generation)
 }
 
 // listObjectReferences is an internal administrative operation over one
@@ -300,7 +387,7 @@ func (s *Store) listObjectReferences(ctx context.Context, tenantID sessionwire.T
 	if err := s.verifySessionScope(opCtx, scope); err != nil {
 		return nil, err
 	}
-	prefix := scope.BlobPrefix + "v1/" + string(kind) + "/"
+	prefix := objectKindPrefix(scope, kind)
 	keys, err := s.backend.Blobs.List(opCtx, prefix)
 	if err != nil {
 		return nil, objectErr(ObjectErrorBackend, "list", err)
@@ -312,7 +399,7 @@ func (s *Store) listObjectReferences(ctx context.Context, tenantID sessionwire.T
 		if err != nil {
 			return nil, err
 		}
-		ref := objectMetadataFor(parsed.kind, parsedGeneration(parsed.generation), 0, parsed.digest, "").Reference
+		ref := objectIDFor(parsed.kind, parsed.generation, hex.EncodeToString(parsed.digest[:]))
 		if _, exists := seen[ref.ObjectID]; exists {
 			return nil, objectErr(ObjectErrorIntegrity, "list_duplicate", nil)
 		}
@@ -355,27 +442,24 @@ func (s *Store) deleteObject(ctx context.Context, tenantID sessionwire.TenantID,
 	return nil
 }
 
+// parsePhysicalObjectKey recovers the identity of a listed key. The suffix is
+// split by splitObjectKeySuffix, the inverse of the layout objectKey writes, and
+// the recovered components must then satisfy the same canonical grammar as a
+// caller-supplied ObjectID, so a key the store cannot have written is refused
+// instead of resolved.
 func parsePhysicalObjectKey(prefix string, kind ObjectKind, key string) (parsedObject, error) {
 	if prefix == "" || !strings.HasPrefix(key, prefix) {
 		return parsedObject{}, objectErr(ObjectErrorIntegrity, "list_key", nil)
 	}
-	parts := strings.Split(strings.TrimPrefix(key, prefix), "/")
-	if len(parts) != 2 {
+	digest, generation, ok := splitObjectKeySuffix(strings.TrimPrefix(key, prefix))
+	if !ok {
 		return parsedObject{}, objectErr(ObjectErrorIntegrity, "list_key", nil)
 	}
-	reference := sessionwire.ObjectReference{ObjectID: "v1:" + string(kind) + ":" + parts[1] + ":" + parts[0]}
-	parsed, err := parseObjectReference(reference)
-	if err != nil || prefix+parts[0]+"/"+parts[1] != key {
+	parsed, err := parseObjectReference(objectIDFor(kind, generation, digest))
+	if err != nil {
 		return parsedObject{}, objectErr(ObjectErrorIntegrity, "list_key", err)
 	}
 	return parsed, nil
-}
-
-func parsedGeneration(value string) [16]byte {
-	decoded, _ := base32.HexEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(value))
-	var generation [16]byte
-	copy(generation[:], decoded)
-	return generation
 }
 
 func validateMediaType(value string) error {
