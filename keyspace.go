@@ -139,20 +139,55 @@ func validateLayoutMarker(data []byte) error {
 	return nil
 }
 
+// tenantScope names the surfaces a tenant owns independently of any one
+// session. A recent-first listing is a tenant-scoped provider query and has no
+// SessionID to derive a scope from, so the tenant half of the derivation lives
+// here and deriveSessionScope extends it. Stating it once is what keeps a
+// listing and a direct write agreeing about which ordering scope a tenant's
+// catalog records occupy.
+type tenantScope struct {
+	layout           keyspaceLayout
+	TenantNamespace  string
+	CatalogScope     string
+	tenantWitnessKey string
+	tenantWitness    []byte
+}
+
+// deriveTenantScope is pure: it validates the tenant and derives provider-safe
+// names without touching storage.
+func (s *Store) deriveTenantScope(tenant sessionwire.TenantID) (tenantScope, error) {
+	if err := tenant.Validate(); err != nil {
+		return tenantScope{}, &InvalidIdentityError{Field: "TenantID", Cause: err}
+	}
+	if s.keys.layout == layoutLegacySingleTenantV1 {
+		if tenant != s.keys.legacyTenant {
+			return tenantScope{}, &KeyspaceError{Code: KeyspaceLegacyTenant}
+		}
+		return tenantScope{layout: layoutLegacySingleTenantV1, CatalogScope: legacyCatalogScope}, nil
+	}
+	tenantToken := encodeDigest(s.keys.digest(digestFrame("looprig/sessionstore/key/v1/tenant", []byte(tenant))))
+	tenantNamespace := "tenants/" + tenantToken
+	return tenantScope{
+		layout:           layoutTenantV1,
+		TenantNamespace:  tenantNamespace,
+		CatalogScope:     tenantNamespace,
+		tenantWitnessKey: witnessKey("tenant", tenantToken),
+		tenantWitness:    encodeWitness(1, []byte(tenant)),
+	}, nil
+}
+
 // deriveSessionScope is pure: it validates identities and derives provider-safe
 // names without touching storage. Callers must use verifySessionScope before a
 // read or bindSessionScope before creating durable session data.
 func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionScope, error) {
-	if err := tenant.Validate(); err != nil {
-		return sessionScope{}, &InvalidIdentityError{Field: "TenantID", Cause: err}
-	}
-	if s.keys.layout == layoutLegacySingleTenantV1 && tenant != s.keys.legacyTenant {
-		return sessionScope{}, &KeyspaceError{Code: KeyspaceLegacyTenant}
+	owner, err := s.deriveTenantScope(tenant)
+	if err != nil {
+		return sessionScope{}, err
 	}
 	if err := session.Validate(); err != nil {
 		return sessionScope{}, &InvalidIdentityError{Field: "SessionID", Cause: err}
 	}
-	if s.keys.layout == layoutLegacySingleTenantV1 {
+	if owner.layout == layoutLegacySingleTenantV1 {
 		if !isCanonicalLegacySessionID(string(session)) {
 			return sessionScope{}, &KeyspaceError{Code: KeyspaceLegacySession}
 		}
@@ -164,31 +199,28 @@ func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionw
 			LeaseName:         prefix,
 			CatalogKey:        prefix,
 			CatalogListPrefix: "sessions/",
-			CatalogScope:      legacyCatalogScope,
+			CatalogScope:      owner.CatalogScope,
 			BlobPrefix:        prefix + "/blobs/",
 			JournalName:       prefix,
 		}, nil
 	}
 
-	tenantFrame := digestFrame("looprig/sessionstore/key/v1/tenant", []byte(tenant))
 	sessionFrame := digestFrame("looprig/sessionstore/key/v1/session", []byte(tenant), []byte(session))
-	tenantToken := encodeDigest(s.keys.digest(tenantFrame))
 	sessionToken := encodeDigest(s.keys.digest(sessionFrame))
-	tenantNamespace := "tenants/" + tenantToken
-	sessionNamespace := tenantNamespace + "/sessions/" + sessionToken
+	sessionNamespace := owner.TenantNamespace + "/sessions/" + sessionToken
 	return sessionScope{
-		layout:            layoutTenantV1,
-		TenantNamespace:   tenantNamespace,
+		layout:            owner.layout,
+		TenantNamespace:   owner.TenantNamespace,
 		SessionNamespace:  sessionNamespace,
 		LedgerName:        sessionNamespace + "/journal",
 		LeaseName:         sessionNamespace + "/lease",
 		CatalogKey:        sessionNamespace + "/catalog",
-		CatalogListPrefix: tenantNamespace + "/sessions/",
-		CatalogScope:      tenantNamespace,
+		CatalogListPrefix: owner.TenantNamespace + "/sessions/",
+		CatalogScope:      owner.CatalogScope,
 		BlobPrefix:        sessionNamespace + "/blobs/",
 		JournalName:       sessionNamespace + "/journal",
-		tenantWitnessKey:  witnessKey("tenant", tenantToken),
-		tenantWitness:     encodeWitness(1, []byte(tenant)),
+		tenantWitnessKey:  owner.tenantWitnessKey,
+		tenantWitness:     owner.tenantWitness,
 		sessionWitnessKey: witnessKey("session", sessionToken),
 		sessionWitness:    encodeWitness(2, []byte(tenant), []byte(session)),
 	}, nil

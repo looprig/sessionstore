@@ -107,6 +107,25 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 	}, nil
 }
 
+// pageLimit normalizes one caller-supplied page limit and reports whether it
+// was in range. Zero means "this store's page size".
+//
+// storage.MaxOrderedPageLimit names the ordered-index page ceiling, but it is
+// deliberately reused as this package's single page ceiling — the same value
+// Limits.MaxPageSize is validated against — so a journal page and a catalog
+// page cannot disagree about how large one page may be. The rule lives here
+// rather than at each call site because two copies of it would be free to
+// drift; each caller supplies only its own error vocabulary.
+func (s *Store) pageLimit(limit int) (int, bool) {
+	if limit < 0 || limit > storage.MaxOrderedPageLimit {
+		return 0, false
+	}
+	if limit == 0 {
+		return s.limits.MaxPageSize, true
+	}
+	return limit, true
+}
+
 type lifecycleOperation uint8
 
 const (

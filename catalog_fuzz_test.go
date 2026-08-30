@@ -2,10 +2,15 @@ package sessionstore
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/storage"
+	"github.com/looprig/storage/memstore"
 )
 
 // FuzzCatalogRecordCodec fuzzes stored catalog bytes. Its seeds are real
@@ -107,4 +112,84 @@ func FuzzCatalogRecordCodec(f *testing.F) {
 			t.Fatalf("accepted a record with an underivable rank: %+v", rank)
 		}
 	})
+}
+
+// FuzzCatalogCursorCodec fuzzes the listing cursor envelope.
+//
+// Its seeds are cursors this store really issued, plus one derived variant per
+// envelope field, so a mutation starts from a token that already reaches the
+// length gate, the canonical-spelling check, the magic, the version, and the
+// tenant scope comparison rather than bouncing off the base64 decoder.
+//
+// The property is that acceptance is exact: a cursor the decoder accepts must
+// re-encode, for the same tenant, to the identical string. That is what makes
+// the envelope a one-to-one wrapper around a provider token — if any accepted
+// spelling re-encoded differently, two distinct strings would name one position
+// and a caller could perturb a token while still being resumed.
+func FuzzCatalogCursorCodec(f *testing.F) {
+	store, err := Open(context.Background(), memstore.New())
+	if err != nil {
+		f.Fatalf("Open: %v", err)
+	}
+	f.Cleanup(func() { store.Close(context.Background()) })
+
+	issue := func(token storage.RankedCursor) string {
+		cursor, err := store.encodeCatalogCursor(catalogTenant, token)
+		if err != nil {
+			f.Fatalf("seed does not encode: %v", err)
+		}
+		return string(cursor)
+	}
+	valid := issue("provider-token")
+	f.Add(valid)
+	f.Add(issue(storage.RankedCursor(bytes.Repeat([]byte{0xff}, 64))))
+	f.Add(issue("x"))
+	f.Add(string(mustEncodeCatalogCursorFor(f, store, catalogOtherTenant)))
+	f.Add(string(store.encodeJournalCursor(journalCursorPublic, catalogTenant, catalogSession, 1, 1)))
+
+	// One seed per envelope field, derived from a real token rather than
+	// written as a literal, so the fuzzer explores from inside each rejection
+	// path as well as from an accepted cursor.
+	token, err := base64.RawURLEncoding.DecodeString(valid)
+	if err != nil {
+		f.Fatalf("a cursor this store issued is not base64url: %v", err)
+	}
+	for _, mutate := range []func([]byte){
+		func(t []byte) { copy(t[catalogCursorMagicAt:], "XXXX") },
+		func(t []byte) { t[catalogCursorVersionAt]++ },
+		func(t []byte) { t[catalogCursorScopeAt]++ },
+	} {
+		copied := append([]byte(nil), token...)
+		mutate(copied)
+		f.Add(base64.RawURLEncoding.EncodeToString(copied))
+	}
+	f.Add(base64.RawURLEncoding.EncodeToString(token[:catalogCursorTokenAt]))
+	f.Add(valid + strings.Repeat("A", MaxCatalogCursorBytes))
+	f.Add("")
+
+	f.Fuzz(func(t *testing.T, cursor string) {
+		next, err := store.decodeCatalogCursor(catalogTenant, sessionwire.Cursor(cursor))
+		if err != nil {
+			return
+		}
+		if next == "" {
+			t.Fatal("accepted a cursor carrying no provider token")
+		}
+		again, err := store.encodeCatalogCursor(catalogTenant, next)
+		if err != nil {
+			t.Fatalf("accepted a cursor that does not re-encode: %v", err)
+		}
+		if string(again) != cursor {
+			t.Fatalf("acceptance is not exact:\nin  %q\nout %q", cursor, again)
+		}
+	})
+}
+
+func mustEncodeCatalogCursorFor(f *testing.F, store *Store, tenant sessionwire.TenantID) sessionwire.Cursor {
+	f.Helper()
+	cursor, err := store.encodeCatalogCursor(tenant, "provider-token")
+	if err != nil {
+		f.Fatalf("seed does not encode: %v", err)
+	}
+	return cursor
 }

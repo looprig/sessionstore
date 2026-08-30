@@ -5,8 +5,10 @@ package sessionstore
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
+	"testing"
 
 	"github.com/looprig/storage"
 )
@@ -131,6 +133,7 @@ type hostileOrdered struct {
 	mu      sync.Mutex
 	getErr  error
 	rewrite func([]byte) []byte
+	ranked  func(storage.RankedPage, error) (storage.RankedPage, error)
 }
 
 // failGets makes every later Get return err.
@@ -147,6 +150,26 @@ func (o *hostileOrdered) corruptGets(rewrite func([]byte) []byte) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.rewrite = rewrite
+}
+
+// answerRanked lets a test replace what the provider returns from ListRanked,
+// which is the only way to present SessionStore with a page a conforming
+// provider would never produce.
+func (o *hostileOrdered) answerRanked(answer func(storage.RankedPage, error) (storage.RankedPage, error)) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.ranked = answer
+}
+
+func (o *hostileOrdered) ListRanked(ctx context.Context, namespace, rankingScope string, after storage.RankedCursor, limit int) (storage.RankedPage, error) {
+	page, err := o.OrderedIndex.ListRanked(ctx, namespace, rankingScope, after, limit)
+	o.mu.Lock()
+	answer := o.ranked
+	o.mu.Unlock()
+	if answer == nil {
+		return page, err
+	}
+	return answer(page, err)
 }
 
 func (o *hostileOrdered) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
@@ -167,4 +190,112 @@ func (o *hostileOrdered) Get(ctx context.Context, id storage.OrderedID) (storage
 var (
 	_ storage.OrderedIndex = (*recordingOrdered)(nil)
 	_ storage.OrderedIndex = (*hostileOrdered)(nil)
+)
+
+// rankedCall is one recorded ListRanked query. Its ranking scope and limit are
+// what distinguish a tenant-scoped provider query from a wider scan the caller
+// narrows afterwards, and records is what a test compares the returned page
+// against to prove nothing was dropped after the provider answered.
+type rankedCall struct {
+	namespace    string
+	rankingScope string
+	after        storage.RankedCursor
+	limit        int
+	records      int
+}
+
+// listAuditOrdered fails the test if a catalog listing is anything other than
+// one tenant-scoped ListRanked query. It starts inert so a fixture can be
+// created through the ordinary write paths, and a test arms it with the tenant
+// scope the listing under test must ask the provider for.
+type listAuditOrdered struct {
+	storage.OrderedIndex
+
+	t *testing.T
+
+	mu        sync.Mutex
+	armed     bool
+	wantScope string
+	ranked    []rankedCall
+}
+
+// arm makes every later call other than a ListRanked in scope a test failure.
+func (o *listAuditOrdered) arm(scope string) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.armed, o.wantScope = true, scope
+}
+
+func (o *listAuditOrdered) refuse(op string) {
+	o.mu.Lock()
+	armed := o.armed
+	o.mu.Unlock()
+	if armed {
+		o.t.Errorf("a listing reached the provider through %s; it must use ListRanked only", op)
+	}
+}
+
+func (o *listAuditOrdered) rankedCalls() []rankedCall {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]rankedCall(nil), o.ranked...)
+}
+
+func (o *listAuditOrdered) ListRanked(ctx context.Context, namespace, rankingScope string, after storage.RankedCursor, limit int) (storage.RankedPage, error) {
+	page, err := o.OrderedIndex.ListRanked(ctx, namespace, rankingScope, after, limit)
+	o.mu.Lock()
+	armed, wantScope := o.armed, o.wantScope
+	o.ranked = append(o.ranked, rankedCall{
+		namespace:    namespace,
+		rankingScope: rankingScope,
+		after:        after,
+		limit:        limit,
+		records:      len(page.Records),
+	})
+	o.mu.Unlock()
+	if armed && rankingScope != wantScope {
+		o.t.Errorf("ListRanked ranking scope = %q, want %q: the tenant restriction must be part of the provider query, not a filter applied to its page",
+			rankingScope, wantScope)
+	}
+	return page, err
+}
+
+func (o *listAuditOrdered) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
+	o.refuse("Get")
+	return o.OrderedIndex.Get(ctx, id)
+}
+
+func (o *listAuditOrdered) ListOrdered(ctx context.Context, namespace, orderingScope string, afterOrder uint64, limit int) (storage.OrderedPage, error) {
+	o.refuse("ListOrdered")
+	return o.OrderedIndex.ListOrdered(ctx, namespace, orderingScope, afterOrder, limit)
+}
+
+func (o *listAuditOrdered) ListDue(ctx context.Context, namespace string, dueAtOrBefore int64, after storage.DueCursor, limit int) (storage.DuePage, error) {
+	o.refuse("ListDue")
+	return o.OrderedIndex.ListDue(ctx, namespace, dueAtOrBefore, after, limit)
+}
+
+// permissiveRankedOrdered is a deliberately non-conforming provider: its ranked
+// cursor is not bound to the query that issued it, so it accepts any token and
+// simply restarts the scan.
+//
+// It exists so SessionStore's own cursor binding is observable. Against a
+// conforming provider the provider's rejection and SessionStore's arrive as the
+// same typed failure, so a test written over one could not tell which guard
+// fired and would keep passing after SessionStore's was deleted.
+type permissiveRankedOrdered struct{ storage.OrderedIndex }
+
+func (o permissiveRankedOrdered) ListRanked(ctx context.Context, namespace, rankingScope string, after storage.RankedCursor, limit int) (storage.RankedPage, error) {
+	page, err := o.OrderedIndex.ListRanked(ctx, namespace, rankingScope, after, limit)
+	if err != nil && errors.As(err, new(*storage.InvalidOrderedCursorError)) {
+		// Issue cursors as usual, but never refuse one: this is the provider
+		// that leaves the binding entirely to its caller.
+		return o.OrderedIndex.ListRanked(ctx, namespace, rankingScope, "", limit)
+	}
+	return page, err
+}
+
+var (
+	_ storage.OrderedIndex = (*listAuditOrdered)(nil)
+	_ storage.OrderedIndex = permissiveRankedOrdered{}
 )

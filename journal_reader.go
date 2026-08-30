@@ -10,7 +10,6 @@ import (
 	"io"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
-	"github.com/looprig/storage"
 )
 
 // ReadPublicJournalRequest positions one bounded public journal page. FromSeq
@@ -196,15 +195,9 @@ func (s *Store) planJournalRead(
 	cursor sessionwire.Cursor,
 	limit int,
 ) (*journalScan, func(), error) {
-	// storage.MaxOrderedPageLimit names the ordered-index page ceiling, but it
-	// is deliberately reused as this package's single page ceiling — the same
-	// value Limits.MaxPageSize is validated against — so a journal page and a
-	// catalog page cannot disagree about how large "one page" may be.
-	if limit < 0 || limit > storage.MaxOrderedPageLimit {
+	limit, ok := s.pageLimit(limit)
+	if !ok {
 		return nil, nil, journalErr(JournalErrorInvalid, "limit", nil)
-	}
-	if limit == 0 {
-		limit = s.limits.MaxPageSize
 	}
 	if cursor != "" && fromSeq != 0 {
 		return nil, nil, journalErr(JournalErrorInvalid, "cursor", nil)

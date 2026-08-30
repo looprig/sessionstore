@@ -127,3 +127,29 @@ Both paths close their read-compare-write with the same revision
 compare-and-swap, which is what makes the epoch a fence rather than advice: a
 writer that observed a stale high-water mark loses the swap and, on re-reading,
 meets the successor's epoch.
+
+## Recent-first pages are one ranked query
+
+`ListSessions` returns a Core `SessionPage` from a single `ListRanked` call. The
+tenant is the ranking scope, so the tenant restriction and the recency order are
+both inside the provider query and the limit applies to a result that is already
+restricted and already ordered. Nothing enumerates a key prefix, sorts a
+catalog, or narrows a wider page afterwards; those cost work proportional to a
+tenant's history rather than to the page, and a picker renders on every visit.
+
+Unlike a direct get, a listing does not verify the tenant's collision witness:
+it names no session, and a tenant that has never created one has no binding to
+prove, so requiring one would answer "this tenant is empty" with a failure.
+Separation instead comes from holding every returned record to the tenant it
+itself claims, so a scope two tenants somehow shared fails the page closed
+rather than disclosing a row.
+
+A page cursor is a versioned SessionStore envelope wrapping the provider's own
+opaque token. The envelope binds the token to the tenant it was issued for and
+tags it as a catalog page, so it can be moved neither between tenants nor into a
+journal read even when the provider underneath does not bind its own cursors,
+and a caller retains a SessionStore token rather than a provider one. Pagination
+resumes from the provider's frozen `(rank, stable_key, ordering_scope)` position
+rather than from a snapshot, so a session whose recency changes mid-walk may
+repeat or be skipped; a sweep that must see every session once reconciles by
+identity, not by page.

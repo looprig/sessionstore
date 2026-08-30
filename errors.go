@@ -187,6 +187,12 @@ func envelopeError(code EnvelopeErrorCode, field string, cause error) error {
 
 // CatalogErrorCode classifies a session catalog record failure.
 //
+// Cursor is separate from Invalid because the two name different owners. An
+// invalid limit is a caller mistake in the request this package validates;
+// Cursor means a continuation token was not one this store issued for this
+// query, whether the envelope or the provider token inside it failed, and a
+// caller's only recovery is to restart the walk from the first page.
+//
 // Epoch and Conflict are deliberately distinct, and the distinction is the
 // whole point of the catalog's two ownership mechanisms. Epoch means a
 // Host-owned write named a lease epoch below the record's committed high-water
@@ -198,6 +204,7 @@ type CatalogErrorCode string
 
 const (
 	CatalogErrorInvalid   CatalogErrorCode = "invalid"
+	CatalogErrorCursor    CatalogErrorCode = "cursor"
 	CatalogErrorNotFound  CatalogErrorCode = "not_found"
 	CatalogErrorDeleted   CatalogErrorCode = "deleted"
 	CatalogErrorIdentity  CatalogErrorCode = "identity"

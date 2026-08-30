@@ -3,11 +3,13 @@ package sessionstore
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1312,8 +1314,14 @@ func TestCatalogTextValidationCoversEveryStringField(t *testing.T) {
 		enumerateTextSites(reflect.ValueOf(&record).Elem(), "record", &sites)
 		return len(sites)
 	}()
-	if count < 15 {
-		t.Fatalf("the enumerator found only %d text sites; it is not reaching the nested projections", count)
+	// The count is exact rather than a floor. Slack here would let a regression
+	// that dropped a text member from the record — or from a nested projection
+	// the enumerator walks into — narrow this test's coverage without failing
+	// it. Bump this number when the record legitimately gains or loses a text
+	// member, and check that the member is validated when you do.
+	const wantTextSites = 26
+	if count != wantTextSites {
+		t.Fatalf("the enumerator found %d text sites, want exactly %d; bump me when the record gains or loses a text member", count, wantTextSites)
 	}
 	for i := range count {
 		record := richCatalogRecord()
@@ -1414,6 +1422,13 @@ func TestCatalogRawJSONTextValidityIsCoresRule(t *testing.T) {
 func TestCatalogNormalizesAnEmptyGateListToAbsent(t *testing.T) {
 	store := openTestStore(t)
 	mustCreateCatalog(t, store)
+	// The normalization is asserted where it is observable. The encoded form
+	// omits an empty list either way, so a round trip through the store cannot
+	// distinguish nil from empty; canonicalGates is the one place that can, and
+	// it is the function the early return belongs to.
+	if got, err := canonicalGates([]sessionwire.GateProjection{}); err != nil || got != nil {
+		t.Fatalf("canonicalGates(empty) = %#v, %v; want nil, nil so \"no open gates\" has one spelling", got, err)
+	}
 	req := testHostStateRequest(1)
 	// An empty-but-present slice is a distinct Go value from nil and would
 	// otherwise survive the clone, giving "no open gates" two spellings.
@@ -1431,5 +1446,759 @@ func TestCatalogNormalizesAnEmptyGateListToAbsent(t *testing.T) {
 	}
 	if read.Record.OpenGates != nil {
 		t.Fatalf("a read returned %#v, want nil", read.Record.OpenGates)
+	}
+}
+
+// --- bounded recent-first listing ----------------------------------------
+
+const catalogOtherTenant = sessionwire.TenantID("tenant-b")
+
+// mustCreateSession creates one catalog record for an explicit tenant, session,
+// and recency. Nothing else varies, so a listing assertion reads as a statement
+// about rank and tenancy alone.
+func mustCreateSession(
+	t *testing.T,
+	store *Store,
+	tenant sessionwire.TenantID,
+	session sessionwire.SessionID,
+	lastActive time.Time,
+) {
+	t.Helper()
+	req := testCreateRequest()
+	req.TenantID = tenant
+	req.SessionID = session
+	req.LastActiveAt = lastActive
+	req.IdempotencyKey = "create-" + string(session)
+	entry, created, err := store.CreateCatalogEntry(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateCatalogEntry(%s/%s): %v", tenant, session, err)
+	}
+	if !created {
+		t.Fatalf("CreateCatalogEntry(%s/%s) reported an existing record", tenant, session)
+	}
+	if entry.Record.SessionID != session {
+		t.Fatalf("created %q, want %q", entry.Record.SessionID, session)
+	}
+}
+
+func listedSessionIDs(page sessionwire.SessionPage) []sessionwire.SessionID {
+	ids := make([]sessionwire.SessionID, 0, len(page.Sessions))
+	for _, summary := range page.Sessions {
+		ids = append(ids, summary.SessionID)
+	}
+	return ids
+}
+
+// walkSessions follows cursors to exhaustion and returns every session id in
+// page order. It bounds the walk so a cursor that fails to make progress fails
+// the test instead of hanging it, which is the observable consequence of the
+// sort key not being a total order.
+func walkSessions(t *testing.T, store *Store, tenant sessionwire.TenantID, limit int) []sessionwire.SessionID {
+	t.Helper()
+	var ids []sessionwire.SessionID
+	cursor := sessionwire.Cursor("")
+	for pages := 0; ; pages++ {
+		if pages > 32 {
+			t.Fatalf("cursor walk did not terminate after %d pages: %v", pages, ids)
+		}
+		page, err := store.ListSessions(context.Background(), ListSessionsRequest{
+			TenantID: tenant,
+			Cursor:   cursor,
+			Limit:    limit,
+		})
+		if err != nil {
+			t.Fatalf("ListSessions page %d: %v", pages, err)
+		}
+		ids = append(ids, listedSessionIDs(page)...)
+		if page.NextCursor == "" {
+			return ids
+		}
+		cursor = page.NextCursor
+	}
+}
+
+// openAuditedListStore wires a store whose OrderedIndex refuses every query a
+// listing must not make and whose KV counts prefix scans.
+func openAuditedListStore(t *testing.T, opts ...Option) (*Store, *listAuditOrdered, *keysCountingKV) {
+	t.Helper()
+	base := memstore.New()
+	audit := &listAuditOrdered{OrderedIndex: base.OrderedIndex, t: t}
+	base.OrderedIndex = audit
+	kv := &keysCountingKV{KV: base.KV}
+	base.KV = kv
+	store, err := Open(context.Background(), base, opts...)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return store, audit, kv
+}
+
+func openHostileListStore(t *testing.T) (*Store, *hostileOrdered) {
+	t.Helper()
+	base := memstore.New()
+	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = hostile
+	store, err := Open(context.Background(), base)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return store, hostile
+}
+
+func mustListSessions(t *testing.T, store *Store, req ListSessionsRequest) sessionwire.SessionPage {
+	t.Helper()
+	page, err := store.ListSessions(context.Background(), req)
+	if err != nil {
+		t.Fatalf("ListSessions: %v", err)
+	}
+	return page
+}
+
+// TestListSessionsUsesTenantRankBeforeLimit is the central claim of the listing:
+// the tenant restriction and the recency order are both part of the one
+// provider query, and the limit applies to that already-restricted, already
+// ordered result. The fixture makes the other tenant's sessions the most recent
+// in the whole store, so an implementation that ranked globally and filtered
+// afterwards would return an empty or short page rather than this tenant's two
+// newest sessions.
+func TestListSessionsUsesTenantRankBeforeLimit(t *testing.T) {
+	store, audit, kv := openAuditedListStore(t)
+	base := catalogActiveAt
+	mustCreateSession(t, store, catalogTenant, "session-a1", base)
+	mustCreateSession(t, store, catalogTenant, "session-a2", base.Add(2*time.Minute))
+	mustCreateSession(t, store, catalogTenant, "session-a3", base.Add(time.Minute))
+	mustCreateSession(t, store, catalogOtherTenant, "session-b1", base.Add(time.Hour))
+	mustCreateSession(t, store, catalogOtherTenant, "session-b2", base.Add(2*time.Hour))
+
+	scope, err := store.deriveSessionScope(catalogTenant, "session-a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit.arm(scope.CatalogScope)
+
+	page := mustListSessions(t, store, ListSessionsRequest{TenantID: catalogTenant, Limit: 2})
+	want := []sessionwire.SessionID{"session-a2", "session-a3"}
+	if got := listedSessionIDs(page); !reflect.DeepEqual(got, want) {
+		t.Fatalf("sessions = %v, want %v", got, want)
+	}
+	if page.NextCursor == "" {
+		t.Fatal("a truncated page returned no continuation cursor")
+	}
+
+	calls := audit.rankedCalls()
+	if len(calls) != 1 {
+		t.Fatalf("ListRanked calls = %d, want exactly one", len(calls))
+	}
+	call := calls[0]
+	if call.namespace != catalogNamespace {
+		t.Fatalf("namespace = %q, want %q", call.namespace, catalogNamespace)
+	}
+	if call.limit != 2 {
+		t.Fatalf("provider limit = %d, want the requested 2: a listing must not over-fetch and narrow afterwards", call.limit)
+	}
+	if call.records != len(page.Sessions) {
+		t.Fatalf("provider returned %d records and the page carried %d: a listing must not drop rows the provider selected",
+			call.records, len(page.Sessions))
+	}
+	if kv.keys.Load() != 0 {
+		t.Fatalf("a listing scanned KV keys %d times", kv.keys.Load())
+	}
+}
+
+// TestListSessionsNeverReturnsAnotherTenantsSessions walks both tenants to
+// exhaustion, which is the strongest available statement of separation: every
+// session appears in exactly one tenant's pages.
+func TestListSessionsNeverReturnsAnotherTenantsSessions(t *testing.T) {
+	store := openTestStore(t)
+	base := catalogActiveAt
+	mustCreateSession(t, store, catalogTenant, "session-a1", base)
+	mustCreateSession(t, store, catalogTenant, "session-a2", base.Add(time.Minute))
+	mustCreateSession(t, store, catalogOtherTenant, "session-b1", base.Add(time.Hour))
+
+	gotA := walkSessions(t, store, catalogTenant, 1)
+	wantA := []sessionwire.SessionID{"session-a2", "session-a1"}
+	if !reflect.DeepEqual(gotA, wantA) {
+		t.Fatalf("tenant-a sessions = %v, want %v", gotA, wantA)
+	}
+	gotB := walkSessions(t, store, catalogOtherTenant, 1)
+	wantB := []sessionwire.SessionID{"session-b1"}
+	if !reflect.DeepEqual(gotB, wantB) {
+		t.Fatalf("tenant-b sessions = %v, want %v", gotB, wantB)
+	}
+}
+
+// TestListSessionsBreaksRankTiesWithoutRepeatingOrSkipping pins that equal
+// recency still paginates. The tie-break itself belongs to the provider's
+// frozen (rank, stable_key, ordering_scope) order, so this asserts the property
+// that order buys — a total order over a stable page walk — rather than
+// restating the comparator.
+func TestListSessionsBreaksRankTiesWithoutRepeatingOrSkipping(t *testing.T) {
+	store := openTestStore(t)
+	tied := catalogActiveAt
+	ids := []sessionwire.SessionID{"session-a1", "session-a2", "session-a3"}
+	for _, id := range ids {
+		mustCreateSession(t, store, catalogTenant, id, tied)
+	}
+
+	walked := walkSessions(t, store, catalogTenant, 1)
+	if len(walked) != len(ids) {
+		t.Fatalf("walk returned %v, want %d sessions exactly once", walked, len(ids))
+	}
+	seen := map[sessionwire.SessionID]int{}
+	for _, id := range walked {
+		seen[id]++
+	}
+	for _, id := range ids {
+		if seen[id] != 1 {
+			t.Fatalf("%s appeared %d times in %v", id, seen[id], walked)
+		}
+	}
+	if again := walkSessions(t, store, catalogTenant, 1); !reflect.DeepEqual(again, walked) {
+		t.Fatalf("a tied walk is not deterministic: %v then %v", walked, again)
+	}
+}
+
+// TestListSessionsIncludesASessionNoHostHasWritten pins that listing reads the
+// record Factory created rather than one a Host has since claimed. A session
+// that has never been leased has epoch zero and its creation-time state, and it
+// is exactly the session a picker most needs to see.
+func TestListSessionsIncludesASessionNoHostHasWritten(t *testing.T) {
+	store := openTestStore(t)
+	mustCreateSession(t, store, catalogTenant, catalogSession, catalogActiveAt)
+
+	page := mustListSessions(t, store, ListSessionsRequest{TenantID: catalogTenant, Limit: 10})
+	if len(page.Sessions) != 1 {
+		t.Fatalf("sessions = %v, want the one created session", listedSessionIDs(page))
+	}
+	summary := page.Sessions[0]
+	if summary.SessionID != catalogSession || summary.AgentID != "agent-a" {
+		t.Fatalf("summary identity = %+v", summary)
+	}
+	if summary.State != sessionwire.SessionStateIdle {
+		t.Fatalf("state = %q, want the creation state %q", summary.State, sessionwire.SessionStateIdle)
+	}
+	if !summary.LastActiveAt.Equal(catalogActiveAt) {
+		t.Fatalf("last active = %v, want %v", summary.LastActiveAt, catalogActiveAt)
+	}
+	if page.NextCursor != "" {
+		t.Fatalf("an exhausted page returned a continuation cursor %q", page.NextCursor)
+	}
+}
+
+// TestListSessionsSurvivesARankMoveBetweenPages exercises the contract's stated
+// weakness: pagination resumes from a frozen (rank, stable_key, ordering_scope)
+// tuple, so a record whose rank moves across that position between pages is
+// repeated or skipped. SessionStore must return what the provider selected and
+// must not try to repair the view by buffering or re-sorting — a repair would
+// require holding the whole catalog. What it does owe is that the walk still
+// terminates and every page is well formed.
+func TestListSessionsSurvivesARankMoveBetweenPages(t *testing.T) {
+	store, audit, _ := openAuditedListStore(t)
+	base := catalogActiveAt
+	mustCreateSession(t, store, catalogTenant, "session-a1", base)
+	mustCreateSession(t, store, catalogTenant, "session-a2", base.Add(time.Minute))
+	mustCreateSession(t, store, catalogTenant, "session-a3", base.Add(2*time.Minute))
+
+	first := mustListSessions(t, store, ListSessionsRequest{TenantID: catalogTenant, Limit: 1})
+	if got := listedSessionIDs(first); !reflect.DeepEqual(got, []sessionwire.SessionID{"session-a3"}) {
+		t.Fatalf("first page = %v, want the newest session", got)
+	}
+	if first.NextCursor == "" {
+		t.Fatal("first page of three returned no cursor")
+	}
+
+	// Move the oldest session ahead of the frozen cursor position.
+	moved := testHostStateRequest(1)
+	moved.SessionID = "session-a1"
+	moved.LastActiveAt = base.Add(time.Hour)
+	if _, err := store.UpdateCatalogHostState(context.Background(), moved); err != nil {
+		t.Fatalf("UpdateCatalogHostState: %v", err)
+	}
+
+	scope, err := store.deriveSessionScope(catalogTenant, "session-a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit.arm(scope.CatalogScope)
+
+	cursor := first.NextCursor
+	for pages := 0; cursor != ""; pages++ {
+		if pages > 8 {
+			t.Fatal("a rank move made the cursor walk fail to terminate")
+		}
+		page, err := store.ListSessions(context.Background(), ListSessionsRequest{
+			TenantID: catalogTenant,
+			Cursor:   cursor,
+			Limit:    1,
+		})
+		if err != nil {
+			t.Fatalf("ListSessions after a rank move: %v", err)
+		}
+		if err := page.Validate(); err != nil {
+			t.Fatalf("a page returned after a rank move is not well formed: %v", err)
+		}
+		cursor = page.NextCursor
+	}
+	for _, call := range audit.rankedCalls() {
+		if call.records > call.limit {
+			t.Fatalf("a listing asked the provider for %d records under a limit of %d", call.records, call.limit)
+		}
+	}
+}
+
+// --- listing cursors ------------------------------------------------------
+
+// splitCatalogCursor returns the envelope header and the provider token a
+// SessionStore listing cursor carries. Tests recombine real halves rather than
+// writing a token literal: the payload is the provider's own opaque encoding,
+// and a literal would test one provider's grammar instead of this package's
+// binding.
+func splitCatalogCursor(t *testing.T, cursor sessionwire.Cursor) (header, payload []byte) {
+	t.Helper()
+	token, err := base64.RawURLEncoding.DecodeString(string(cursor))
+	if err != nil {
+		t.Fatalf("a cursor this store issued is not base64url: %v", err)
+	}
+	if len(token) <= catalogCursorTokenAt {
+		t.Fatalf("cursor is %d bytes, want more than the %d-byte envelope", len(token), catalogCursorTokenAt)
+	}
+	return token[:catalogCursorTokenAt:catalogCursorTokenAt], token[catalogCursorTokenAt:]
+}
+
+func joinCatalogCursor(header, payload []byte) sessionwire.Cursor {
+	return sessionwire.Cursor(base64.RawURLEncoding.EncodeToString(append(append([]byte(nil), header...), payload...)))
+}
+
+// mustTruncatedCursor lists one tenant with a limit small enough to truncate and
+// returns the continuation cursor the store issued.
+func mustTruncatedCursor(t *testing.T, store *Store, tenant sessionwire.TenantID) sessionwire.Cursor {
+	t.Helper()
+	page := mustListSessions(t, store, ListSessionsRequest{TenantID: tenant, Limit: 1})
+	if page.NextCursor == "" {
+		t.Fatalf("tenant %s did not produce a continuation cursor", tenant)
+	}
+	return page.NextCursor
+}
+
+func seedTwoTenants(t *testing.T, store *Store) {
+	t.Helper()
+	base := catalogActiveAt
+	mustCreateSession(t, store, catalogTenant, "session-a1", base)
+	mustCreateSession(t, store, catalogTenant, "session-a2", base.Add(time.Minute))
+	mustCreateSession(t, store, catalogOtherTenant, "session-b1", base.Add(time.Hour))
+	mustCreateSession(t, store, catalogOtherTenant, "session-b2", base.Add(2*time.Hour))
+}
+
+// TestListSessionsRejectsACursorIssuedForAnotherTenant is the ordinary
+// cross-tenant case over a conforming provider.
+func TestListSessionsRejectsACursorIssuedForAnotherTenant(t *testing.T) {
+	store := openTestStore(t)
+	seedTwoTenants(t, store)
+	cursor := mustTruncatedCursor(t, store, catalogOtherTenant)
+
+	_, err := store.ListSessions(context.Background(), ListSessionsRequest{
+		TenantID: catalogTenant,
+		Cursor:   cursor,
+		Limit:    1,
+	})
+	if err == nil {
+		t.Fatal("a cursor issued for another tenant was accepted")
+	}
+	assertCatalogCode(t, err, CatalogErrorCursor)
+}
+
+// TestListSessionsBindsItsCursorToTheTenantEvenIfTheProviderDoesNot is the same
+// claim against a provider that does not bind its own cursors. The conforming
+// provider above would reject the token on its own, so that test alone cannot
+// distinguish SessionStore's binding from the provider's; this one can, because
+// here nothing else is checking.
+func TestListSessionsBindsItsCursorToTheTenantEvenIfTheProviderDoesNot(t *testing.T) {
+	backend := memstore.New()
+	backend.OrderedIndex = permissiveRankedOrdered{OrderedIndex: backend.OrderedIndex}
+	store, err := Open(context.Background(), backend)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { store.Close(context.Background()) })
+	seedTwoTenants(t, store)
+	cursor := mustTruncatedCursor(t, store, catalogOtherTenant)
+
+	_, err = store.ListSessions(context.Background(), ListSessionsRequest{
+		TenantID: catalogTenant,
+		Cursor:   cursor,
+		Limit:    1,
+	})
+	if err == nil {
+		t.Fatal("a cursor issued for another tenant was accepted against a provider that does not bind its own")
+	}
+	assertCatalogCode(t, err, CatalogErrorCursor)
+}
+
+// TestListSessionsRejectsAForgedCursorPayload forges the body rather than the
+// header: the envelope names this tenant and carries this version, and only the
+// provider token inside it comes from another query. The envelope check passes,
+// so the rejection can only come from the provider being handed a token that
+// does not bind to the query SessionStore then asked it to resume.
+func TestListSessionsRejectsAForgedCursorPayload(t *testing.T) {
+	store := openTestStore(t)
+	seedTwoTenants(t, store)
+	mine := mustTruncatedCursor(t, store, catalogTenant)
+	theirs := mustTruncatedCursor(t, store, catalogOtherTenant)
+
+	header, payload := splitCatalogCursor(t, mine)
+	_, foreignPayload := splitCatalogCursor(t, theirs)
+	if bytes.Equal(payload, foreignPayload) {
+		t.Fatal("the two tenants' provider tokens are identical; the forgery would be a no-op")
+	}
+	forged := joinCatalogCursor(header, foreignPayload)
+	if forged == mine {
+		t.Fatal("the forged cursor equals the original")
+	}
+
+	_, err := store.ListSessions(context.Background(), ListSessionsRequest{
+		TenantID: catalogTenant,
+		Cursor:   forged,
+		Limit:    1,
+	})
+	if err == nil {
+		t.Fatal("a cursor carrying another query's provider token was accepted")
+	}
+	assertCatalogCode(t, err, CatalogErrorCursor)
+}
+
+// TestListSessionsRejectsACursorEnvelopeItDidNotIssue rewrites the header while
+// leaving a genuine provider token in place, so each rejection is attributable
+// to the envelope field it names.
+func TestListSessionsRejectsACursorEnvelopeItDidNotIssue(t *testing.T) {
+	store := openTestStore(t)
+	seedTwoTenants(t, store)
+	valid := mustTruncatedCursor(t, store, catalogTenant)
+	header, payload := splitCatalogCursor(t, valid)
+
+	rewrite := func(mutate func([]byte)) sessionwire.Cursor {
+		copied := append([]byte(nil), header...)
+		mutate(copied)
+		return joinCatalogCursor(copied, payload)
+	}
+	journal := store.encodeJournalCursor(journalCursorPublic, catalogTenant, catalogSession, 1, 1)
+
+	for name, cursor := range map[string]sessionwire.Cursor{
+		"unknown version": rewrite(func(header []byte) { header[catalogCursorVersionAt]++ }),
+		"foreign magic":   rewrite(func(header []byte) { copy(header[catalogCursorMagicAt:], "XXXX") }),
+		"foreign scope":   rewrite(func(header []byte) { header[catalogCursorScopeAt]++ }),
+		"empty payload":   joinCatalogCursor(header, nil),
+		"journal cursor":  journal,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if cursor == valid {
+				t.Fatal("the mutation did not change the cursor")
+			}
+			_, err := store.ListSessions(context.Background(), ListSessionsRequest{
+				TenantID: catalogTenant,
+				Cursor:   cursor,
+				Limit:    1,
+			})
+			if err == nil {
+				t.Fatal("an unissued cursor was accepted")
+			}
+			assertCatalogCode(t, err, CatalogErrorCursor)
+		})
+	}
+}
+
+// TestListSessionsBoundsACursorBeforeDecodingIt pins the length gate as an
+// allocation precondition rather than a restatement of the envelope checks. A
+// decoder sizes its destination from the caller's string, so an unbounded token
+// would make this reader allocate in proportion to attacker-supplied input. The
+// assertion that no provider query was made is what distinguishes the gate from
+// the rejection that would otherwise happen further down.
+func TestListSessionsBoundsACursorBeforeDecodingIt(t *testing.T) {
+	store, audit, _ := openAuditedListStore(t)
+	seedTwoTenants(t, store)
+	valid := mustTruncatedCursor(t, store, catalogTenant)
+	header, payload := splitCatalogCursor(t, valid)
+	oversized := joinCatalogCursor(header, append(payload, bytes.Repeat([]byte{'x'}, MaxCatalogCursorBytes)...))
+
+	scope, err := store.deriveSessionScope(catalogTenant, "session-a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit.arm(scope.CatalogScope)
+	before := len(audit.rankedCalls())
+
+	if _, err := store.ListSessions(context.Background(), ListSessionsRequest{
+		TenantID: catalogTenant,
+		Cursor:   oversized,
+		Limit:    1,
+	}); err == nil {
+		t.Fatal("an oversized cursor was accepted")
+	} else {
+		assertCatalogCode(t, err, CatalogErrorCursor)
+	}
+	if got := len(audit.rankedCalls()) - before; got != 0 {
+		t.Fatalf("an oversized cursor reached the provider %d times; it must be refused before it is decoded", got)
+	}
+}
+
+// --- listing fail-closed paths -------------------------------------------
+
+// TestListSessionsHoldsEveryRecordToTheRequestedIdentity covers both halves of
+// the identity check a listed record must pass: the tenant it claims and the
+// stable key it was stored under.
+func TestListSessionsHoldsEveryRecordToTheRequestedIdentity(t *testing.T) {
+	for name, corrupt := range map[string]struct{ from, to string }{
+		"foreign tenant": {`"tenant_id":"tenant-a"`, `"tenant_id":"tenant-z"`},
+		"foreign key":    {`"session_id":"session-a1"`, `"session_id":"session-z"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, hostile := openHostileListStore(t)
+			mustCreateSession(t, store, catalogTenant, "session-a1", catalogActiveAt)
+			hostile.answerRanked(func(page storage.RankedPage, err error) (storage.RankedPage, error) {
+				if err != nil {
+					return page, err
+				}
+				for i := range page.Records {
+					rewritten := bytes.Replace(page.Records[i].Value, []byte(corrupt.from), []byte(corrupt.to), 1)
+					if bytes.Equal(rewritten, page.Records[i].Value) {
+						t.Fatalf("could not corrupt %s in %s", name, page.Records[i].Value)
+					}
+					page.Records[i].Value = rewritten
+				}
+				return page, nil
+			})
+
+			page, err := store.ListSessions(context.Background(), ListSessionsRequest{TenantID: catalogTenant, Limit: 10})
+			if err == nil {
+				t.Fatalf("a listing returned %v for a record it could not hold to its identity", listedSessionIDs(page))
+			}
+			assertCatalogCode(t, err, CatalogErrorIdentity)
+			if len(page.Sessions) != 0 {
+				t.Fatalf("a failed listing returned %d sessions", len(page.Sessions))
+			}
+		})
+	}
+}
+
+// TestListSessionsRejectsAnOutOfOrderProviderPage holds the provider to the
+// descending order the page shape promises. A caller reads a SessionPage as
+// recent-first, so a page that is not is refused rather than published.
+func TestListSessionsRejectsAnOutOfOrderProviderPage(t *testing.T) {
+	store, hostile := openHostileListStore(t)
+	mustCreateSession(t, store, catalogTenant, "session-a1", catalogActiveAt)
+	mustCreateSession(t, store, catalogTenant, "session-a2", catalogActiveAt.Add(time.Minute))
+	hostile.answerRanked(func(page storage.RankedPage, err error) (storage.RankedPage, error) {
+		if err != nil || len(page.Records) < 2 {
+			return page, err
+		}
+		slices.Reverse(page.Records)
+		return page, nil
+	})
+
+	_, err := store.ListSessions(context.Background(), ListSessionsRequest{TenantID: catalogTenant, Limit: 10})
+	if err == nil {
+		t.Fatal("an ascending page was published as a recent-first page")
+	}
+	assertCatalogCode(t, err, CatalogErrorBackend)
+}
+
+// TestListSessionsClassifiesProviderFailures maps the outcomes only the
+// provider can produce into the catalog vocabulary.
+func TestListSessionsClassifiesProviderFailures(t *testing.T) {
+	for name, tt := range map[string]struct {
+		err  error
+		want CatalogErrorCode
+	}{
+		"invalid cursor": {
+			err:  storage.NewInvalidOrderedCursorError(storage.RankedCursorKind, "token", storage.OrderedCursorQueryMismatch),
+			want: CatalogErrorCursor,
+		},
+		"unavailable": {err: errors.New("provider is unavailable"), want: CatalogErrorBackend},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, hostile := openHostileListStore(t)
+			mustCreateSession(t, store, catalogTenant, "session-a1", catalogActiveAt)
+			hostile.answerRanked(func(storage.RankedPage, error) (storage.RankedPage, error) {
+				return storage.RankedPage{}, tt.err
+			})
+			_, err := store.ListSessions(context.Background(), ListSessionsRequest{TenantID: catalogTenant, Limit: 10})
+			got := assertCatalogCode(t, err, tt.want)
+			if !errors.Is(err, tt.err) {
+				t.Fatalf("the provider cause was not preserved: %v", got)
+			}
+		})
+	}
+}
+
+// TestListSessionsRejectsAnInvalidRequest covers the inputs refused before any
+// provider work happens.
+func TestListSessionsRejectsAnInvalidRequest(t *testing.T) {
+	store, audit, _ := openAuditedListStore(t)
+	mustCreateSession(t, store, catalogTenant, "session-a1", catalogActiveAt)
+	scope, err := store.deriveSessionScope(catalogTenant, "session-a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit.arm(scope.CatalogScope)
+
+	for name, req := range map[string]ListSessionsRequest{
+		"negative limit":  {TenantID: catalogTenant, Limit: -1},
+		"limit above max": {TenantID: catalogTenant, Limit: storage.MaxOrderedPageLimit + 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			before := len(audit.rankedCalls())
+			_, err := store.ListSessions(context.Background(), req)
+			if err == nil {
+				t.Fatal("an invalid request was accepted")
+			}
+			got := assertCatalogCode(t, err, CatalogErrorInvalid)
+			if got.Field != "limit" {
+				t.Fatalf("field = %q, want %q", got.Field, "limit")
+			}
+			if reached := len(audit.rankedCalls()) - before; reached != 0 {
+				t.Fatalf("an invalid request reached the provider %d times", reached)
+			}
+		})
+	}
+
+	t.Run("invalid tenant", func(t *testing.T) {
+		before := len(audit.rankedCalls())
+		_, err := store.ListSessions(context.Background(), ListSessionsRequest{TenantID: "", Limit: 1})
+		var invalid *InvalidIdentityError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("error = %T %v, want *InvalidIdentityError", err, err)
+		}
+		if invalid.Field != "TenantID" {
+			t.Fatalf("field = %q, want TenantID", invalid.Field)
+		}
+		if reached := len(audit.rankedCalls()) - before; reached != 0 {
+			t.Fatalf("an invalid tenant reached the provider %d times", reached)
+		}
+	})
+}
+
+// TestListSessionsDefaultsAnUnsetLimitToTheStoreCeiling pins that zero means
+// "the store's page size" rather than "no records".
+func TestListSessionsDefaultsAnUnsetLimitToTheStoreCeiling(t *testing.T) {
+	store, audit, _ := openAuditedListStore(t, WithLimits(Limits{MaxPageSize: 7}))
+	mustCreateSession(t, store, catalogTenant, "session-a1", catalogActiveAt)
+	scope, err := store.deriveSessionScope(catalogTenant, "session-a1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit.arm(scope.CatalogScope)
+
+	page := mustListSessions(t, store, ListSessionsRequest{TenantID: catalogTenant})
+	if len(page.Sessions) != 1 {
+		t.Fatalf("sessions = %v, want the one created session", listedSessionIDs(page))
+	}
+	calls := audit.rankedCalls()
+	if len(calls) != 1 || calls[0].limit != 7 {
+		t.Fatalf("provider calls = %+v, want one call with the store page size 7", calls)
+	}
+}
+
+// TestListSessionsOfAnUnusedTenantIsEmpty documents the deliberate difference
+// between a list and a direct get. A get names a session and must prove that
+// session's collision binding before it trusts a derived name; a list names no
+// session, and a tenant that has never created one has no binding to prove. Its
+// answer is an empty page rather than a failure, and cross-tenant safety comes
+// from holding every returned record to the tenant it claims.
+func TestListSessionsOfAnUnusedTenantIsEmpty(t *testing.T) {
+	store, _, kv := openAuditedListStore(t)
+	mustCreateSession(t, store, catalogOtherTenant, "session-b1", catalogActiveAt)
+
+	page := mustListSessions(t, store, ListSessionsRequest{TenantID: catalogTenant, Limit: 10})
+	if len(page.Sessions) != 0 {
+		t.Fatalf("sessions = %v, want none", listedSessionIDs(page))
+	}
+	if page.NextCursor != "" {
+		t.Fatalf("an empty page returned a cursor %q", page.NextCursor)
+	}
+	if kv.keys.Load() != 0 {
+		t.Fatalf("a listing scanned KV keys %d times", kv.keys.Load())
+	}
+}
+
+// TestListSessionsRejectsANonCanonicalCursorSpelling covers the slack in
+// unpadded base64: the low bits of the final group are dropped, so several
+// distinct strings decode to identical bytes. Accepting more than one of them
+// would give a single page position several names and let a token be perturbed
+// while still resuming, so the reader requires the exact spelling it emits.
+//
+// The variants are found by re-spelling a cursor this store issued rather than
+// written down, and the test insists it found at least one so it cannot quietly
+// stop exercising the check.
+func TestListSessionsRejectsANonCanonicalCursorSpelling(t *testing.T) {
+	store := openTestStore(t)
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+	variants := 0
+	for size := 1; size <= 3; size++ {
+		cursor, err := store.encodeCatalogCursor(catalogTenant, storage.RankedCursor(strings.Repeat("t", size)))
+		if err != nil {
+			t.Fatalf("encodeCatalogCursor: %v", err)
+		}
+		if _, err := store.decodeCatalogCursor(catalogTenant, cursor); err != nil {
+			t.Fatalf("the store rejected a cursor it issued: %v", err)
+		}
+		want, err := base64.RawURLEncoding.DecodeString(string(cursor))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, letter := range alphabet {
+			respelled := string(cursor[:len(cursor)-1]) + string(letter)
+			if respelled == string(cursor) {
+				continue
+			}
+			got, err := base64.RawURLEncoding.DecodeString(respelled)
+			if err != nil || !bytes.Equal(got, want) {
+				continue
+			}
+			variants++
+			if _, err := store.decodeCatalogCursor(catalogTenant, sessionwire.Cursor(respelled)); err == nil {
+				t.Fatalf("a second spelling of one position was accepted: %q and %q", cursor, respelled)
+			} else {
+				assertCatalogCode(t, err, CatalogErrorCursor)
+			}
+		}
+	}
+	if variants == 0 {
+		t.Fatal("no alternate spelling was found, so this test exercised nothing")
+	}
+}
+
+// TestListSessionsRefusesToIssueACursorItCouldNotAccept holds the two halves of
+// the cursor bound together. The payload is a provider token whose length this
+// package does not control, so a provider that issued one larger than the bound
+// would otherwise be handed back a page cursor that this same store refuses on
+// presentation — a walk that dead-ends with no way for a caller to tell why.
+func TestListSessionsRefusesToIssueACursorItCouldNotAccept(t *testing.T) {
+	store, hostile := openHostileListStore(t)
+	mustCreateSession(t, store, catalogTenant, "session-a1", catalogActiveAt)
+	hostile.answerRanked(func(page storage.RankedPage, err error) (storage.RankedPage, error) {
+		if err != nil {
+			return page, err
+		}
+		page.NextCursor = storage.RankedCursor(strings.Repeat("t", MaxCatalogCursorBytes))
+		return page, nil
+	})
+
+	_, err := store.ListSessions(context.Background(), ListSessionsRequest{TenantID: catalogTenant, Limit: 10})
+	if err == nil {
+		t.Fatal("a cursor larger than this store will accept was issued to a caller")
+	}
+	got := assertCatalogCode(t, err, CatalogErrorBackend)
+	if got.Field != "next_cursor" {
+		t.Fatalf("field = %q, want next_cursor", got.Field)
 	}
 }

@@ -3,6 +3,7 @@ package sessionstore
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"math"
@@ -34,6 +35,14 @@ const (
 	// through the gate API instead.
 	MaxCatalogOpenGates = 16
 
+	// MaxCatalogCursorBytes bounds a decoded catalog page cursor. A cursor
+	// carries a provider token whose length this package does not control, so
+	// the bound is enforced when one is issued as well as when one is
+	// presented: a token this store hands out is always a token it will accept
+	// back, and a provider whose page tokens exceed this is out of contract
+	// here rather than silently unpaginable.
+	MaxCatalogCursorBytes = 4 << 10
+
 	// MaxCatalogRecordBytes bounds an encoded catalog record. It is well below
 	// storage.MaxOrderedValueBytes so a record that this package accepts always
 	// fits in the provider, leaving no state that can be written but not
@@ -55,9 +64,12 @@ const _ = uint(storage.MaxOrderedValueBytes - MaxCatalogRecordBytes)
 var (
 	minRankableTime = time.Unix(0, math.MinInt64).UTC()
 	maxRankableTime = time.Unix(0, math.MaxInt64).UTC()
-
-	timeType = reflect.TypeOf(time.Time{})
 )
+
+// timeType is the one instant type the projection text walk stops at. It is
+// unrelated to the rank bounds above and is declared separately so neither
+// doc comment describes the other's value.
+var timeType = reflect.TypeOf(time.Time{})
 
 // CheckpointSummary is the bounded durable description of the active workspace
 // checkpoint. Its zero value means no checkpoint has been committed. It names a
@@ -180,6 +192,15 @@ type CreateCatalogEntryRequest struct {
 type GetCatalogEntryRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
+}
+
+// ListSessionsRequest positions one bounded recent-first page of a tenant's
+// sessions. Cursor is a token a previous page issued; Limit is that page's
+// record ceiling, and zero means the store's configured page size.
+type ListSessionsRequest struct {
+	TenantID sessionwire.TenantID
+	Cursor   sessionwire.Cursor
+	Limit    int
 }
 
 // UpdateCatalogHostStateRequest writes the fields owned by the Host holding the
@@ -373,6 +394,162 @@ func (s *Store) UpdateCatalogDesiredState(ctx context.Context, req UpdateCatalog
 	return s.writeCatalogRecord(opCtx, scope, next, current.Revision)
 }
 
+// ListSessions returns one bounded recent-first page of a tenant's sessions.
+//
+// The whole page is one ranked provider query. The tenant is the ranking scope,
+// so the restriction and the recency order are both inside the query and the
+// limit applies to an already-restricted, already-ordered result. Nothing here
+// enumerates a prefix, sorts a catalog, or filters a wider page afterwards:
+// those all cost work proportional to a tenant's history rather than to the
+// page, and a Factory calls this on every picker render.
+//
+// This deliberately does NOT verify the tenant's collision witness, which is
+// where it differs from GetCatalogEntry. A direct get names a session and must
+// prove that session's binding before it trusts a derived name; a list names no
+// session, and a tenant that has never created one has no binding to prove, so
+// requiring one would answer "this tenant is empty" with a failure. Cross-tenant
+// safety instead comes from below: every record the provider returns is held to
+// the tenant it itself claims, so a scope two tenants somehow shared would fail
+// the page closed rather than disclose a row.
+func (s *Store) ListSessions(ctx context.Context, req ListSessionsRequest) (sessionwire.SessionPage, error) {
+	limit, ok := s.pageLimit(req.Limit)
+	if !ok {
+		return sessionwire.SessionPage{}, catalogErr(CatalogErrorInvalid, "limit", nil)
+	}
+	scope, err := s.deriveTenantScope(req.TenantID)
+	if err != nil {
+		return sessionwire.SessionPage{}, err
+	}
+	var after storage.RankedCursor
+	if req.Cursor != "" {
+		if after, err = s.decodeCatalogCursor(req.TenantID, req.Cursor); err != nil {
+			return sessionwire.SessionPage{}, err
+		}
+	}
+	opCtx, release, err := s.admitForeground(ctx)
+	if err != nil {
+		return sessionwire.SessionPage{}, err
+	}
+	defer release()
+
+	ranked, err := s.backend.OrderedIndex.ListRanked(opCtx, catalogNamespace, scope.CatalogScope, after, limit)
+	if err != nil {
+		return sessionwire.SessionPage{}, classifyCatalogOrderedError(err, "list")
+	}
+	var page sessionwire.SessionPage
+	for _, stored := range ranked.Records {
+		// The stable key is the identity the provider filed the record under
+		// and the record carries its own; catalogEntry holds one to the other
+		// and both to the requested tenant, which is the same check a direct
+		// get makes and is deliberately not restated here.
+		entry, err := catalogEntry(stored, req.TenantID, sessionwire.SessionID(stored.ID.StableKey))
+		if err != nil {
+			return sessionwire.SessionPage{}, err
+		}
+		summary, err := entry.Record.Summary()
+		if err != nil {
+			return sessionwire.SessionPage{}, err
+		}
+		page.Sessions = append(page.Sessions, summary)
+	}
+	if ranked.NextCursor != "" {
+		next, err := s.encodeCatalogCursor(req.TenantID, ranked.NextCursor)
+		if err != nil {
+			return sessionwire.SessionPage{}, err
+		}
+		page.NextCursor = next
+	}
+	// Core owns what "recent-first" means for this page shape, so the order is
+	// verified by asking core rather than by comparing timestamps again here.
+	// A page that fails is a provider that did not deliver the descending rank
+	// order ListRanked promises, and publishing it would hand a caller a page
+	// whose own contract it violates.
+	if err := page.Validate(); err != nil {
+		return sessionwire.SessionPage{}, catalogErr(CatalogErrorBackend, "sessions", err)
+	}
+	return page, nil
+}
+
+// Catalog page cursor grammar, stated exactly once.
+//
+//	cursor = base64url-raw( magic[4] version[1] scope[32] provider-token[1..] )
+//
+// The provider's own ranked cursor is the payload and stays opaque: this
+// package cannot interpret it and does not try. What the envelope adds is the
+// binding the provider is not obliged to give a CALLER of this package. The
+// magic separates a catalog page from the journal's cursors, so neither can be
+// replayed into the other, and the scope token is a domain-separated digest of
+// the tenant the cursor was issued for, so a token cannot be moved between
+// tenants even if the provider underneath does not bind its own.
+//
+// It also keeps the provider's grammar out of this package's public API: a
+// caller retains a SessionStore token, not a memstore or JetStream one.
+const (
+	catalogCursorMagic        = "LRCP"
+	catalogCursorVersion byte = 1
+
+	catalogCursorMagicAt   = 0
+	catalogCursorVersionAt = catalogCursorMagicAt + 4
+	catalogCursorScopeAt   = catalogCursorVersionAt + 1
+	catalogCursorTokenAt   = catalogCursorScopeAt + 32
+)
+
+func (s *Store) catalogCursorScope(tenant sessionwire.TenantID) [32]byte {
+	return s.keys.digest(digestFrame("looprig/sessionstore/catalog/cursor/v1", []byte(tenant)))
+}
+
+// encodeCatalogCursor wraps one provider continuation token for one tenant.
+func (s *Store) encodeCatalogCursor(tenant sessionwire.TenantID, next storage.RankedCursor) (sessionwire.Cursor, error) {
+	scope := s.catalogCursorScope(tenant)
+	token := make([]byte, catalogCursorTokenAt, catalogCursorTokenAt+len(next))
+	copy(token[catalogCursorMagicAt:catalogCursorVersionAt], catalogCursorMagic)
+	token[catalogCursorVersionAt] = catalogCursorVersion
+	copy(token[catalogCursorScopeAt:catalogCursorTokenAt], scope[:])
+	token = append(token, next...)
+	if len(token) > MaxCatalogCursorBytes {
+		return "", catalogErr(CatalogErrorBackend, "next_cursor", nil)
+	}
+	return sessionwire.Cursor(base64.RawURLEncoding.EncodeToString(token)), nil
+}
+
+// decodeCatalogCursor unwraps a continuation token this store issued for this
+// tenant and returns the provider token inside it.
+func (s *Store) decodeCatalogCursor(tenant sessionwire.TenantID, cursor sessionwire.Cursor) (storage.RankedCursor, error) {
+	invalid := func() (storage.RankedCursor, error) {
+		return "", catalogErr(CatalogErrorCursor, "cursor", nil)
+	}
+	// Bound the decode BEFORE it allocates: DecodeString sizes its own
+	// destination from the caller's string, so an unbounded cursor would make
+	// this reader allocate in proportion to attacker-supplied input. For
+	// RawURLEncoding DecodedLen is exact, so a successful decode after this
+	// gate has a length inside these bounds and the envelope slices below
+	// cannot be out of range.
+	size := base64.RawURLEncoding.DecodedLen(len(cursor))
+	if size <= catalogCursorTokenAt || size > MaxCatalogCursorBytes {
+		return invalid()
+	}
+	token, err := base64.RawURLEncoding.DecodeString(string(cursor))
+	if err != nil {
+		return invalid()
+	}
+	// Unpadded base64 has slack in its final character: the low bits of the
+	// last group are dropped, so several distinct strings decode to identical
+	// bytes. Require the exact spelling this reader emits, so one position has
+	// one cursor and a token cannot be perturbed while still being accepted.
+	if base64.RawURLEncoding.EncodeToString(token) != string(cursor) {
+		return invalid()
+	}
+	if string(token[catalogCursorMagicAt:catalogCursorVersionAt]) != catalogCursorMagic ||
+		token[catalogCursorVersionAt] != catalogCursorVersion {
+		return invalid()
+	}
+	scope := s.catalogCursorScope(tenant)
+	if !bytes.Equal(token[catalogCursorScopeAt:catalogCursorTokenAt], scope[:]) {
+		return invalid()
+	}
+	return storage.RankedCursor(token[catalogCursorTokenAt:]), nil
+}
+
 // readCatalogEntry verifies the session's witnesses and returns its current
 // decoded record. Both update paths funnel through it so the binding check and
 // the stored-identity check are stated exactly once.
@@ -477,6 +654,14 @@ func classifyCatalogOrderedError(err error, field string) error {
 	var conflict *storage.OrderedRevisionConflictError
 	if errors.As(err, &conflict) {
 		return &CatalogError{Code: CatalogErrorConflict, Field: field, Revision: conflict.ActualRevision, Cause: err}
+	}
+	// A limit error has no arm: every limit this package sends is normalized by
+	// pageLimit against storage.MaxOrderedPageLimit, which is also the ceiling
+	// WithLimits validates the configured page size against, so the provider
+	// cannot see one it would refuse.
+	var cursor *storage.InvalidOrderedCursorError
+	if errors.As(err, &cursor) {
+		return catalogErr(CatalogErrorCursor, field, err)
 	}
 	var ambiguous *storage.OrderedAmbiguousError
 	if errors.As(err, &ambiguous) {
