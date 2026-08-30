@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -80,11 +81,11 @@ func TestOpenValidatesOptions(t *testing.T) {
 		wantLimit *InvalidLimitError
 	}{
 		{name: "nil option", option: nil, wantField: "option"},
-		{name: "zero page size", option: WithLimits(Limits{ShutdownTimeout: DefaultShutdownTimeout}), wantField: "MaxPageSize", wantLimit: &InvalidLimitError{Field: "MaxPageSize", Value: 0, Min: 1, Max: storage.MaxOrderedPageLimit}},
-		{name: "negative page size", option: WithLimits(Limits{MaxPageSize: -1, ShutdownTimeout: DefaultShutdownTimeout}), wantField: "MaxPageSize", wantLimit: &InvalidLimitError{Field: "MaxPageSize", Value: -1, Min: 1, Max: storage.MaxOrderedPageLimit}},
-		{name: "page size above provider maximum", option: WithLimits(Limits{MaxPageSize: storage.MaxOrderedPageLimit + 1, ShutdownTimeout: DefaultShutdownTimeout}), wantField: "MaxPageSize", wantLimit: &InvalidLimitError{Field: "MaxPageSize", Value: storage.MaxOrderedPageLimit + 1, Min: 1, Max: storage.MaxOrderedPageLimit}},
-		{name: "zero shutdown timeout", option: WithLimits(Limits{MaxPageSize: 1}), wantField: "ShutdownTimeout", wantLimit: &InvalidLimitError{Field: "ShutdownTimeout", Value: 0, Min: 1, Max: int64(^uint64(0) >> 1)}},
-		{name: "negative shutdown timeout", option: WithLimits(Limits{MaxPageSize: 1, ShutdownTimeout: -time.Nanosecond}), wantField: "ShutdownTimeout", wantLimit: &InvalidLimitError{Field: "ShutdownTimeout", Value: -1, Min: 1, Max: int64(^uint64(0) >> 1)}},
+		{name: "zero page size", option: WithLimits(Limits{}), wantField: "MaxPageSize", wantLimit: &InvalidLimitError{Field: "MaxPageSize", Value: 0, Min: 1, Max: storage.MaxOrderedPageLimit}},
+		{name: "negative page size", option: WithLimits(Limits{MaxPageSize: -1}), wantField: "MaxPageSize", wantLimit: &InvalidLimitError{Field: "MaxPageSize", Value: -1, Min: 1, Max: storage.MaxOrderedPageLimit}},
+		{name: "page size above provider maximum", option: WithLimits(Limits{MaxPageSize: storage.MaxOrderedPageLimit + 1}), wantField: "MaxPageSize", wantLimit: &InvalidLimitError{Field: "MaxPageSize", Value: storage.MaxOrderedPageLimit + 1, Min: 1, Max: storage.MaxOrderedPageLimit}},
+		{name: "zero shutdown timeout", option: WithShutdownTimeout(0), wantField: "ShutdownTimeout", wantLimit: &InvalidLimitError{Field: "ShutdownTimeout", Value: 0, Min: 1, Max: int64(^uint64(0) >> 1)}},
+		{name: "negative shutdown timeout", option: WithShutdownTimeout(-time.Nanosecond), wantField: "ShutdownTimeout", wantLimit: &InvalidLimitError{Field: "ShutdownTimeout", Value: -1, Min: 1, Max: int64(^uint64(0) >> 1)}},
 		{name: "nil clock", option: WithClock(nil), wantField: "Clock"},
 		{name: "typed nil clock", option: WithClock((*nilClock)(nil)), wantField: "Clock"},
 		{name: "nil logger", option: WithLogger(nil), wantField: "Logger"},
@@ -132,7 +133,8 @@ func TestOpenAcceptsExplicitSeams(t *testing.T) {
 		memstore.New(),
 		WithClock(clock),
 		WithLogger(logger),
-		WithLimits(Limits{MaxPageSize: 17, ShutdownTimeout: 3 * time.Second}),
+		WithLimits(Limits{MaxPageSize: 17}),
+		WithShutdownTimeout(3*time.Second),
 	)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -152,8 +154,38 @@ func TestOpenAcceptsExplicitSeams(t *testing.T) {
 	if store.limits.MaxPageSize != 17 {
 		t.Fatalf("MaxPageSize = %d, want 17", store.limits.MaxPageSize)
 	}
-	if store.limits.ShutdownTimeout != 3*time.Second {
-		t.Fatalf("ShutdownTimeout = %v, want 3s", store.limits.ShutdownTimeout)
+	if store.shutdownTimeout != 3*time.Second {
+		t.Fatalf("ShutdownTimeout = %v, want 3s", store.shutdownTimeout)
+	}
+}
+
+func TestOpenRejectsRepeatedProviderOwnership(t *testing.T) {
+	t.Parallel()
+
+	contextCloser := &recordingCloser{}
+	ioCloser := &recordingIOCloser{}
+	tests := []struct {
+		name    string
+		options []Option
+	}{
+		{name: "context then context", options: []Option{WithProviderOwnership(contextCloser), WithProviderOwnership(contextCloser)}},
+		{name: "io then io", options: []Option{WithIOProviderOwnership(ioCloser), WithIOProviderOwnership(ioCloser)}},
+		{name: "context then io", options: []Option{WithProviderOwnership(contextCloser), WithIOProviderOwnership(ioCloser)}},
+		{name: "io then context", options: []Option{WithIOProviderOwnership(ioCloser), WithProviderOwnership(contextCloser)}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			store, err := Open(context.Background(), memstore.New(), test.options...)
+			if store != nil {
+				t.Fatal("Open returned a store for repeated ownership transfer")
+			}
+			var invalid *InvalidOptionError
+			if !errors.As(err, &invalid) || invalid.Field != "ProviderOwnership" {
+				t.Fatalf("Open error = %T %v, want ProviderOwnership *InvalidOptionError", err, err)
+			}
+		})
 	}
 }
 
@@ -188,13 +220,13 @@ func TestCloseCancelsOwnedContextBeforeClosingOwnedProvider(t *testing.T) {
 		t.Fatalf("Open: %v", err)
 	}
 
-	store.background.Add(1)
 	workerDone := make(chan struct{})
-	go func() {
-		defer store.background.Done()
-		<-store.ctx.Done()
+	if err := store.startBackground(func(ctx context.Context) {
+		<-ctx.Done()
 		close(workerDone)
-	}()
+	}); err != nil {
+		t.Fatalf("startBackground: %v", err)
+	}
 
 	err = store.Close(context.Background())
 	if !errors.Is(err, errProviderClose) {
@@ -227,6 +259,70 @@ func TestCloseOwnsIOProviderExactlyOnce(t *testing.T) {
 	if got := closer.calls.Load(); got != 1 {
 		t.Fatalf("provider Close calls = %d, want 1", got)
 	}
+}
+
+func TestIOProviderShutdownTimeoutReturnsStableResult(t *testing.T) {
+	t.Parallel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	exited := make(chan struct{})
+	var closerStarted atomic.Bool
+	var releaseOnce sync.Once
+	releaseCloser := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		releaseCloser()
+		if closerStarted.Load() {
+			<-exited
+		}
+	})
+
+	closer := &recordingIOCloser{closeFn: func() error {
+		closerStarted.Store(true)
+		close(started)
+		defer close(exited)
+		<-release
+		return errProviderClose
+	}}
+	store, err := Open(
+		context.Background(),
+		memstore.New(),
+		WithShutdownTimeout(time.Millisecond),
+		WithIOProviderOwnership(closer),
+	)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() { result <- store.Close(context.Background()) }()
+	safety, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	select {
+	case <-started:
+	case <-safety.Done():
+		t.Fatal("owned io.Closer did not start")
+	}
+	select {
+	case got := <-result:
+		if !errors.Is(got, context.DeadlineExceeded) {
+			t.Fatalf("Close error = %v, want deadline exceeded", got)
+		}
+	case <-safety.Done():
+		t.Fatal("Close did not honor ShutdownTimeout")
+	}
+
+	canceled, cancelCanceled := context.WithCancel(context.Background())
+	cancelCanceled()
+	if got := store.Close(canceled); !errors.Is(got, context.DeadlineExceeded) || errors.Is(got, context.Canceled) {
+		t.Fatalf("completed Close error = %v, want stable deadline exceeded", got)
+	}
+	if got := closer.calls.Load(); got != 1 {
+		t.Fatalf("provider Close calls = %d, want 1", got)
+	}
+
+	releaseCloser()
+	<-exited
 }
 
 func TestCloseIsConcurrentIdempotentAndReturnsStableResult(t *testing.T) {
@@ -279,22 +375,22 @@ func TestCloseCallerDeadlineDoesNotAbandonLifecycle(t *testing.T) {
 	store, err := Open(
 		context.Background(),
 		memstore.New(),
-		WithLimits(Limits{MaxPageSize: 1, ShutdownTimeout: time.Second}),
+		WithShutdownTimeout(time.Second),
 		WithProviderOwnership(closer),
 	)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 
-	store.background.Add(1)
 	workerCanceled := make(chan struct{})
 	releaseWorker := make(chan struct{})
-	go func() {
-		defer store.background.Done()
-		<-store.ctx.Done()
+	if err := store.startBackground(func(ctx context.Context) {
+		<-ctx.Done()
 		close(workerCanceled)
 		<-releaseWorker
-	}()
+	}); err != nil {
+		t.Fatalf("startBackground: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
@@ -352,7 +448,7 @@ func TestProviderShutdownTimeoutIsStable(t *testing.T) {
 	store, err := Open(
 		context.Background(),
 		memstore.New(),
-		WithLimits(Limits{MaxPageSize: 1, ShutdownTimeout: time.Millisecond}),
+		WithShutdownTimeout(time.Millisecond),
 		WithProviderOwnership(closer),
 	)
 	if err != nil {
@@ -369,6 +465,62 @@ func TestProviderShutdownTimeoutIsStable(t *testing.T) {
 	}
 	if got := closer.calls.Load(); got != 1 {
 		t.Fatalf("provider Close calls = %d, want 1", got)
+	}
+}
+
+func TestCloseRejectsWorkAdmissionAfterShutdownStarts(t *testing.T) {
+	t.Parallel()
+
+	providerClosed := make(chan struct{})
+	closer := &recordingCloser{closeFn: func(context.Context) error {
+		close(providerClosed)
+		return nil
+	}}
+	store, err := Open(context.Background(), memstore.New(), WithProviderOwnership(closer))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	workerCanceled := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	if err := store.startBackground(func(ctx context.Context) {
+		<-ctx.Done()
+		close(workerCanceled)
+		<-releaseWorker
+	}); err != nil {
+		t.Fatalf("startBackground: %v", err)
+	}
+
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- store.Close(context.Background()) }()
+	<-workerCanceled
+
+	lateRan := make(chan struct{})
+	err = store.startBackground(func(context.Context) { close(lateRan) })
+	var closed *StoreClosedError
+	if !errors.As(err, &closed) {
+		t.Fatalf("late startBackground error = %T %v, want *StoreClosedError", err, err)
+	}
+	select {
+	case <-lateRan:
+		t.Fatal("work admitted after shutdown started")
+	default:
+	}
+	select {
+	case <-providerClosed:
+		t.Fatal("provider closed before admitted work drained")
+	default:
+	}
+
+	close(releaseWorker)
+	if err := <-closeResult; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	<-providerClosed
+	select {
+	case <-lateRan:
+		t.Fatal("late work ran after provider close")
+	default:
 	}
 }
 

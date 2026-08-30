@@ -17,15 +17,13 @@ const DefaultShutdownTimeout = 30 * time.Second
 // Limits contains Store-wide ceilings. MaxPageSize bounds every provider page
 // requested by SessionStore; individual operations may request a smaller page.
 type Limits struct {
-	MaxPageSize     int
-	ShutdownTimeout time.Duration
+	MaxPageSize int
 }
 
-// DefaultLimits returns bounded defaults for provider queries and cleanup.
+// DefaultLimits returns bounded defaults for provider queries.
 func DefaultLimits() Limits {
 	return Limits{
-		MaxPageSize:     storage.MaxOrderedPageLimit,
-		ShutdownTimeout: DefaultShutdownTimeout,
+		MaxPageSize: storage.MaxOrderedPageLimit,
 	}
 }
 
@@ -44,17 +42,19 @@ type ProviderCloser interface {
 type Option func(*config) error
 
 type config struct {
-	limits        Limits
-	clock         Clock
-	logger        *slog.Logger
-	providerClose func(context.Context) error
+	limits          Limits
+	clock           Clock
+	logger          *slog.Logger
+	shutdownTimeout time.Duration
+	providerClose   func(context.Context) error
 }
 
 func defaultConfig() config {
 	return config{
-		limits: DefaultLimits(),
-		clock:  systemClock{},
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		limits:          DefaultLimits(),
+		clock:           systemClock{},
+		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		shutdownTimeout: DefaultShutdownTimeout,
 	}
 }
 
@@ -70,16 +70,25 @@ func WithLimits(limits Limits) Option {
 			}
 			return &InvalidOptionError{Field: "MaxPageSize", Cause: cause}
 		}
-		if limits.ShutdownTimeout <= 0 {
+		cfg.limits = limits
+		return nil
+	}
+}
+
+// WithShutdownTimeout bounds explicitly owned provider cleanup after Store
+// background work drains.
+func WithShutdownTimeout(timeout time.Duration) Option {
+	return func(cfg *config) error {
+		if timeout <= 0 {
 			cause := &InvalidLimitError{
 				Field: "ShutdownTimeout",
-				Value: int64(limits.ShutdownTimeout),
+				Value: int64(timeout),
 				Min:   int64(time.Nanosecond),
 				Max:   int64(1<<63 - 1),
 			}
 			return &InvalidOptionError{Field: "ShutdownTimeout", Cause: cause}
 		}
-		cfg.limits = limits
+		cfg.shutdownTimeout = timeout
 		return nil
 	}
 }
@@ -113,19 +122,37 @@ func WithProviderOwnership(closer ProviderCloser) Option {
 		if isNilDynamic(reflect.ValueOf(closer)) {
 			return &InvalidOptionError{Field: "ProviderCloser"}
 		}
+		if cfg.providerClose != nil {
+			return &InvalidOptionError{Field: "ProviderOwnership"}
+		}
 		cfg.providerClose = closer.Close
 		return nil
 	}
 }
 
 // WithIOProviderOwnership explicitly transfers ownership of a provider whose
-// released lifecycle contract is the standard io.Closer shape.
+// released lifecycle contract is the standard io.Closer shape. Because
+// io.Closer has no context, ShutdownTimeout can release the Store lifecycle but
+// cannot force the underlying Close to return; its adapter goroutine may outlive
+// the Store until the provider eventually returns.
 func WithIOProviderOwnership(closer io.Closer) Option {
 	return func(cfg *config) error {
 		if isNilDynamic(reflect.ValueOf(closer)) {
 			return &InvalidOptionError{Field: "IOProviderCloser"}
 		}
-		cfg.providerClose = func(context.Context) error { return closer.Close() }
+		if cfg.providerClose != nil {
+			return &InvalidOptionError{Field: "ProviderOwnership"}
+		}
+		cfg.providerClose = func(ctx context.Context) error {
+			result := make(chan error, 1)
+			go func() { result <- closer.Close() }()
+			select {
+			case err := <-result:
+				return err
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		return nil
 	}
 }

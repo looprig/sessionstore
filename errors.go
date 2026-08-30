@@ -39,3 +39,8 @@ type InvalidLimitError struct {
 func (e *InvalidLimitError) Error() string {
 	return fmt.Sprintf("%s %d is outside [%d,%d]", e.Field, e.Value, e.Min, e.Max)
 }
+
+// StoreClosedError reports an attempt to admit work after shutdown started.
+type StoreClosedError struct{}
+
+func (*StoreClosedError) Error() string { return "sessionstore: store is closing" }

@@ -4,20 +4,25 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/looprig/storage"
 )
 
 // Store is the durable session aggregate over one complete storage backend.
 type Store struct {
-	backend *storage.Composite
-	limits  Limits
-	clock   Clock
-	logger  *slog.Logger
+	backend         *storage.Composite
+	limits          Limits
+	clock           Clock
+	logger          *slog.Logger
+	shutdownTimeout time.Duration
 
-	ctx           context.Context
-	cancel        context.CancelFunc
-	background    sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+	lifecycleMu sync.Mutex
+	closing     bool
+	background  sync.WaitGroup
+
 	providerClose func(context.Context) error
 	closeOnce     sync.Once
 	closeDone     chan struct{}
@@ -57,15 +62,32 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 
 	ownedCtx, cancel := context.WithCancel(ctx)
 	return &Store{
-		backend:       backend,
-		limits:        cfg.limits,
-		clock:         cfg.clock,
-		logger:        cfg.logger,
-		ctx:           ownedCtx,
-		cancel:        cancel,
-		providerClose: cfg.providerClose,
-		closeDone:     make(chan struct{}),
+		backend:         backend,
+		limits:          cfg.limits,
+		clock:           cfg.clock,
+		logger:          cfg.logger,
+		shutdownTimeout: cfg.shutdownTimeout,
+		ctx:             ownedCtx,
+		cancel:          cancel,
+		providerClose:   cfg.providerClose,
+		closeDone:       make(chan struct{}),
 	}, nil
+}
+
+// startBackground atomically admits Store-owned work while the Store is open.
+// The work receives the Store lifecycle context and must return when canceled.
+func (s *Store) startBackground(work func(context.Context)) error {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.closing {
+		return &StoreClosedError{}
+	}
+	s.background.Add(1)
+	go func() {
+		defer s.background.Done()
+		work(s.ctx)
+	}()
+	return nil
 }
 
 // Close initiates shutdown exactly once. It cancels Store-owned work, waits for
@@ -75,11 +97,14 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 // stable final result.
 func (s *Store) Close(ctx context.Context) error {
 	s.closeOnce.Do(func() {
+		s.lifecycleMu.Lock()
+		s.closing = true
 		s.cancel()
+		s.lifecycleMu.Unlock()
 		go func() {
 			s.background.Wait()
 			if s.providerClose != nil {
-				closeCtx, cancel := context.WithTimeout(context.Background(), s.limits.ShutdownTimeout)
+				closeCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
 				s.closeErr = s.providerClose(closeCtx)
 				cancel()
 			}
