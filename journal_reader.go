@@ -196,6 +196,10 @@ func (s *Store) planJournalRead(
 	cursor sessionwire.Cursor,
 	limit int,
 ) (*journalScan, func(), error) {
+	// storage.MaxOrderedPageLimit names the ordered-index page ceiling, but it
+	// is deliberately reused as this package's single page ceiling — the same
+	// value Limits.MaxPageSize is validated against — so a journal page and a
+	// catalog page cannot disagree about how large "one page" may be.
 	if limit < 0 || limit > storage.MaxOrderedPageLimit {
 		return nil, nil, journalErr(JournalErrorInvalid, "limit", nil)
 	}
@@ -362,9 +366,18 @@ const (
 	journalCursorRuntime journalCursorKind = "LRJR"
 )
 
+// The field layout is declared once, as offsets. Encode appends in this order
+// and decode slices at these bounds, so the two halves cannot drift and the
+// prose above describes exactly one definition.
 const (
 	journalCursorVersion byte = 1
-	journalCursorBytes        = 4 + 1 + 32 + 8 + 8
+
+	journalCursorMagicAt   = 0
+	journalCursorVersionAt = journalCursorMagicAt + 4
+	journalCursorScopeAt   = journalCursorVersionAt + 1
+	journalCursorNextSeqAt = journalCursorScopeAt + 32
+	journalCursorTipAt     = journalCursorNextSeqAt + 8
+	journalCursorBytes     = journalCursorTipAt + 8
 )
 
 type journalCursorPosition struct {
@@ -384,12 +397,12 @@ func (s *Store) encodeJournalCursor(
 	capturedTip uint64,
 ) sessionwire.Cursor {
 	scope := s.journalCursorScope(tenant, session)
-	token := make([]byte, 0, journalCursorBytes)
-	token = append(token, kind...)
-	token = append(token, journalCursorVersion)
-	token = append(token, scope[:]...)
-	token = binary.BigEndian.AppendUint64(token, nextSeq)
-	token = binary.BigEndian.AppendUint64(token, capturedTip)
+	token := make([]byte, journalCursorBytes)
+	copy(token[journalCursorMagicAt:journalCursorVersionAt], kind)
+	token[journalCursorVersionAt] = journalCursorVersion
+	copy(token[journalCursorScopeAt:journalCursorNextSeqAt], scope[:])
+	binary.BigEndian.PutUint64(token[journalCursorNextSeqAt:journalCursorTipAt], nextSeq)
+	binary.BigEndian.PutUint64(token[journalCursorTipAt:], capturedTip)
 	return sessionwire.Cursor(base64.RawURLEncoding.EncodeToString(token))
 }
 
@@ -423,16 +436,17 @@ func (s *Store) decodeJournalCursor(
 	if base64.RawURLEncoding.EncodeToString(token) != string(cursor) {
 		return invalid()
 	}
-	if string(token[:4]) != string(kind) || token[4] != journalCursorVersion {
+	if string(token[journalCursorMagicAt:journalCursorVersionAt]) != string(kind) ||
+		token[journalCursorVersionAt] != journalCursorVersion {
 		return invalid()
 	}
 	scope := s.journalCursorScope(tenant, session)
-	if !bytes.Equal(token[5:37], scope[:]) {
+	if !bytes.Equal(token[journalCursorScopeAt:journalCursorNextSeqAt], scope[:]) {
 		return invalid()
 	}
 	position := journalCursorPosition{
-		nextSeq:     binary.BigEndian.Uint64(token[37:45]),
-		capturedTip: binary.BigEndian.Uint64(token[45:53]),
+		nextSeq:     binary.BigEndian.Uint64(token[journalCursorNextSeqAt:journalCursorTipAt]),
+		capturedTip: binary.BigEndian.Uint64(token[journalCursorTipAt:]),
 	}
 	// Sequences are 1-based, so a zero start is not a position this reader ever
 	// issued.

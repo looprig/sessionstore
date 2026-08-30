@@ -1,4 +1,6 @@
-// Fakes and helpers shared by the object tests.
+// Fakes and helpers shared by the object tests. The journal tests reuse the
+// blob fakes and the call log from here; their own fakes live in
+// journal_fakes_test.go.
 package sessionstore
 
 import (
@@ -108,18 +110,77 @@ func (b *bindingCheckingBlobs) Get(ctx context.Context, key string) (io.ReadClos
 	return b.Blobs.Get(ctx, key)
 }
 
+// callLog records the ordered provider calls a test cares about. Every hook
+// appends through the same mutex so a -race run over concurrent writers sees a
+// consistent order.
+type callLog struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (l *callLog) add(name string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = append(l.calls, name)
+}
+
+func (l *callLog) snapshot() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.calls...)
+}
+
+func (l *callLog) count(name string) int {
+	n := 0
+	for _, call := range l.snapshot() {
+		if call == name {
+			n++
+		}
+	}
+	return n
+}
+
+// countingBlobs counts blob traffic and, when log is set, records its order
+// alongside whatever else that log is tracking. Counts are taken under a mutex
+// so a concurrent test can read them without racing the provider.
 type countingBlobs struct {
 	lifecycleBlobs
+	log *callLog
+
+	mu         sync.Mutex
 	gets, puts int
 }
 
 func (b *countingBlobs) Put(ctx context.Context, key string, r io.Reader) error {
+	b.mu.Lock()
 	b.puts++
+	b.mu.Unlock()
+	if b.log != nil {
+		b.log.add("blob_put")
+	}
 	return b.Blobs.Put(ctx, key, r)
 }
+
 func (b *countingBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	b.mu.Lock()
 	b.gets++
+	b.mu.Unlock()
+	if b.log != nil {
+		b.log.add("blob_get")
+	}
 	return b.Blobs.Get(ctx, key)
+}
+
+func (b *countingBlobs) getCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.gets
+}
+
+func (b *countingBlobs) putCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.puts
 }
 func objectMetadata(kind ObjectKind, generation [16]byte, size uint64, digest [32]byte, mediaType string) sessionwire.ObjectMetadata {
 	g := strings.ToLower(base32.HexEncoding.WithPadding(base32.NoPadding).EncodeToString(generation[:]))

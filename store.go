@@ -202,3 +202,32 @@ func (s *Store) admitForeground(caller context.Context) (context.Context, func()
 	}
 	return ctx, release, nil
 }
+
+// bindCancelHandle is the one cancellation-registration handshake in this
+// package. Both the object stream and the journal writer need it, and a second
+// subtly different copy of it is precisely the kind of restatement that hides a
+// race: context.AfterFunc runs hook in a NEW goroutine immediately when signal
+// is already done, so hook can reach the caller's fields before the returned
+// deregistration handle has been stored.
+//
+// publish therefore stores the handle under the same mutex hook contends for
+// and reports whether hook's effect has already happened. When it has, the
+// handle is released here rather than left registered for a hook that can no
+// longer do anything.
+func bindCancelHandle(signal context.Context, hook func(), publish func(stop func() bool) bool) {
+	stop := context.AfterFunc(signal, hook)
+	if publish(stop) {
+		stop()
+	}
+}
+
+// withCancelOn derives a context canceled by either caller or signal, and a
+// release that is safe to call exactly once through defer.
+func withCancelOn(caller, signal context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(caller)
+	stop := context.AfterFunc(signal, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}

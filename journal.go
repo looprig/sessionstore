@@ -23,53 +23,6 @@ const DefaultJournalOverflowThresholdBytes = 64 << 10
 // largest single public body a writer can commit still fits in one page.
 const DefaultJournalPageBytes = 1 << 20
 
-// JournalErrorCode classifies a journal ownership, append, or read failure.
-//
-// Fenced and Unknown are deliberately distinct outcomes of one CAS append.
-// Fenced is definite — a successor's record occupies the contested sequence, so
-// this writer has provably lost the stream. Unknown means the outcome could not
-// be resolved at all, so the writer's own tip is no longer trustworthy. Both
-// end the writer permanently; only Fenced asserts that someone else won.
-type JournalErrorCode string
-
-const (
-	JournalErrorInvalid   JournalErrorCode = "invalid"
-	JournalErrorLeaseHeld JournalErrorCode = "lease_held"
-	JournalErrorLeaseLost JournalErrorCode = "lease_lost"
-	JournalErrorFenced    JournalErrorCode = "fenced"
-	JournalErrorUnknown   JournalErrorCode = "unknown"
-	JournalErrorClosed    JournalErrorCode = "closed"
-	JournalErrorBackend   JournalErrorCode = "backend"
-	JournalErrorIntegrity JournalErrorCode = "integrity"
-	JournalErrorTooLarge  JournalErrorCode = "too_large"
-	JournalErrorCursor    JournalErrorCode = "cursor"
-)
-
-// JournalError is a typed, redacted journal failure. Field names the offending
-// input or stage and never carries a provider name, key, or record payload.
-// Epoch is populated only where a fencing epoch is itself the answer — the live
-// holder's epoch for lease_held, this writer's epoch for lease_lost.
-type JournalError struct {
-	Code  JournalErrorCode
-	Field string
-	Epoch uint64
-	Cause error
-}
-
-func (e *JournalError) Error() string {
-	message := "sessionstore: journal " + string(e.Code)
-	if e.Field != "" {
-		message += " (" + e.Field + ")"
-	}
-	return message
-}
-
-func (e *JournalError) Unwrap() error { return e.Cause }
-
-func journalErr(code JournalErrorCode, field string, cause error) error {
-	return &JournalError{Code: code, Field: field, Cause: cause}
-}
-
 // OpenJournalRequest names the session whose stream a writer wants to own.
 type OpenJournalRequest struct {
 	TenantID  sessionwire.TenantID
@@ -440,33 +393,4 @@ func (s *Store) journalOverflowThreshold() int {
 		threshold = MaxInlineBodyBytes
 	}
 	return threshold
-}
-
-// bindCancelHandle is the one cancellation-registration handshake in this
-// package. Both the object stream and the journal writer need it, and a second
-// subtly different copy of it is precisely the kind of restatement that hides a
-// race: context.AfterFunc runs hook in a NEW goroutine immediately when signal
-// is already done, so hook can reach the caller's fields before the returned
-// deregistration handle has been stored.
-//
-// publish therefore stores the handle under the same mutex hook contends for
-// and reports whether hook's effect has already happened. When it has, the
-// handle is released here rather than left registered for a hook that can no
-// longer do anything.
-func bindCancelHandle(signal context.Context, hook func(), publish func(stop func() bool) bool) {
-	stop := context.AfterFunc(signal, hook)
-	if publish(stop) {
-		stop()
-	}
-}
-
-// withCancelOn derives a context canceled by either caller or signal, and a
-// release that is safe to call exactly once through defer.
-func withCancelOn(caller, signal context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(caller)
-	stop := context.AfterFunc(signal, cancel)
-	return ctx, func() {
-		stop()
-		cancel()
-	}
 }

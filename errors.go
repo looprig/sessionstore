@@ -141,3 +141,93 @@ func (e *ObjectError) Unwrap() error { return e.Cause }
 func objectErr(code ObjectErrorCode, field string, cause error) error {
 	return &ObjectError{Code: code, Field: field, Cause: cause}
 }
+
+// EnvelopeErrorCode is a stable machine-readable envelope failure reason.
+type EnvelopeErrorCode string
+
+const (
+	EnvelopeErrorMalformed EnvelopeErrorCode = "malformed"
+	EnvelopeErrorVersion   EnvelopeErrorCode = "version"
+	EnvelopeErrorKind      EnvelopeErrorCode = "kind"
+	EnvelopeErrorField     EnvelopeErrorCode = "field"
+	EnvelopeErrorOrder     EnvelopeErrorCode = "order"
+	EnvelopeErrorMissing   EnvelopeErrorCode = "missing"
+	EnvelopeErrorInvalid   EnvelopeErrorCode = "invalid"
+	EnvelopeErrorLength    EnvelopeErrorCode = "length"
+	EnvelopeErrorTooLarge  EnvelopeErrorCode = "too-large"
+	EnvelopeErrorDigest    EnvelopeErrorCode = "digest"
+	EnvelopeErrorTrailing  EnvelopeErrorCode = "trailing"
+)
+
+// EnvelopeError reports a bounded codec failure and preserves its cause without
+// placing attacker-controlled cause text in Error().
+type EnvelopeError struct {
+	Code  EnvelopeErrorCode
+	Field string
+	Cause error
+}
+
+func (e *EnvelopeError) Error() string {
+	message := "sessionstore: envelope " + string(e.Code)
+	if e.Field != "" {
+		field := e.Field
+		if len(field) > 48 {
+			field = field[:48]
+		}
+		message += " (" + field + ")"
+	}
+	return message
+}
+
+func (e *EnvelopeError) Unwrap() error { return e.Cause }
+
+func envelopeError(code EnvelopeErrorCode, field string, cause error) error {
+	return &EnvelopeError{Code: code, Field: field, Cause: cause}
+}
+
+// JournalErrorCode classifies a journal ownership, append, or read failure.
+//
+// Fenced and Unknown are deliberately distinct outcomes of one CAS append.
+// Fenced is definite — a successor's record occupies the contested sequence, so
+// this writer has provably lost the stream. Unknown means the outcome could not
+// be resolved at all, so the writer's own tip is no longer trustworthy. Both
+// end the writer permanently; only Fenced asserts that someone else won.
+type JournalErrorCode string
+
+const (
+	JournalErrorInvalid   JournalErrorCode = "invalid"
+	JournalErrorLeaseHeld JournalErrorCode = "lease_held"
+	JournalErrorLeaseLost JournalErrorCode = "lease_lost"
+	JournalErrorFenced    JournalErrorCode = "fenced"
+	JournalErrorUnknown   JournalErrorCode = "unknown"
+	JournalErrorClosed    JournalErrorCode = "closed"
+	JournalErrorBackend   JournalErrorCode = "backend"
+	JournalErrorIntegrity JournalErrorCode = "integrity"
+	JournalErrorTooLarge  JournalErrorCode = "too_large"
+	JournalErrorCursor    JournalErrorCode = "cursor"
+)
+
+// JournalError is a typed, redacted journal failure. Field names the offending
+// input or stage and never carries a provider name, key, or record payload.
+// Epoch is populated only where a fencing epoch is itself the answer — the live
+// holder's epoch for lease_held, this writer's epoch for lease_lost.
+type JournalError struct {
+	Code  JournalErrorCode
+	Field string
+	Epoch uint64
+	Cause error
+}
+
+func (e *JournalError) Error() string {
+	message := "sessionstore: journal " + string(e.Code)
+	if e.Field != "" {
+		message += " (" + e.Field + ")"
+	}
+	return message
+}
+
+func (e *JournalError) Unwrap() error { return e.Cause }
+
+func journalErr(code JournalErrorCode, field string, cause error) error {
+	return &JournalError{Code: code, Field: field, Cause: cause}
+}

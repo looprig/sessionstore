@@ -244,7 +244,7 @@ func TestPublicPageResolvesOverflowedPublicBody(t *testing.T) {
 
 func TestPublicPageNeverFetchesRuntimeObjects(t *testing.T) {
 	backend := memstore.New()
-	blobs := &loggingBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}}
+	blobs := &countingBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}}
 	backend.Blobs = blobs
 	store := openJournalStore(t, backend)
 	store.overflowThreshold = 16
@@ -620,7 +620,7 @@ func TestPublicPageCursorPinsTheCapturedSnapshot(t *testing.T) {
 // commit must be refused before the object stream is opened.
 func TestPublicPageRejectsForgedOversizedPublicReference(t *testing.T) {
 	backend := memstore.New()
-	blobs := &loggingBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}}
+	blobs := &countingBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}}
 	backend.Blobs = blobs
 	store := openJournalStore(t, backend)
 	store.overflowThreshold = 16
@@ -761,7 +761,7 @@ func noncanonicalTail(cursor string) string {
 // that merely looks load-bearing.
 func TestResolvePublicBodyRejectsAnAbsentSlot(t *testing.T) {
 	backend := memstore.New()
-	blobs := &loggingBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}}
+	blobs := &countingBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}}
 	backend.Blobs = blobs
 	store := openJournalStore(t, backend)
 	mixedSession(t, store)

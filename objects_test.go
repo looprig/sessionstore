@@ -138,8 +138,8 @@ func TestGetObjectMissingBindingDoesNotTouchBlobs(t *testing.T) {
 	if err == nil {
 		t.Fatal("GetObject succeeded")
 	}
-	if blobs.gets != 0 || blobs.puts != 0 {
-		t.Fatalf("blob calls get=%d put=%d", blobs.gets, blobs.puts)
+	if blobs.getCount() != 0 || blobs.putCount() != 0 {
+		t.Fatalf("blob calls get=%d put=%d", blobs.getCount(), blobs.putCount())
 	}
 }
 
@@ -357,12 +357,12 @@ func TestGetObjectCrossTenantFailsBeforeBlob(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	beforeGets := blobs.gets
+	beforeGets := blobs.getCount()
 	_, err = store.GetObject(context.Background(), GetObjectRequest{TenantID: "tenant-b", SessionID: "same", ExpectedKind: ObjectKindArtifact, Metadata: metadata})
 	if err == nil {
 		t.Fatal("cross-tenant Get succeeded")
 	}
-	if blobs.gets != beforeGets {
+	if blobs.getCount() != beforeGets {
 		t.Fatalf("cross-tenant Get touched Blobs: %d -> %d", beforeGets, blobs.gets)
 	}
 }

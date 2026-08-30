@@ -128,49 +128,6 @@ type Envelope struct {
 	CommandKind      string
 }
 
-// EnvelopeErrorCode is a stable machine-readable envelope failure reason.
-type EnvelopeErrorCode string
-
-const (
-	EnvelopeErrorMalformed EnvelopeErrorCode = "malformed"
-	EnvelopeErrorVersion   EnvelopeErrorCode = "version"
-	EnvelopeErrorKind      EnvelopeErrorCode = "kind"
-	EnvelopeErrorField     EnvelopeErrorCode = "field"
-	EnvelopeErrorOrder     EnvelopeErrorCode = "order"
-	EnvelopeErrorMissing   EnvelopeErrorCode = "missing"
-	EnvelopeErrorInvalid   EnvelopeErrorCode = "invalid"
-	EnvelopeErrorLength    EnvelopeErrorCode = "length"
-	EnvelopeErrorTooLarge  EnvelopeErrorCode = "too-large"
-	EnvelopeErrorDigest    EnvelopeErrorCode = "digest"
-	EnvelopeErrorTrailing  EnvelopeErrorCode = "trailing"
-)
-
-// EnvelopeError reports a bounded codec failure and preserves its cause without
-// placing attacker-controlled cause text in Error().
-type EnvelopeError struct {
-	Code  EnvelopeErrorCode
-	Field string
-	Cause error
-}
-
-func (e *EnvelopeError) Error() string {
-	message := "sessionstore: envelope " + string(e.Code)
-	if e.Field != "" {
-		field := e.Field
-		if len(field) > 48 {
-			field = field[:48]
-		}
-		message += " (" + field + ")"
-	}
-	return message
-}
-
-func (e *EnvelopeError) Unwrap() error { return e.Cause }
-
-func envelopeError(code EnvelopeErrorCode, field string, cause error) error {
-	return &EnvelopeError{Code: code, Field: field, Cause: cause}
-}
-
 // EncodeEnvelope validates and deterministically encodes an envelope. The
 // returned frame does not alias any caller-owned body.
 func EncodeEnvelope(env Envelope) ([]byte, error) {
