@@ -77,14 +77,21 @@ func TestOpenValidatesOptions(t *testing.T) {
 		name      string
 		option    Option
 		wantField string
+		wantLimit *InvalidLimitError
 	}{
 		{name: "nil option", option: nil, wantField: "option"},
-		{name: "zero page size", option: WithLimits(Limits{}), wantField: "MaxPageSize"},
-		{name: "negative page size", option: WithLimits(Limits{MaxPageSize: -1}), wantField: "MaxPageSize"},
-		{name: "page size above provider maximum", option: WithLimits(Limits{MaxPageSize: storage.MaxOrderedPageLimit + 1}), wantField: "MaxPageSize"},
+		{name: "zero page size", option: WithLimits(Limits{ShutdownTimeout: DefaultShutdownTimeout}), wantField: "MaxPageSize", wantLimit: &InvalidLimitError{Field: "MaxPageSize", Value: 0, Min: 1, Max: storage.MaxOrderedPageLimit}},
+		{name: "negative page size", option: WithLimits(Limits{MaxPageSize: -1, ShutdownTimeout: DefaultShutdownTimeout}), wantField: "MaxPageSize", wantLimit: &InvalidLimitError{Field: "MaxPageSize", Value: -1, Min: 1, Max: storage.MaxOrderedPageLimit}},
+		{name: "page size above provider maximum", option: WithLimits(Limits{MaxPageSize: storage.MaxOrderedPageLimit + 1, ShutdownTimeout: DefaultShutdownTimeout}), wantField: "MaxPageSize", wantLimit: &InvalidLimitError{Field: "MaxPageSize", Value: storage.MaxOrderedPageLimit + 1, Min: 1, Max: storage.MaxOrderedPageLimit}},
+		{name: "zero shutdown timeout", option: WithLimits(Limits{MaxPageSize: 1}), wantField: "ShutdownTimeout", wantLimit: &InvalidLimitError{Field: "ShutdownTimeout", Value: 0, Min: 1, Max: int64(^uint64(0) >> 1)}},
+		{name: "negative shutdown timeout", option: WithLimits(Limits{MaxPageSize: 1, ShutdownTimeout: -time.Nanosecond}), wantField: "ShutdownTimeout", wantLimit: &InvalidLimitError{Field: "ShutdownTimeout", Value: -1, Min: 1, Max: int64(^uint64(0) >> 1)}},
 		{name: "nil clock", option: WithClock(nil), wantField: "Clock"},
+		{name: "typed nil clock", option: WithClock((*nilClock)(nil)), wantField: "Clock"},
 		{name: "nil logger", option: WithLogger(nil), wantField: "Logger"},
 		{name: "nil owned provider", option: WithProviderOwnership(nil), wantField: "ProviderCloser"},
+		{name: "typed nil owned provider", option: WithProviderOwnership((*recordingCloser)(nil)), wantField: "ProviderCloser"},
+		{name: "nil owned io provider", option: WithIOProviderOwnership(nil), wantField: "IOProviderCloser"},
+		{name: "typed nil owned io provider", option: WithIOProviderOwnership((*recordingIOCloser)(nil)), wantField: "IOProviderCloser"},
 	}
 
 	for _, test := range tests {
@@ -102,6 +109,15 @@ func TestOpenValidatesOptions(t *testing.T) {
 			if invalid.Field != test.wantField {
 				t.Fatalf("Field = %q, want %q", invalid.Field, test.wantField)
 			}
+			if test.wantLimit != nil {
+				var limit *InvalidLimitError
+				if !errors.As(err, &limit) {
+					t.Fatalf("Open error = %T %v, want wrapped *InvalidLimitError", err, err)
+				}
+				if *limit != *test.wantLimit {
+					t.Fatalf("InvalidLimitError = %+v, want %+v", *limit, *test.wantLimit)
+				}
+			}
 		})
 	}
 }
@@ -116,7 +132,7 @@ func TestOpenAcceptsExplicitSeams(t *testing.T) {
 		memstore.New(),
 		WithClock(clock),
 		WithLogger(logger),
-		WithLimits(Limits{MaxPageSize: 17}),
+		WithLimits(Limits{MaxPageSize: 17, ShutdownTimeout: 3 * time.Second}),
 	)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -135,6 +151,9 @@ func TestOpenAcceptsExplicitSeams(t *testing.T) {
 	}
 	if store.limits.MaxPageSize != 17 {
 		t.Fatalf("MaxPageSize = %d, want 17", store.limits.MaxPageSize)
+	}
+	if store.limits.ShutdownTimeout != 3*time.Second {
+		t.Fatalf("ShutdownTimeout = %v, want 3s", store.limits.ShutdownTimeout)
 	}
 }
 
@@ -191,6 +210,25 @@ func TestCloseCancelsOwnedContextBeforeClosingOwnedProvider(t *testing.T) {
 	}
 }
 
+func TestCloseOwnsIOProviderExactlyOnce(t *testing.T) {
+	t.Parallel()
+
+	closer := &recordingIOCloser{closeFn: func() error { return errProviderClose }}
+	store, err := Open(context.Background(), memstore.New(), WithIOProviderOwnership(closer))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if got := store.Close(context.Background()); !errors.Is(got, errProviderClose) {
+		t.Fatalf("Close error = %v, want %v", got, errProviderClose)
+	}
+	if got := store.Close(context.Background()); !errors.Is(got, errProviderClose) {
+		t.Fatalf("second Close error = %v, want %v", got, errProviderClose)
+	}
+	if got := closer.calls.Load(); got != 1 {
+		t.Fatalf("provider Close calls = %d, want 1", got)
+	}
+}
+
 func TestCloseIsConcurrentIdempotentAndReturnsStableResult(t *testing.T) {
 	t.Parallel()
 
@@ -233,28 +271,101 @@ func TestCloseIsConcurrentIdempotentAndReturnsStableResult(t *testing.T) {
 func TestCloseCallerDeadlineDoesNotAbandonLifecycle(t *testing.T) {
 	t.Parallel()
 
-	release := make(chan struct{})
-	closer := &recordingCloser{closeFn: func(context.Context) error {
-		<-release
+	providerContext := make(chan error, 1)
+	closer := &recordingCloser{closeFn: func(ctx context.Context) error {
+		providerContext <- ctx.Err()
 		return errProviderClose
 	}}
-	store, err := Open(context.Background(), memstore.New(), WithProviderOwnership(closer))
+	store, err := Open(
+		context.Background(),
+		memstore.New(),
+		WithLimits(Limits{MaxPageSize: 1, ShutdownTimeout: time.Second}),
+		WithProviderOwnership(closer),
+	)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	store.background.Add(1)
+	workerCanceled := make(chan struct{})
+	releaseWorker := make(chan struct{})
+	go func() {
+		defer store.background.Done()
+		<-store.ctx.Done()
+		close(workerCanceled)
+		<-releaseWorker
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	if got := store.Close(ctx); !errors.Is(got, context.DeadlineExceeded) {
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- store.Close(ctx) }()
+	<-workerCanceled
+	<-ctx.Done()
+	if got := <-closeResult; !errors.Is(got, context.DeadlineExceeded) {
 		t.Fatalf("first Close error = %v, want deadline exceeded", got)
 	}
-	if got := closer.calls.Load(); got != 1 {
-		t.Fatalf("provider Close calls after timeout = %d, want 1", got)
+	if got := closer.calls.Load(); got != 0 {
+		t.Fatalf("provider Close calls before worker drain = %d, want 0", got)
 	}
 
-	close(release)
+	close(releaseWorker)
+	if got := <-providerContext; got != nil {
+		t.Fatalf("provider context error on entry = %v, want nil", got)
+	}
 	if got := store.Close(context.Background()); !errors.Is(got, errProviderClose) {
 		t.Fatalf("eventual Close error = %v, want stable %v", got, errProviderClose)
+	}
+	if got := closer.calls.Load(); got != 1 {
+		t.Fatalf("provider Close calls = %d, want 1", got)
+	}
+}
+
+func TestCloseAfterCompletionIgnoresCanceledCallerContext(t *testing.T) {
+	t.Parallel()
+
+	closer := &recordingCloser{closeFn: func(context.Context) error { return errProviderClose }}
+	store, err := Open(context.Background(), memstore.New(), WithProviderOwnership(closer))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if got := store.Close(context.Background()); !errors.Is(got, errProviderClose) {
+		t.Fatalf("initial Close error = %v, want %v", got, errProviderClose)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for i := 0; i < 10_000; i++ {
+		if got := store.Close(canceled); !errors.Is(got, errProviderClose) {
+			t.Fatalf("Close iteration %d = %v, want stable %v", i, got, errProviderClose)
+		}
+	}
+}
+
+func TestProviderShutdownTimeoutIsStable(t *testing.T) {
+	t.Parallel()
+
+	closer := &recordingCloser{closeFn: func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	store, err := Open(
+		context.Background(),
+		memstore.New(),
+		WithLimits(Limits{MaxPageSize: 1, ShutdownTimeout: time.Millisecond}),
+		WithProviderOwnership(closer),
+	)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if got := store.Close(context.Background()); !errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("initial Close error = %v, want deadline exceeded", got)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := store.Close(canceled); !errors.Is(got, context.DeadlineExceeded) || errors.Is(got, context.Canceled) {
+		t.Fatalf("completed Close error = %v, want stable deadline exceeded", got)
 	}
 	if got := closer.calls.Load(); got != 1 {
 		t.Fatalf("provider Close calls = %d, want 1", got)
@@ -267,9 +378,26 @@ type fixedClock struct{ now time.Time }
 
 func (c fixedClock) Now() time.Time { return c.now }
 
+type nilClock struct{}
+
+func (*nilClock) Now() time.Time { return time.Time{} }
+
 type recordingCloser struct {
 	calls   atomic.Int32
 	closeFn func(context.Context) error
+}
+
+type recordingIOCloser struct {
+	calls   atomic.Int32
+	closeFn func() error
+}
+
+func (c *recordingIOCloser) Close() error {
+	c.calls.Add(1)
+	if c.closeFn != nil {
+		return c.closeFn()
+	}
+	return nil
 }
 
 type closeCapableLedger struct {

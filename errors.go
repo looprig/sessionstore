@@ -31,9 +31,9 @@ func (e *InvalidOptionError) Unwrap() error { return e.Cause }
 // InvalidLimitError reports a limit outside its inclusive valid range.
 type InvalidLimitError struct {
 	Field string
-	Value int
-	Min   int
-	Max   int
+	Value int64
+	Min   int64
+	Max   int64
 }
 
 func (e *InvalidLimitError) Error() string {
