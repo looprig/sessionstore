@@ -17,13 +17,15 @@ type Store struct {
 	logger          *slog.Logger
 	shutdownTimeout time.Duration
 
-	ctx         context.Context
-	cancel      context.CancelFunc
-	lifecycleMu sync.Mutex
-	closing     bool
-	background  sync.WaitGroup
+	ctx             context.Context
+	cancel          context.CancelFunc
+	lifecycleMu     sync.Mutex
+	lifecycleLocked func(lifecycleOperation)
+	closing         bool
+	background      sync.WaitGroup
 
 	providerClose func(context.Context) error
+	ioAdapter     *ioProviderAdapter
 	closeOnce     sync.Once
 	closeDone     chan struct{}
 	closeErr      error
@@ -70,15 +72,29 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 		ctx:             ownedCtx,
 		cancel:          cancel,
 		providerClose:   cfg.providerClose,
+		ioAdapter:       cfg.ioAdapter,
 		closeDone:       make(chan struct{}),
 	}, nil
 }
 
+type lifecycleOperation uint8
+
+const (
+	lifecycleAdmit lifecycleOperation = iota + 1
+	lifecycleClose
+)
+
 // startBackground atomically admits Store-owned work while the Store is open.
 // The work receives the Store lifecycle context and must return when canceled.
 func (s *Store) startBackground(work func(context.Context)) error {
+	if work == nil {
+		return &InvalidBackgroundWorkError{}
+	}
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
+	if s.lifecycleLocked != nil {
+		s.lifecycleLocked(lifecycleAdmit)
+	}
 	if s.closing {
 		return &StoreClosedError{}
 	}
@@ -98,6 +114,9 @@ func (s *Store) startBackground(work func(context.Context)) error {
 func (s *Store) Close(ctx context.Context) error {
 	s.closeOnce.Do(func() {
 		s.lifecycleMu.Lock()
+		if s.lifecycleLocked != nil {
+			s.lifecycleLocked(lifecycleClose)
+		}
 		s.closing = true
 		s.cancel()
 		s.lifecycleMu.Unlock()

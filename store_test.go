@@ -323,6 +323,21 @@ func TestIOProviderShutdownTimeoutReturnsStableResult(t *testing.T) {
 
 	releaseCloser()
 	<-exited
+	adapterSafety, cancelAdapterSafety := context.WithTimeout(context.Background(), time.Second)
+	defer cancelAdapterSafety()
+	select {
+	case <-store.ioAdapter.done:
+	case <-adapterSafety.Done():
+		// Drain an intentionally unbuffered result mutation so its wrapper can
+		// exit before the test reports the failure.
+		select {
+		case <-store.ioAdapter.result:
+		case <-time.After(time.Second):
+			t.Fatal("timed-out io.Closer adapter could not be drained")
+		}
+		<-store.ioAdapter.done
+		t.Fatal("io.Closer adapter goroutine did not exit after provider return")
+	}
 }
 
 func TestCloseIsConcurrentIdempotentAndReturnsStableResult(t *testing.T) {
@@ -521,6 +536,73 @@ func TestCloseRejectsWorkAdmissionAfterShutdownStarts(t *testing.T) {
 	case <-lateRan:
 		t.Fatal("late work ran after provider close")
 	default:
+	}
+}
+
+func TestLifecycleOperationsHoldAdmissionLock(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		operation lifecycleOperation
+		invoke    func(*Store) error
+	}{
+		{name: "admit", operation: lifecycleAdmit, invoke: func(store *Store) error {
+			return store.startBackground(func(context.Context) {})
+		}},
+		{name: "close", operation: lifecycleClose, invoke: func(store *Store) error {
+			return store.Close(context.Background())
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			store, err := Open(context.Background(), memstore.New())
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			checked := make(chan bool, 1)
+			store.lifecycleLocked = func(operation lifecycleOperation) {
+				if operation != test.operation {
+					return
+				}
+				unlocked := store.lifecycleMu.TryLock()
+				if unlocked {
+					store.lifecycleMu.Unlock()
+				}
+				checked <- !unlocked
+			}
+
+			if err := test.invoke(store); err != nil {
+				t.Fatalf("invoke: %v", err)
+			}
+			if held := <-checked; !held {
+				t.Fatal("lifecycle operation reached mutation boundary without holding lifecycleMu")
+			}
+			if test.operation != lifecycleClose {
+				store.lifecycleLocked = nil
+				if err := store.Close(context.Background()); err != nil {
+					t.Fatalf("Close: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestStartBackgroundRejectsNilWorkSynchronously(t *testing.T) {
+	t.Parallel()
+
+	store, err := Open(context.Background(), memstore.New())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	var invalid *InvalidBackgroundWorkError
+	if err := store.startBackground(nil); !errors.As(err, &invalid) {
+		t.Fatalf("startBackground(nil) error = %T %v, want *InvalidBackgroundWorkError", err, err)
+	}
+	if err := store.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }
 

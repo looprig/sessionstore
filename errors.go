@@ -44,3 +44,10 @@ func (e *InvalidLimitError) Error() string {
 type StoreClosedError struct{}
 
 func (*StoreClosedError) Error() string { return "sessionstore: store is closing" }
+
+// InvalidBackgroundWorkError reports a nil internal background work function.
+type InvalidBackgroundWorkError struct{}
+
+func (*InvalidBackgroundWorkError) Error() string {
+	return "sessionstore: background work function is nil"
+}

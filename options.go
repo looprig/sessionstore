@@ -47,6 +47,7 @@ type config struct {
 	logger          *slog.Logger
 	shutdownTimeout time.Duration
 	providerClose   func(context.Context) error
+	ioAdapter       *ioProviderAdapter
 }
 
 func defaultConfig() config {
@@ -143,17 +144,37 @@ func WithIOProviderOwnership(closer io.Closer) Option {
 		if cfg.providerClose != nil {
 			return &InvalidOptionError{Field: "ProviderOwnership"}
 		}
-		cfg.providerClose = func(ctx context.Context) error {
-			result := make(chan error, 1)
-			go func() { result <- closer.Close() }()
-			select {
-			case err := <-result:
-				return err
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
+		adapter := newIOProviderAdapter(closer)
+		cfg.providerClose = adapter.close
+		cfg.ioAdapter = adapter
 		return nil
+	}
+}
+
+type ioProviderAdapter struct {
+	closer io.Closer
+	result chan error
+	done   chan struct{}
+}
+
+func newIOProviderAdapter(closer io.Closer) *ioProviderAdapter {
+	return &ioProviderAdapter{
+		closer: closer,
+		result: make(chan error, 1),
+		done:   make(chan struct{}),
+	}
+}
+
+func (a *ioProviderAdapter) close(ctx context.Context) error {
+	go func() {
+		defer close(a.done)
+		a.result <- a.closer.Close()
+	}()
+	select {
+	case err := <-a.result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
