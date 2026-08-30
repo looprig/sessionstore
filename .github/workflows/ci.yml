@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      GOCACHE: /tmp/looprig-sessionstore-gocache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Run repository checks
+        run: GOWORK=off make check
+      - name: Run standalone race suite
+        run: GOWORK=off go test -race ./...
