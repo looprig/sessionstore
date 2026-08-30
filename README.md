@@ -14,3 +14,14 @@ by the product composition root.
 Production imports are intentionally limited to the Go standard library, Core, and
 Storage. Published module files use exact released versions and contain no local
 `replace` directives or vendor tree.
+
+## Layout compatibility
+
+An unmarked backend is atomically initialized as the tenant-scoped `tenant-v1`
+layout. The historical `sessions/<uuid>` layout is available only through
+`WithLegacySingleTenant`, which persists and enforces the exact configured tenant.
+SessionStore never probes for old data, auto-migrates, or dual-writes layouts.
+
+Migration must be performed offline with SessionStore stopped, into a new backend
+already initialized for `tenant-v1`. Validate the migrated data before switching
+the composition root; do not rewrite a live backend's immutable layout marker.

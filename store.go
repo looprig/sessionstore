@@ -26,13 +26,15 @@ type Store struct {
 
 	providerClose func(context.Context) error
 	ioAdapter     *ioProviderAdapter
+	keys          keyspace
 	closeOnce     sync.Once
 	closeDone     chan struct{}
 	closeErr      error
 }
 
-// Open constructs a Store over a complete storage composite. Open performs no
-// marker, keyspace, or other provider I/O.
+// Open constructs a Store over a complete storage composite. Before publishing
+// a Store or starting its lifecycle it atomically establishes the immutable
+// backend keyspace marker.
 func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Store, error) {
 	if backend == nil {
 		return nil, &InvalidBackendError{Component: "Composite"}
@@ -61,6 +63,10 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 			return nil, err
 		}
 	}
+	keys := newKeyspace(backend.KV, cfg.layout, cfg.legacyTenant)
+	if err := keys.initialize(ctx); err != nil {
+		return nil, err
+	}
 
 	ownedCtx, cancel := context.WithCancel(ctx)
 	return &Store{
@@ -73,6 +79,7 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 		cancel:          cancel,
 		providerClose:   cfg.providerClose,
 		ioAdapter:       cfg.ioAdapter,
+		keys:            keys,
 		closeDone:       make(chan struct{}),
 	}, nil
 }

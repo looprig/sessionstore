@@ -2,6 +2,40 @@ package sessionstore
 
 import "fmt"
 
+// KeyspaceErrorCode is a stable machine-readable keyspace failure class.
+type KeyspaceErrorCode string
+
+const (
+	KeyspaceBackend         KeyspaceErrorCode = "backend"
+	KeyspaceMarkerMalformed KeyspaceErrorCode = "marker_malformed"
+	KeyspaceLayoutMismatch  KeyspaceErrorCode = "layout_mismatch"
+	KeyspaceMarkerAmbiguous KeyspaceErrorCode = "marker_ambiguous"
+	KeyspaceHashCollision   KeyspaceErrorCode = "hash_collision"
+	KeyspaceLegacyTenant    KeyspaceErrorCode = "legacy_tenant"
+	KeyspaceLegacySession   KeyspaceErrorCode = "legacy_session"
+)
+
+// KeyspaceError reports a fail-closed layout or physical-key failure. Cause is
+// available to errors.Is/As, while Error deliberately omits provider and raw ID
+// details.
+type KeyspaceError struct {
+	Code  KeyspaceErrorCode
+	Cause error
+}
+
+func (e *KeyspaceError) Error() string { return "sessionstore: keyspace " + string(e.Code) }
+func (e *KeyspaceError) Unwrap() error { return e.Cause }
+
+// InvalidIdentityError identifies which opaque identity failed validation
+// without retaining or rendering its value.
+type InvalidIdentityError struct {
+	Field string
+	Cause error
+}
+
+func (e *InvalidIdentityError) Error() string { return "sessionstore: invalid " + e.Field }
+func (e *InvalidIdentityError) Unwrap() error { return e.Cause }
+
 // InvalidBackendError reports a storage component that was not wired at Open.
 // Component is one of Composite, Ledger, Leaser, KV, OrderedIndex, or Blobs.
 type InvalidBackendError struct {

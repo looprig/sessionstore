@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"time"
 
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/storage"
 )
 
@@ -48,6 +49,8 @@ type config struct {
 	shutdownTimeout time.Duration
 	providerClose   func(context.Context) error
 	ioAdapter       *ioProviderAdapter
+	layout          keyspaceLayout
+	legacyTenant    sessionwire.TenantID
 }
 
 func defaultConfig() config {
@@ -56,6 +59,24 @@ func defaultConfig() config {
 		clock:           systemClock{},
 		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 		shutdownTimeout: DefaultShutdownTimeout,
+		layout:          layoutTenantV1,
+	}
+}
+
+// WithLegacySingleTenant explicitly adopts the historical unscoped layout for
+// one tenant. It never probes for legacy data; Open atomically persists the
+// choice and exact tenant in the backend layout marker.
+func WithLegacySingleTenant(defaultTenant sessionwire.TenantID) Option {
+	return func(cfg *config) error {
+		if err := defaultTenant.Validate(); err != nil {
+			return &InvalidOptionError{Field: "LegacyTenant", Cause: &InvalidIdentityError{Field: "TenantID", Cause: err}}
+		}
+		if cfg.layout == layoutLegacySingleTenantV1 {
+			return &InvalidOptionError{Field: "LegacySingleTenant"}
+		}
+		cfg.layout = layoutLegacySingleTenantV1
+		cfg.legacyTenant = defaultTenant
+		return nil
 	}
 }
 
