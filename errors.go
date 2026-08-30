@@ -185,6 +185,59 @@ func envelopeError(code EnvelopeErrorCode, field string, cause error) error {
 	return &EnvelopeError{Code: code, Field: field, Cause: cause}
 }
 
+// CatalogErrorCode classifies a session catalog record failure.
+//
+// Epoch and Conflict are deliberately distinct, and the distinction is the
+// whole point of the catalog's two ownership mechanisms. Epoch means a
+// Host-owned write named a lease epoch below the record's committed high-water
+// mark: that writer has provably been superseded and must not retry with the
+// same epoch. Conflict means a compare-and-swap lost a race on the record's
+// revision without any statement about ownership; the caller may re-read and
+// retry. Unknown means the mutation's outcome could not be resolved at all.
+type CatalogErrorCode string
+
+const (
+	CatalogErrorInvalid   CatalogErrorCode = "invalid"
+	CatalogErrorNotFound  CatalogErrorCode = "not_found"
+	CatalogErrorDeleted   CatalogErrorCode = "deleted"
+	CatalogErrorIdentity  CatalogErrorCode = "identity"
+	CatalogErrorEpoch     CatalogErrorCode = "epoch"
+	CatalogErrorSequence  CatalogErrorCode = "sequence"
+	CatalogErrorConflict  CatalogErrorCode = "conflict"
+	CatalogErrorUnknown   CatalogErrorCode = "unknown"
+	CatalogErrorBackend   CatalogErrorCode = "backend"
+	CatalogErrorMalformed CatalogErrorCode = "malformed"
+	CatalogErrorVersion   CatalogErrorCode = "version"
+	CatalogErrorTooLarge  CatalogErrorCode = "too_large"
+)
+
+// CatalogError is a typed, redacted catalog failure. Field names the offending
+// input or stage and never carries a provider name, key, or record payload.
+// Epoch is populated only for CatalogErrorEpoch, where the committed high-water
+// epoch is itself the answer, and Revision only for CatalogErrorConflict, where
+// a backend that can safely disclose the current revision did so.
+type CatalogError struct {
+	Code     CatalogErrorCode
+	Field    string
+	Epoch    uint64
+	Revision uint64
+	Cause    error
+}
+
+func (e *CatalogError) Error() string {
+	message := "sessionstore: catalog " + string(e.Code)
+	if e.Field != "" {
+		message += " (" + e.Field + ")"
+	}
+	return message
+}
+
+func (e *CatalogError) Unwrap() error { return e.Cause }
+
+func catalogErr(code CatalogErrorCode, field string, cause error) error {
+	return &CatalogError{Code: code, Field: field, Cause: cause}
+}
+
 // JournalErrorCode classifies a journal ownership, append, or read failure.
 //
 // Fenced and Unknown are deliberately distinct outcomes of one CAS append.

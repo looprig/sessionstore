@@ -104,3 +104,26 @@ cursor cannot be replayed into a public read, a cursor cannot be moved between
 sessions, and an inflated captured tip cannot widen the snapshot a walk covers.
 `ReadRuntimeJournal` is the privileged counterpart and returns every record as
 stored, leaving object-backed bodies unresolved for the caller to fetch.
+
+## Catalog ownership: a Host epoch and a Factory revision
+
+The session catalog is one authoritative `OrderedIndex` record per session,
+ordered and ranked by the tenant's namespace and ranked by
+`LastActiveAt.UnixNano()`, so a recent-first tenant page stays a bounded
+provider query and a status read stays a direct get.
+
+Its fields have two owners and two different guards, and the difference is
+structural rather than advisory. `UpdateCatalogHostState` carries the writing
+lease epoch and is refused if that epoch is below the record's committed
+high-water mark; an equal epoch is admitted, because one grant legitimately
+writes many times. `UpdateCatalogDesiredState` carries an expected revision and
+a retry-stable idempotency key and has no lease-epoch member at all, so a
+Factory cannot spell a claim on a lease it does not hold. The idempotency key is
+compared before the revision: a retry of an already-applied desired-state write
+carries an expected revision that its own success invalidated, so comparing the
+revision first would reject exactly the requests idempotency exists to absorb.
+
+Both paths close their read-compare-write with the same revision
+compare-and-swap, which is what makes the epoch a fence rather than advice: a
+writer that observed a stale high-water mark loses the swap and, on re-reading,
+meets the successor's epoch.

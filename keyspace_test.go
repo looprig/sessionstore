@@ -278,13 +278,15 @@ func TestTenantSessionTokenGolden(t *testing.T) {
 		"LeaseName":         scope.SessionNamespace + "/lease",
 		"CatalogKey":        scope.SessionNamespace + "/catalog",
 		"CatalogListPrefix": scope.TenantNamespace + "/sessions/",
+		"CatalogScope":      scope.TenantNamespace,
 		"BlobPrefix":        scope.SessionNamespace + "/blobs/",
 	}
 	gotFields := map[string]string{
 		"TenantNamespace": scope.TenantNamespace, "SessionNamespace": scope.SessionNamespace,
 		"LedgerName": scope.LedgerName, "JournalName": scope.JournalName,
 		"LeaseName": scope.LeaseName, "CatalogKey": scope.CatalogKey,
-		"CatalogListPrefix": scope.CatalogListPrefix, "BlobPrefix": scope.BlobPrefix,
+		"CatalogListPrefix": scope.CatalogListPrefix, "CatalogScope": scope.CatalogScope,
+		"BlobPrefix": scope.BlobPrefix,
 	}
 	for field, want := range wantFields {
 		got := gotFields[field]
@@ -691,6 +693,12 @@ func TestLegacyLayoutRejectsForeignTenantAndNoncanonicalSession(t *testing.T) {
 	}
 	if scope.CatalogListPrefix != "sessions/" {
 		t.Fatalf("legacy catalog list prefix = %q", scope.CatalogListPrefix)
+	}
+	if scope.CatalogScope != legacyCatalogScope {
+		t.Fatalf("legacy catalog scope = %q, want %q", scope.CatalogScope, legacyCatalogScope)
+	}
+	if err := storage.ValidateName(scope.CatalogScope); err != nil {
+		t.Fatalf("legacy catalog scope is not a storage name: %v", err)
 	}
 	if scope.BlobPrefix != scope.SessionNamespace+"/blobs/" {
 		t.Fatalf("legacy blob prefix = %q", scope.BlobPrefix)

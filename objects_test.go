@@ -363,7 +363,7 @@ func TestGetObjectCrossTenantFailsBeforeBlob(t *testing.T) {
 		t.Fatal("cross-tenant Get succeeded")
 	}
 	if blobs.getCount() != beforeGets {
-		t.Fatalf("cross-tenant Get touched Blobs: %d -> %d", beforeGets, blobs.gets)
+		t.Fatalf("cross-tenant Get touched Blobs: %d -> %d", beforeGets, blobs.getCount())
 	}
 }
 

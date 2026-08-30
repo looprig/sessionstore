@@ -212,8 +212,10 @@ func (s *Store) admitForeground(caller context.Context) (context.Context, func()
 //
 // publish therefore stores the handle under the same mutex hook contends for
 // and reports whether hook's effect has already happened. When it has, the
-// handle is released here rather than left registered for a hook that can no
-// longer do anything.
+// handle is released here. For a cancelCtx signal that release is already a
+// no-op — cancelCtx.cancel clears its children, so nothing is retained — but
+// context.AfterFunc accepts any Context, and a signal implementation that does
+// retain its registrations would otherwise keep this one forever.
 func bindCancelHandle(signal context.Context, hook func(), publish func(stop func() bool) bool) {
 	stop := context.AfterFunc(signal, hook)
 	if publish(stop) {

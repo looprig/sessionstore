@@ -16,6 +16,12 @@ import (
 
 const layoutMarkerKey = "sessionstore/layout"
 
+// legacyCatalogScope is the single ordering/ranking scope of a
+// legacy-single-tenant backend. That layout authorizes exactly one tenant, so
+// its whole catalog is one scope; it deliberately does not begin with
+// "tenants/", which the legacy layout forbids.
+const legacyCatalogScope = "sessions"
+
 const (
 	markerCodecVersion  byte = 1
 	keyAlgorithmVersion byte = 1
@@ -43,6 +49,12 @@ type sessionScope struct {
 	LeaseName         string
 	CatalogKey        string
 	CatalogListPrefix string
+	// CatalogScope is the OrderedIndex ordering and ranking scope for this
+	// session's catalog record. It is the tenant's physical namespace, so a
+	// tenant-scoped ranked page is a provider query rather than a filter
+	// applied after one. It obeys the storage name grammar and, unlike
+	// CatalogKey, is not a KV key.
+	CatalogScope      string
 	BlobPrefix        string
 	JournalName       string
 	tenantWitnessKey  string
@@ -152,6 +164,7 @@ func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionw
 			LeaseName:         prefix,
 			CatalogKey:        prefix,
 			CatalogListPrefix: "sessions/",
+			CatalogScope:      legacyCatalogScope,
 			BlobPrefix:        prefix + "/blobs/",
 			JournalName:       prefix,
 		}, nil
@@ -171,6 +184,7 @@ func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionw
 		LeaseName:         sessionNamespace + "/lease",
 		CatalogKey:        sessionNamespace + "/catalog",
 		CatalogListPrefix: tenantNamespace + "/sessions/",
+		CatalogScope:      tenantNamespace,
 		BlobPrefix:        sessionNamespace + "/blobs/",
 		JournalName:       sessionNamespace + "/journal",
 		tenantWitnessKey:  witnessKey("tenant", tenantToken),
