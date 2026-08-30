@@ -10,7 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/storage"
@@ -1077,7 +1076,7 @@ func instrumentComposite(base *storage.Composite) (*storage.Composite, *provider
 		Ledger:       &countAllLedger{Ledger: base.Ledger, calls: calls},
 		Leaser:       &countAllLeaser{Leaser: base.Leaser, calls: calls},
 		KV:           &countAllKV{KV: base.KV, calls: calls},
-		Blobs:        &countAllBlobs{Blobs: base.Blobs, calls: calls},
+		Blobs:        &countAllBlobs{lifecycleBlobs: lifecycleBlobs{base.Blobs}, calls: calls},
 		OrderedIndex: &countAllOrdered{OrderedIndex: base.OrderedIndex, calls: calls},
 	}, calls
 }
@@ -1137,7 +1136,7 @@ func (c *countAllKV) Delete(ctx context.Context, key string) error {
 }
 
 type countAllBlobs struct {
-	storage.Blobs
+	lifecycleBlobs
 	calls *providerCalls
 }
 
@@ -1156,9 +1155,6 @@ func (c *countAllBlobs) Delete(ctx context.Context, key string) error {
 func (c *countAllBlobs) List(ctx context.Context, prefix string) ([]string, error) {
 	c.calls.blobs.Add(1)
 	return c.Blobs.List(ctx, prefix)
-}
-func (c *countAllBlobs) BlobReaderCloseBound() time.Duration {
-	return forwardBlobReaderCloseBound(c.Blobs)
 }
 
 type countAllOrdered struct {

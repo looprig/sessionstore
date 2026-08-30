@@ -286,7 +286,7 @@ func TestCloseDoesNotCloseUnownedProvider(t *testing.T) {
 	backend.Leaser = &closeCapableLeaser{Leaser: backend.Leaser, closer: closer}
 	backend.KV = &closeCapableKV{KV: backend.KV, closer: closer}
 	backend.OrderedIndex = &closeCapableOrderedIndex{OrderedIndex: backend.OrderedIndex, closer: closer}
-	backend.Blobs = &closeCapableBlobs{Blobs: backend.Blobs, closer: closer}
+	backend.Blobs = &closeCapableBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}, closer: closer}
 	store, err := Open(context.Background(), backend)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -751,14 +751,11 @@ type closeCapableOrderedIndex struct {
 func (p *closeCapableOrderedIndex) Close(ctx context.Context) error { return p.closer.Close(ctx) }
 
 type closeCapableBlobs struct {
-	storage.Blobs
+	lifecycleBlobs
 	closer *recordingCloser
 }
 
 func (p *closeCapableBlobs) Close(ctx context.Context) error { return p.closer.Close(ctx) }
-func (p *closeCapableBlobs) BlobReaderCloseBound() time.Duration {
-	return forwardBlobReaderCloseBound(p.Blobs)
-}
 
 type baseOnlyBlobs struct{ storage.Blobs }
 
@@ -771,10 +768,6 @@ type boundedLifecycleBlobs struct {
 func (b *boundedLifecycleBlobs) BlobReaderCloseBound() time.Duration {
 	b.boundCalls.Add(1)
 	return b.bound
-}
-
-func forwardBlobReaderCloseBound(blobs storage.Blobs) time.Duration {
-	return blobs.(storage.BlobReaderLifecycle).BlobReaderCloseBound()
 }
 
 func (c *recordingCloser) Close(ctx context.Context) error {
