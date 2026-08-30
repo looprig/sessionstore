@@ -20,5 +20,3 @@ jobs:
           cache: false
       - name: Run repository checks
         run: GOWORK=off make check
-      - name: Run standalone race suite
-        run: GOWORK=off go test -race ./...

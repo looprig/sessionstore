@@ -1,13 +1,20 @@
+SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
+
 .PHONY: test fmt fmt-check vet staticcheck gosec vuln secure check build
+
+GOFILES = GOWORK=off go run ./internal/modfiles/cmd/modfiles -root .
 
 test:
 	GOWORK=off go test -race ./...
 
 fmt:
-	gofmt -w .
+	$(GOFILES) | xargs -0 gofmt -w
 
 fmt-check:
-	@test -z "$$(gofmt -l .)" || (gofmt -l . && exit 1)
+	@output="$$(mktemp)"; trap 'rm -f "$$output"' EXIT; \
+		if ! $(GOFILES) | xargs -0 gofmt -l >"$$output"; then exit 1; fi; \
+		if [[ -s "$$output" ]]; then cat "$$output"; exit 1; fi
 
 vet:
 	GOWORK=off go vet ./...

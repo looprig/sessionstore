@@ -3,13 +3,14 @@ package sessionstore_test
 import (
 	"go/parser"
 	"go/token"
-	"io/fs"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/sessionstore/internal/modfiles"
 	"github.com/looprig/storage"
 )
 
@@ -57,42 +58,103 @@ func TestReleasedDependencySurfaceCompiles(t *testing.T) {
 func TestProductionImportsStayWithinBoundary(t *testing.T) {
 	t.Parallel()
 
-	productionFiles := 0
-	err := filepath.WalkDir(".", func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			if path != "." && (entry.Name() == ".git" || entry.Name() == "vendor") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !isProductionGoFile(entry.Name()) {
-			return nil
-		}
+	productionFiles, violations, err := productionImportViolations(".")
+	if err != nil {
+		t.Fatalf("inspect production imports: %v", err)
+	}
+	for _, violation := range violations {
+		t.Error(violation)
+	}
+	if productionFiles == 0 {
+		t.Fatal("no production Go files found; dependency boundary check would be vacuous")
+	}
+}
 
+func TestProductionImportScanHonorsModuleOwnership(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeGoFixture(t, root, "go.mod", "module github.com/looprig/sessionstore\n")
+	for _, path := range []string{
+		"nested/forbidden.go",
+		".worktrees/branch/forbidden.go",
+		"testdata/forbidden.go",
+		"_ignored/forbidden.go",
+		".ignored/forbidden.go",
+	} {
+		writeGoFixture(t, root, path, "//go:build fixturetag\n\npackage fixture\n\nimport _ \"github.com/looprig/harness\"\n")
+	}
+	writeGoFixture(t, root, "nested/support_test.go", "package fixture\n\nimport _ \"github.com/looprig/harness\"\n")
+	writeGoFixture(t, root, "nested-module/go.mod", "module example.com/nested\n")
+	writeGoFixture(t, root, "nested-module/forbidden.go", "package fixture\n\nimport _ \"github.com/looprig/harness\"\n")
+	writeGoFixture(t, root, "nested-repository/.git/HEAD", "ref: refs/heads/main\n")
+	writeGoFixture(t, root, "nested-repository/forbidden.go", "package fixture\n\nimport _ \"github.com/looprig/harness\"\n")
+
+	productionFiles, violations, err := productionImportViolations(root)
+	if err != nil {
+		t.Fatalf("productionImportViolations: %v", err)
+	}
+	if productionFiles != 1 {
+		t.Fatalf("production files = %d, want 1", productionFiles)
+	}
+	if len(violations) != 1 || !strings.Contains(violations[0], filepath.Join("nested", "forbidden.go")) {
+		t.Fatalf("violations = %q, want only real nested package violation", violations)
+	}
+}
+
+func TestProductionImportScanRemainsNonvacuous(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeGoFixture(t, root, "go.mod", "module github.com/looprig/sessionstore\n")
+	writeGoFixture(t, root, "testdata/ignored.go", "package ignored\n")
+
+	productionFiles, _, err := productionImportViolations(root)
+	if err != nil {
+		t.Fatalf("productionImportViolations: %v", err)
+	}
+	if productionFiles != 0 {
+		t.Fatalf("production files = %d, want 0", productionFiles)
+	}
+}
+
+func productionImportViolations(root string) (int, []string, error) {
+	files, err := modfiles.Files(root)
+	if err != nil {
+		return 0, nil, err
+	}
+	productionFiles := 0
+	var violations []string
+	for _, path := range files {
+		if !isProductionGoFile(filepath.Base(path)) {
+			continue
+		}
 		productionFiles++
 		parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
 		if err != nil {
-			return err
+			return 0, nil, err
 		}
 		for _, spec := range parsed.Imports {
 			importPath, err := strconv.Unquote(spec.Path.Value)
 			if err != nil {
-				return err
+				return 0, nil, err
 			}
 			if !allowedProductionImport(importPath) {
-				t.Errorf("production file %s imports forbidden package %q", path, importPath)
+				violations = append(violations, "production file "+path+" imports forbidden package "+strconv.Quote(importPath))
 			}
 		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("inspect production imports: %v", err)
 	}
-	if productionFiles == 0 {
-		t.Fatal("no production Go files found; dependency boundary check would be vacuous")
+	return productionFiles, violations, nil
+}
+
+func writeGoFixture(t *testing.T, root, relative, content string) {
+	t.Helper()
+	path := filepath.Join(root, relative)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("create fixture directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write fixture %q: %v", relative, err)
 	}
 }
 
