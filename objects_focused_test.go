@@ -131,3 +131,22 @@ func TestExactVerifierRejectsJoinedEOFAndNegativeCount(t *testing.T) {
 		})
 	}
 }
+
+func TestExactVerifierTerminalProbeRejectsNegativeCountWithEOF(t *testing.T) {
+	body := []byte("x")
+	digest := sha256.Sum256(body)
+	reads := 0
+	source := readerFunc(func(p []byte) (int, error) {
+		reads++
+		if reads == 1 {
+			return copy(p, body), nil
+		}
+		return -1, io.EOF
+	})
+	verifier := newExactVerifier(context.Background(), source, uint64(len(body)), digest)
+	_, err := io.ReadAll(verifier)
+	var objectErr *ObjectError
+	if !errors.As(err, &objectErr) || objectErr.Code != ObjectErrorSource || verifier.verified {
+		t.Fatalf("error=%T %v verified=%v", err, err, verifier.verified)
+	}
+}

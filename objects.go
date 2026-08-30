@@ -456,6 +456,10 @@ func (v *exactVerifier) Read(p []byte) (int, error) {
 	if remaining == 0 {
 		var probe [1]byte
 		n, err := v.source.Read(probe[:])
+		if n < 0 {
+			v.failure = objectErr(v.readCode, "stream", errors.New("invalid reader count"))
+			return 0, v.failure
+		}
 		if n > 0 {
 			v.failure = objectErr(ObjectErrorSize, "stream", nil)
 			return 0, v.failure
