@@ -42,13 +42,12 @@ type keyspace struct {
 }
 
 type sessionScope struct {
-	layout            keyspaceLayout
-	TenantNamespace   string
-	SessionNamespace  string
-	LedgerName        string
-	LeaseName         string
-	CatalogKey        string
-	CatalogListPrefix string
+	layout           keyspaceLayout
+	TenantNamespace  string
+	SessionNamespace string
+	LedgerName       string
+	LeaseName        string
+	CatalogKey       string
 	// CatalogScope is the OrderedIndex ordering and ranking scope for this
 	// session's catalog record. It is the tenant's physical namespace, so a
 	// tenant-scoped ranked page is a provider query rather than a filter
@@ -193,15 +192,14 @@ func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionw
 		}
 		prefix := "sessions/" + string(session)
 		return sessionScope{
-			layout:            layoutLegacySingleTenantV1,
-			SessionNamespace:  prefix,
-			LedgerName:        prefix,
-			LeaseName:         prefix,
-			CatalogKey:        prefix,
-			CatalogListPrefix: "sessions/",
-			CatalogScope:      owner.CatalogScope,
-			BlobPrefix:        prefix + "/blobs/",
-			JournalName:       prefix,
+			layout:           layoutLegacySingleTenantV1,
+			SessionNamespace: prefix,
+			LedgerName:       prefix,
+			LeaseName:        prefix,
+			CatalogKey:       prefix,
+			CatalogScope:     owner.CatalogScope,
+			BlobPrefix:       prefix + "/blobs/",
+			JournalName:      prefix,
 		}, nil
 	}
 
@@ -215,7 +213,6 @@ func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionw
 		LedgerName:        sessionNamespace + "/journal",
 		LeaseName:         sessionNamespace + "/lease",
 		CatalogKey:        sessionNamespace + "/catalog",
-		CatalogListPrefix: owner.TenantNamespace + "/sessions/",
 		CatalogScope:      owner.CatalogScope,
 		BlobPrefix:        sessionNamespace + "/blobs/",
 		JournalName:       sessionNamespace + "/journal",

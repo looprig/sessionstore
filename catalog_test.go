@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"math"
 	"reflect"
 	"slices"
@@ -878,6 +881,52 @@ func TestCatalogHostUpdateInterleavedWithAnotherWriterConflicts(t *testing.T) {
 
 // --- lifecycle and provider errors ---------------------------------------
 
+// declaredCatalogOperations returns the name of every public Store operation
+// declared in catalog.go, parsed from the source rather than listed by hand.
+//
+// A hand-maintained list is the thing that failed here once already: the
+// operations below have to be spelled out anyway, because each needs a valid
+// request, but nothing made the spelling COMPLETE, so a fifth operation could
+// be added and silently never checked. Reading the declarations back is what
+// closes that: the file that declares an operation is the same file the test
+// enumerates, so the two cannot drift.
+//
+// It is scoped to catalog.go on purpose. Each area of this package owns a close
+// test for the operations it declares, and a guard that failed here for a new
+// object or journal method would be pointing at the wrong test.
+func declaredCatalogOperations(t *testing.T) map[string]bool {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), "catalog.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse catalog.go: %v", err)
+	}
+	operations := map[string]bool{}
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Recv == nil || !function.Name.IsExported() {
+			continue
+		}
+		receiver, ok := function.Recv.List[0].Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		if name, ok := receiver.X.(*ast.Ident); ok && name.Name == "Store" {
+			operations[function.Name.Name] = true
+		}
+	}
+	if len(operations) == 0 {
+		t.Fatal("no public Store operations were found in catalog.go; the enumerator is not reaching the declarations")
+	}
+	return operations
+}
+
+// TestCatalogOperationsRefuseAfterClose holds every public catalog operation to
+// the Store lifecycle. Each one admits foreground work, so each one must refuse
+// once shutdown has started rather than racing the drain it was supposed to
+// join.
+//
+// The table is checked against catalog.go's own declarations, so a new public
+// operation fails this test until it is exercised here.
 func TestCatalogOperationsRefuseAfterClose(t *testing.T) {
 	store, err := Open(context.Background(), memstore.New())
 	if err != nil {
@@ -887,20 +936,55 @@ func TestCatalogOperationsRefuseAfterClose(t *testing.T) {
 	if err := store.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if _, _, err := store.CreateCatalogEntry(context.Background(), testCreateRequest()); !errors.As(err, new(*StoreClosedError)) {
-		t.Fatalf("CreateCatalogEntry after Close = %v", err)
+
+	operations := map[string]func() error{
+		"CreateCatalogEntry": func() error {
+			_, _, err := store.CreateCatalogEntry(context.Background(), testCreateRequest())
+			return err
+		},
+		"GetCatalogEntry": func() error {
+			_, err := store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{
+				TenantID: catalogTenant, SessionID: catalogSession,
+			})
+			return err
+		},
+		"UpdateCatalogHostState": func() error {
+			_, err := store.UpdateCatalogHostState(context.Background(), testHostStateRequest(1))
+			return err
+		},
+		"UpdateCatalogDesiredState": func() error {
+			_, err := store.UpdateCatalogDesiredState(context.Background(), UpdateCatalogDesiredStateRequest{
+				TenantID: catalogTenant, SessionID: catalogSession, ExpectedRevision: 1,
+				IdempotencyKey: "k", DesiredPlacement: sessionwire.HostPlacementPooled,
+			})
+			return err
+		},
+		"ListSessions": func() error {
+			_, err := store.ListSessions(context.Background(), ListSessionsRequest{
+				TenantID: catalogTenant, Limit: 10,
+			})
+			return err
+		},
 	}
-	if _, err := store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{TenantID: catalogTenant, SessionID: catalogSession}); !errors.As(err, new(*StoreClosedError)) {
-		t.Fatalf("GetCatalogEntry after Close = %v", err)
+
+	declared := declaredCatalogOperations(t)
+	for name := range declared {
+		if operations[name] == nil {
+			t.Errorf("catalog.go declares the public operation %s and this test does not exercise it", name)
+		}
 	}
-	if _, err := store.UpdateCatalogHostState(context.Background(), testHostStateRequest(1)); !errors.As(err, new(*StoreClosedError)) {
-		t.Fatalf("UpdateCatalogHostState after Close = %v", err)
+	for name := range operations {
+		if !declared[name] {
+			t.Errorf("this test exercises %s, which catalog.go no longer declares", name)
+		}
 	}
-	if _, err := store.UpdateCatalogDesiredState(context.Background(), UpdateCatalogDesiredStateRequest{
-		TenantID: catalogTenant, SessionID: catalogSession, ExpectedRevision: 1,
-		IdempotencyKey: "k", DesiredPlacement: sessionwire.HostPlacementPooled,
-	}); !errors.As(err, new(*StoreClosedError)) {
-		t.Fatalf("UpdateCatalogDesiredState after Close = %v", err)
+
+	for name, call := range operations {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); !errors.As(err, new(*StoreClosedError)) {
+				t.Fatalf("%s after Close = %T %v, want *StoreClosedError", name, err, err)
+			}
+		})
 	}
 }
 
@@ -2200,5 +2284,52 @@ func TestListSessionsRefusesToIssueACursorItCouldNotAccept(t *testing.T) {
 	got := assertCatalogCode(t, err, CatalogErrorBackend)
 	if got.Field != "next_cursor" {
 		t.Fatalf("field = %q, want next_cursor", got.Field)
+	}
+}
+
+// TestListSessionsUnderTheLegacyLayout drives the legacy arm of the tenant
+// scope derivation directly. A legacy backend authorizes exactly one tenant, so
+// its whole catalog is the single ordering and ranking scope "sessions" rather
+// than a per-tenant namespace, and a listing must still be one ranked query in
+// that scope. The arm is reachable from a listing, which has no SessionID, so
+// covering it only through deriveSessionScope would leave the path a listing
+// actually takes unexercised.
+func TestListSessionsUnderTheLegacyLayout(t *testing.T) {
+	const legacyTenant = sessionwire.TenantID("local")
+	const (
+		olderSession = sessionwire.SessionID("11111111-1111-1111-1111-111111111111")
+		newerSession = sessionwire.SessionID("22222222-2222-2222-2222-222222222222")
+	)
+	store, audit, kv := openAuditedListStore(t, WithLegacySingleTenant(legacyTenant))
+	mustCreateSession(t, store, legacyTenant, olderSession, catalogActiveAt)
+	mustCreateSession(t, store, legacyTenant, newerSession, catalogActiveAt.Add(time.Hour))
+	audit.arm(legacyCatalogScope)
+
+	page := mustListSessions(t, store, ListSessionsRequest{TenantID: legacyTenant, Limit: 10})
+	want := []sessionwire.SessionID{newerSession, olderSession}
+	if got := listedSessionIDs(page); !reflect.DeepEqual(got, want) {
+		t.Fatalf("sessions = %v, want %v", got, want)
+	}
+	calls := audit.rankedCalls()
+	if len(calls) != 1 {
+		t.Fatalf("ListRanked calls = %d, want exactly one", len(calls))
+	}
+	if calls[0].rankingScope != legacyCatalogScope {
+		t.Fatalf("ranking scope = %q, want %q", calls[0].rankingScope, legacyCatalogScope)
+	}
+	if kv.keys.Load() != 0 {
+		t.Fatalf("a legacy listing scanned KV keys %d times", kv.keys.Load())
+	}
+
+	// A legacy backend authorizes one tenant and no other, and the refusal is
+	// the layout's, not a "this tenant has no sessions" empty page.
+	before := len(audit.rankedCalls())
+	_, err := store.ListSessions(context.Background(), ListSessionsRequest{TenantID: catalogTenant, Limit: 10})
+	if err == nil {
+		t.Fatal("a legacy backend listed a tenant it does not authorize")
+	}
+	assertKeyspaceCode(t, err, KeyspaceLegacyTenant)
+	if reached := len(audit.rankedCalls()) - before; reached != 0 {
+		t.Fatalf("an unauthorized tenant reached the provider %d times", reached)
 	}
 }

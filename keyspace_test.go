@@ -271,22 +271,21 @@ func TestTenantSessionTokenGolden(t *testing.T) {
 		t.Fatalf("SessionNamespace = %q, want %q", got, want)
 	}
 	wantFields := map[string]string{
-		"TenantNamespace":   scope.TenantNamespace,
-		"SessionNamespace":  scope.SessionNamespace,
-		"LedgerName":        scope.SessionNamespace + "/journal",
-		"JournalName":       scope.SessionNamespace + "/journal",
-		"LeaseName":         scope.SessionNamespace + "/lease",
-		"CatalogKey":        scope.SessionNamespace + "/catalog",
-		"CatalogListPrefix": scope.TenantNamespace + "/sessions/",
-		"CatalogScope":      scope.TenantNamespace,
-		"BlobPrefix":        scope.SessionNamespace + "/blobs/",
+		"TenantNamespace":  scope.TenantNamespace,
+		"SessionNamespace": scope.SessionNamespace,
+		"LedgerName":       scope.SessionNamespace + "/journal",
+		"JournalName":      scope.SessionNamespace + "/journal",
+		"LeaseName":        scope.SessionNamespace + "/lease",
+		"CatalogKey":       scope.SessionNamespace + "/catalog",
+		"CatalogScope":     scope.TenantNamespace,
+		"BlobPrefix":       scope.SessionNamespace + "/blobs/",
 	}
 	gotFields := map[string]string{
 		"TenantNamespace": scope.TenantNamespace, "SessionNamespace": scope.SessionNamespace,
 		"LedgerName": scope.LedgerName, "JournalName": scope.JournalName,
 		"LeaseName": scope.LeaseName, "CatalogKey": scope.CatalogKey,
-		"CatalogListPrefix": scope.CatalogListPrefix, "CatalogScope": scope.CatalogScope,
-		"BlobPrefix": scope.BlobPrefix,
+		"CatalogScope": scope.CatalogScope,
+		"BlobPrefix":   scope.BlobPrefix,
 	}
 	for field, want := range wantFields {
 		got := gotFields[field]
@@ -690,9 +689,6 @@ func TestLegacyLayoutRejectsForeignTenantAndNoncanonicalSession(t *testing.T) {
 	}
 	if scope.LeaseName != scope.SessionNamespace {
 		t.Fatalf("legacy lease = %q, want %q", scope.LeaseName, scope.SessionNamespace)
-	}
-	if scope.CatalogListPrefix != "sessions/" {
-		t.Fatalf("legacy catalog list prefix = %q", scope.CatalogListPrefix)
 	}
 	if scope.CatalogScope != legacyCatalogScope {
 		t.Fatalf("legacy catalog scope = %q, want %q", scope.CatalogScope, legacyCatalogScope)
@@ -1197,4 +1193,60 @@ func (c *countAllOrdered) ListRanked(ctx context.Context, namespace, scope strin
 func (c *countAllOrdered) ListDue(ctx context.Context, namespace string, before int64, after storage.DueCursor, limit int) (storage.DuePage, error) {
 	c.calls.ordered.Add(1)
 	return c.OrderedIndex.ListDue(ctx, namespace, before, after, limit)
+}
+
+// TestDeriveSessionScopeValidatesTenantBeforeSession pins the precedence of the
+// four identity gates, which is otherwise invisible: every ordering of them
+// rejects the same inputs, so only a request that fails more than one gate can
+// tell them apart.
+//
+// The order matters because the answers differ in what they tell a caller to
+// do. A tenant a backend does not authorize is a configuration failure, and
+// reporting a malformed session id instead would send the caller to fix the
+// wrong thing. Within the legacy layout the same holds one level down: an
+// unusable session id is a caller error, while a well-formed but non-canonical
+// one is a layout restriction.
+func TestDeriveSessionScopeValidatesTenantBeforeSession(t *testing.T) {
+	canonical := openTestStore(t)
+	legacyBackend := memstore.New()
+	legacy, err := Open(context.Background(), legacyBackend, WithLegacySingleTenant("local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { legacy.Close(context.Background()) })
+
+	t.Run("invalid tenant precedes invalid session", func(t *testing.T) {
+		_, err := canonical.deriveSessionScope("", "")
+		var invalid *InvalidIdentityError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("error = %T %v, want *InvalidIdentityError", err, err)
+		}
+		if invalid.Field != "TenantID" {
+			t.Fatalf("field = %q, want TenantID", invalid.Field)
+		}
+	})
+
+	t.Run("unauthorized legacy tenant precedes invalid session", func(t *testing.T) {
+		_, err := legacy.deriveSessionScope("someone-else", "")
+		assertKeyspaceCode(t, err, KeyspaceLegacyTenant)
+	})
+
+	t.Run("invalid session precedes the legacy session form", func(t *testing.T) {
+		// An empty session id is both invalid and non-canonical for the legacy
+		// layout. It must be reported as invalid: the layout restriction is a
+		// statement about well-formed ids this backend cannot store.
+		_, err := legacy.deriveSessionScope("local", "")
+		var invalid *InvalidIdentityError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("error = %T %v, want *InvalidIdentityError", err, err)
+		}
+		if invalid.Field != "SessionID" {
+			t.Fatalf("field = %q, want SessionID", invalid.Field)
+		}
+	})
+
+	t.Run("a valid non-canonical legacy session is a layout restriction", func(t *testing.T) {
+		_, err := legacy.deriveSessionScope("local", "not-a-uuid")
+		assertKeyspaceCode(t, err, KeyspaceLegacySession)
+	})
 }
