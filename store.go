@@ -22,14 +22,15 @@ type Store struct {
 	lifecycleMu     sync.Mutex
 	lifecycleLocked func(lifecycleOperation)
 	closing         bool
-	background      sync.WaitGroup
+	active          sync.WaitGroup
 
-	providerClose func(context.Context) error
-	ioAdapter     *ioProviderAdapter
-	keys          keyspace
-	closeOnce     sync.Once
-	closeDone     chan struct{}
-	closeErr      error
+	providerClose    func(context.Context) error
+	ioAdapter        *ioProviderAdapter
+	keys             keyspace
+	objectGeneration func() ([16]byte, error)
+	closeOnce        sync.Once
+	closeDone        chan struct{}
+	closeErr         error
 }
 
 // Open constructs a Store over a complete storage composite. Before publishing
@@ -70,17 +71,18 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 
 	ownedCtx, cancel := context.WithCancel(ctx)
 	return &Store{
-		backend:         backend,
-		limits:          cfg.limits,
-		clock:           cfg.clock,
-		logger:          cfg.logger,
-		shutdownTimeout: cfg.shutdownTimeout,
-		ctx:             ownedCtx,
-		cancel:          cancel,
-		providerClose:   cfg.providerClose,
-		ioAdapter:       cfg.ioAdapter,
-		keys:            keys,
-		closeDone:       make(chan struct{}),
+		backend:          backend,
+		limits:           cfg.limits,
+		clock:            cfg.clock,
+		logger:           cfg.logger,
+		shutdownTimeout:  cfg.shutdownTimeout,
+		ctx:              ownedCtx,
+		cancel:           cancel,
+		providerClose:    cfg.providerClose,
+		ioAdapter:        cfg.ioAdapter,
+		keys:             keys,
+		objectGeneration: randomObjectGeneration,
+		closeDone:        make(chan struct{}),
 	}, nil
 }
 
@@ -105,16 +107,17 @@ func (s *Store) startBackground(work func(context.Context)) error {
 	if s.closing {
 		return &StoreClosedError{}
 	}
-	s.background.Add(1)
+	s.active.Add(1)
 	go func() {
-		defer s.background.Done()
+		defer s.active.Done()
 		work(s.ctx)
 	}()
 	return nil
 }
 
 // Close initiates shutdown exactly once. It cancels Store-owned work, waits for
-// it, then closes an explicitly owned provider at most once with a fresh,
+// admitted background work, foreground operations, and returned readers, then
+// closes an explicitly owned provider at most once with a fresh,
 // lifecycle-owned timeout. Each caller's ctx bounds only its own wait. If a
 // caller stops waiting, shutdown continues and a later call can observe the one
 // stable final result.
@@ -128,7 +131,7 @@ func (s *Store) Close(ctx context.Context) error {
 		s.cancel()
 		s.lifecycleMu.Unlock()
 		go func() {
-			s.background.Wait()
+			s.active.Wait()
 			if s.providerClose != nil {
 				closeCtx, cancel := context.WithTimeout(context.Background(), s.shutdownTimeout)
 				s.closeErr = s.providerClose(closeCtx)
@@ -149,4 +152,32 @@ func (s *Store) Close(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// admitForeground admits one public operation and returns a context canceled
+// by either its caller or Store shutdown. The idempotent release may be held by
+// a returned streaming reader.
+func (s *Store) admitForeground(caller context.Context) (context.Context, func(), error) {
+	s.lifecycleMu.Lock()
+	if s.lifecycleLocked != nil {
+		s.lifecycleLocked(lifecycleAdmit)
+	}
+	if s.closing {
+		s.lifecycleMu.Unlock()
+		return nil, nil, &StoreClosedError{}
+	}
+	s.active.Add(1)
+	s.lifecycleMu.Unlock()
+
+	ctx, cancel := context.WithCancel(caller)
+	stop := context.AfterFunc(s.ctx, cancel)
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			stop()
+			cancel()
+			s.active.Done()
+		})
+	}
+	return ctx, release, nil
 }
