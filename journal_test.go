@@ -1397,3 +1397,69 @@ func TestLeaseLostWriterStaysFailedWhenTheLeaseLooksLiveAgain(t *testing.T) {
 		t.Fatalf("ledger = %d records, want only the fence", len(records))
 	}
 }
+
+// TestOpenJournalRefusesWhenShutdownRacesRegistration pins the OUTCOME of an
+// open that is overtaken by Store shutdown.
+//
+// Registering the shutdown hook against an already-cancelled lifetime spawns the
+// hook on its own goroutine, so whether the hook or the constructor reaches the
+// writer's mutex first is a scheduling coin flip. Deciding the result from that
+// race would make the public contract nondeterministic: half the time the caller
+// receives the very writer the refusal exists to avoid, already closed. The
+// opening goroutine must therefore decide for itself, by consulting the lifetime
+// it just registered against.
+//
+// The seam is needed because shutdown reaches the writer's lifetime through
+// admitForeground's own AfterFunc goroutine, so cancelling the Store and waiting
+// on its context is not enough to guarantee the lifetime is already done.
+func TestOpenJournalRefusesWhenShutdownRacesRegistration(t *testing.T) {
+	// Repeated because the defect it guards is a race: one attempt could pass
+	// by luck even with the outcome left to the scheduler.
+	for attempt := 0; attempt < 15; attempt++ {
+		backend := memstore.New()
+		leaser := newRecordingLeaser()
+		backend.Leaser = leaser
+		store, err := Open(context.Background(), backend)
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+
+		var shutdown sync.WaitGroup
+		shutdown.Add(1)
+		store.beforeJournalBind = func(lifeCtx context.Context) {
+			go func() {
+				defer shutdown.Done()
+				closeCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				_ = store.Close(closeCtx)
+			}()
+			// Shutdown cannot complete while this open holds its admission, so
+			// waiting on the writer's own lifetime is what proves the
+			// cancellation has propagated all the way here.
+			<-lifeCtx.Done()
+		}
+
+		writer, err := store.OpenJournal(context.Background(), OpenJournalRequest{TenantID: testTenant, SessionID: testSession})
+		if writer != nil {
+			t.Fatalf("attempt %d: OpenJournal returned a writer during shutdown", attempt)
+		}
+		if !errors.As(err, new(*StoreClosedError)) {
+			t.Fatalf("attempt %d: error = %T %v, want *StoreClosedError", attempt, err, err)
+		}
+		lease := leaser.last()
+		if lease == nil {
+			t.Fatalf("attempt %d: no lease was acquired", attempt)
+		}
+		if got := lease.releaseCount(); got != 1 {
+			t.Fatalf("attempt %d: Release called %d times, want exactly 1", attempt, got)
+		}
+		shutdown.Wait()
+
+		drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := store.Close(drainCtx); err != nil {
+			cancel()
+			t.Fatalf("attempt %d: shutdown did not drain: %v", attempt, err)
+		}
+		cancel()
+	}
+}

@@ -36,6 +36,12 @@ type Store struct {
 	// paying for megabyte fixtures.
 	overflowThreshold int
 	maxPageBytes      int
+
+	// beforeJournalBind runs inside OpenJournal immediately before the writer
+	// registers its shutdown hook. It is nil in production and exists only so a
+	// test can place Store shutdown at that exact point; the window is a few
+	// instructions wide and cannot be reached reliably from outside.
+	beforeJournalBind func(context.Context)
 	closeOnce         sync.Once
 	closeDone         chan struct{}
 	closeErr          error

@@ -181,27 +181,39 @@ func (s *Store) OpenJournal(ctx context.Context, req OpenJournalRequest) (*Journ
 		release: release,
 		tracked: tip + 1,
 	}
-	if writer.bindShutdown(lifeCtx) {
-		// Shutdown closed this writer before its handle could be published, so
-		// the fence is durable but the grant is already handed back. Report the
-		// refusal rather than returning a writer that would refuse every append.
+	if s.beforeJournalBind != nil {
+		s.beforeJournalBind(lifeCtx)
+	}
+	writer.bindShutdown(lifeCtx)
+	// Decide the outcome here rather than leaving it to whichever goroutine
+	// took the writer's mutex first. Registering against an already-cancelled
+	// lifetime spawns the hook on its own goroutine, so without this check an
+	// open overtaken by shutdown returns a live-looking writer roughly half the
+	// time — the exact object this refusal exists to avoid.
+	//
+	// The lifetime is the whole fact. bindShutdown could only observe a closed
+	// writer if its hook had already run, and the hook runs only once this
+	// lifetime is done, so also consulting its result would state one condition
+	// twice and let either copy rot unnoticed. Close is idempotent, so it is
+	// safe whether or not the hook already ran.
+	if lifeCtx.Err() != nil {
+		_ = writer.Close(context.Background())
 		return nil, &StoreClosedError{}
 	}
 	return writer, nil
 }
 
-// bindShutdown wires Store shutdown to close this writer and reports whether
-// shutdown had already closed it while the handle was being published.
-func (w *JournalWriter) bindShutdown(lifeCtx context.Context) bool {
-	closed := false
+// bindShutdown wires Store shutdown to close this writer. It reports nothing:
+// the caller decides the open's outcome from the lifetime itself, and the only
+// thing this could add — that the hook won the publish race — is implied by a
+// cancelled lifetime.
+func (w *JournalWriter) bindShutdown(lifeCtx context.Context) {
 	bindCancelHandle(lifeCtx, func() { _ = w.Close(context.Background()) }, func(stop func() bool) bool {
 		w.mu.Lock()
 		defer w.mu.Unlock()
 		w.stopShutdown = stop
-		closed = w.closed
-		return closed
+		return w.closed
 	})
-	return closed
 }
 
 // Epoch returns the fencing epoch of this writer's lease grant.
