@@ -36,9 +36,18 @@ type keyspace struct {
 }
 
 type sessionScope struct {
-	TenantNamespace  string
-	SessionNamespace string
-	JournalName      string
+	TenantNamespace   string
+	SessionNamespace  string
+	LedgerName        string
+	LeaseName         string
+	CatalogKey        string
+	CatalogListPrefix string
+	BlobPrefix        string
+	JournalName       string
+	tenantWitnessKey  string
+	tenantWitness     []byte
+	sessionWitnessKey string
+	sessionWitness    []byte
 }
 
 func newKeyspace(kv storage.KV, layout keyspaceLayout, legacyTenant sessionwire.TenantID) keyspace {
@@ -51,20 +60,18 @@ func (k keyspace) initialize(ctx context.Context) error {
 	if err == nil {
 		return compareLayoutMarker(got, want)
 	}
-	var notFound *storage.KeyNotFoundError
-	if !errors.As(err, &notFound) {
+	if !isKeyNotFound(err, layoutMarkerKey) {
 		return &KeyspaceError{Code: KeyspaceBackend, Cause: err}
 	}
 	if _, err = k.kv.Put(ctx, layoutMarkerKey, 0, want); err == nil {
 		return nil
 	}
-	var conflict *storage.ConflictError
-	if !errors.As(err, &conflict) {
+	if !isCreateConflict(err, layoutMarkerKey) {
 		return &KeyspaceError{Code: KeyspaceBackend, Cause: err}
 	}
 	got, _, err = k.kv.Get(ctx, layoutMarkerKey)
 	if err != nil {
-		if errors.As(err, &notFound) {
+		if isKeyNotFound(err, layoutMarkerKey) {
 			return &KeyspaceError{Code: KeyspaceMarkerAmbiguous, Cause: err}
 		}
 		return &KeyspaceError{Code: KeyspaceBackend, Cause: err}
@@ -119,7 +126,10 @@ func validateLayoutMarker(data []byte) error {
 	return nil
 }
 
-func (s *Store) sessionScope(ctx context.Context, tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionScope, error) {
+// deriveSessionScope is pure: it validates identities and derives provider-safe
+// names without touching storage. Callers must use verifySessionScope before a
+// read or bindSessionScope before creating durable session data.
+func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionwire.SessionID) (sessionScope, error) {
 	if err := tenant.Validate(); err != nil {
 		return sessionScope{}, &InvalidIdentityError{Field: "TenantID", Cause: err}
 	}
@@ -134,22 +144,67 @@ func (s *Store) sessionScope(ctx context.Context, tenant sessionwire.TenantID, s
 			return sessionScope{}, &KeyspaceError{Code: KeyspaceLegacySession}
 		}
 		prefix := "sessions/" + string(session)
-		return sessionScope{SessionNamespace: prefix, JournalName: prefix + "/journal"}, nil
+		return sessionScope{
+			SessionNamespace:  prefix,
+			LedgerName:        prefix,
+			LeaseName:         prefix,
+			CatalogKey:        prefix,
+			CatalogListPrefix: "sessions/",
+			BlobPrefix:        prefix + "/blobs/",
+			JournalName:       prefix,
+		}, nil
 	}
 
 	tenantFrame := digestFrame("looprig/sessionstore/key/v1/tenant", []byte(tenant))
 	sessionFrame := digestFrame("looprig/sessionstore/key/v1/session", []byte(tenant), []byte(session))
 	tenantToken := encodeDigest(s.keys.digest(tenantFrame))
 	sessionToken := encodeDigest(s.keys.digest(sessionFrame))
-	if err := s.keys.bindWitness(ctx, "tenant", tenantToken, encodeWitness(1, []byte(tenant))); err != nil {
-		return sessionScope{}, err
-	}
-	if err := s.keys.bindWitness(ctx, "session", sessionToken, encodeWitness(2, []byte(tenant), []byte(session))); err != nil {
-		return sessionScope{}, err
-	}
 	tenantNamespace := "tenants/" + tenantToken
 	sessionNamespace := tenantNamespace + "/sessions/" + sessionToken
-	return sessionScope{TenantNamespace: tenantNamespace, SessionNamespace: sessionNamespace, JournalName: sessionNamespace + "/journal"}, nil
+	return sessionScope{
+		TenantNamespace:   tenantNamespace,
+		SessionNamespace:  sessionNamespace,
+		LedgerName:        sessionNamespace + "/journal",
+		LeaseName:         sessionNamespace + "/lease",
+		CatalogKey:        sessionNamespace + "/catalog",
+		CatalogListPrefix: tenantNamespace + "/sessions/",
+		BlobPrefix:        sessionNamespace + "/blobs/",
+		JournalName:       sessionNamespace + "/journal",
+		tenantWitnessKey:  witnessKey("tenant", tenantToken),
+		tenantWitness:     encodeWitness(1, []byte(tenant)),
+		sessionWitnessKey: witnessKey("session", sessionToken),
+		sessionWitness:    encodeWitness(2, []byte(tenant), []byte(session)),
+	}, nil
+}
+
+// verifySessionScope verifies collision bindings for an already-derived
+// canonical scope without creating metadata. A missing binding fails closed.
+func (s *Store) verifySessionScope(ctx context.Context, scope sessionScope) error {
+	if scope.tenantWitnessKey == "" {
+		return nil
+	}
+	if err := s.keys.verifyWitness(ctx, scope.tenantWitnessKey, scope.tenantWitness); err != nil {
+		return err
+	}
+	if err := s.keys.verifyWitness(ctx, scope.sessionWitnessKey, scope.sessionWitness); err != nil {
+		return err
+	}
+	return nil
+}
+
+// bindSessionScope create-only binds collision witnesses before a caller may
+// create any canonical session data. Legacy scopes require no witnesses.
+func (s *Store) bindSessionScope(ctx context.Context, scope sessionScope) error {
+	if scope.tenantWitnessKey == "" {
+		return nil
+	}
+	if err := s.keys.bindWitness(ctx, scope.tenantWitnessKey, scope.tenantWitness); err != nil {
+		return err
+	}
+	if err := s.keys.bindWitness(ctx, scope.sessionWitnessKey, scope.sessionWitness); err != nil {
+		return err
+	}
+	return nil
 }
 
 func digestFrame(domain string, values ...[]byte) []byte {
@@ -199,8 +254,23 @@ func checkedUint32Length(length int) uint32 {
 	return uint32(length)
 }
 
-func (k keyspace) bindWitness(ctx context.Context, kind, token string, want []byte) error {
-	key := "sessionstore/witnesses/" + kind + "/" + token
+func witnessKey(kind, token string) string { return "sessionstore/witnesses/" + kind + "/" + token }
+
+func (k keyspace) verifyWitness(ctx context.Context, key string, want []byte) error {
+	got, _, err := k.kv.Get(ctx, key)
+	if err != nil {
+		if isKeyNotFound(err, key) {
+			return &KeyspaceError{Code: KeyspaceBindingNotFound, Cause: err}
+		}
+		return &KeyspaceError{Code: KeyspaceBackend, Cause: err}
+	}
+	if !bytes.Equal(got, want) {
+		return &KeyspaceError{Code: KeyspaceHashCollision}
+	}
+	return nil
+}
+
+func (k keyspace) bindWitness(ctx context.Context, key string, want []byte) error {
 	got, _, err := k.kv.Get(ctx, key)
 	if err == nil {
 		if !bytes.Equal(got, want) {
@@ -208,25 +278,36 @@ func (k keyspace) bindWitness(ctx context.Context, kind, token string, want []by
 		}
 		return nil
 	}
-	var notFound *storage.KeyNotFoundError
-	if !errors.As(err, &notFound) {
+	if !isKeyNotFound(err, key) {
 		return &KeyspaceError{Code: KeyspaceBackend, Cause: err}
 	}
 	if _, err = k.kv.Put(ctx, key, 0, want); err == nil {
 		return nil
 	}
-	var conflict *storage.ConflictError
-	if !errors.As(err, &conflict) {
+	if !isCreateConflict(err, key) {
 		return &KeyspaceError{Code: KeyspaceBackend, Cause: err}
 	}
 	got, _, err = k.kv.Get(ctx, key)
 	if err != nil {
-		return &KeyspaceError{Code: KeyspaceMarkerAmbiguous, Cause: err}
+		if isKeyNotFound(err, key) {
+			return &KeyspaceError{Code: KeyspaceBindingAmbiguous, Cause: err}
+		}
+		return &KeyspaceError{Code: KeyspaceBackend, Cause: err}
 	}
 	if !bytes.Equal(got, want) {
 		return &KeyspaceError{Code: KeyspaceHashCollision}
 	}
 	return nil
+}
+
+func isKeyNotFound(err error, key string) bool {
+	var target *storage.KeyNotFoundError
+	return errors.As(err, &target) && target.Key == key
+}
+
+func isCreateConflict(err error, key string) bool {
+	var target *storage.ConflictError
+	return errors.As(err, &target) && target.Name == key && target.Expected == 0
 }
 
 func isCanonicalLegacySessionID(id string) bool {

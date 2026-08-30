@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -150,6 +152,11 @@ func TestLayoutMarkerBackendStateMachineAndOwnership(t *testing.T) {
 	}{
 		{name: "initial get", get: func(int) ([]byte, uint64, error) { return nil, 0, sentinel }, wantCode: KeyspaceBackend, wantGets: 1},
 		{name: "put definite failure", get: notFoundGet, put: func(int, []byte) (uint64, error) { return 0, sentinel }, wantCode: KeyspaceBackend, wantGets: 1, wantPuts: 1},
+		{name: "wrong not-found key", get: func(int) ([]byte, uint64, error) { return nil, 0, &storage.KeyNotFoundError{Key: "other"} }, wantCode: KeyspaceBackend, wantGets: 1},
+		{name: "conflict wrong name", get: notFoundGet, put: func(int, []byte) (uint64, error) { return 0, &storage.ConflictError{Name: "other", Expected: 0} }, wantCode: KeyspaceBackend, wantGets: 1, wantPuts: 1},
+		{name: "conflict wrong expected", get: notFoundGet, put: func(int, []byte) (uint64, error) {
+			return 0, &storage.ConflictError{Name: layoutMarkerKey, Expected: 7}
+		}, wantCode: KeyspaceBackend, wantGets: 1, wantPuts: 1},
 		{name: "conflict reread absent", get: notFoundGet, put: conflictPut, wantCode: KeyspaceMarkerAmbiguous, wantGets: 2, wantPuts: 1},
 		{name: "conflict reread backend failure", get: func(n int) ([]byte, uint64, error) {
 			if n == 1 {
@@ -157,6 +164,18 @@ func TestLayoutMarkerBackendStateMachineAndOwnership(t *testing.T) {
 			}
 			return nil, 0, sentinel
 		}, put: conflictPut, wantCode: KeyspaceBackend, wantGets: 2, wantPuts: 1},
+		{name: "conflict reread different layout", get: func(n int) ([]byte, uint64, error) {
+			if n == 1 {
+				return notFoundGet(n)
+			}
+			return encodeLayoutMarker(layoutLegacySingleTenantV1, "tenant"), 1, nil
+		}, put: conflictPut, wantCode: KeyspaceLayoutMismatch, wantGets: 2, wantPuts: 1},
+		{name: "conflict reread malformed", get: func(n int) ([]byte, uint64, error) {
+			if n == 1 {
+				return notFoundGet(n)
+			}
+			return []byte("malformed"), 1, nil
+		}, put: conflictPut, wantCode: KeyspaceMarkerMalformed, wantGets: 2, wantPuts: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -196,7 +215,7 @@ func TestTenantSessionScopeUsesOpaqueSafeNames(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := openTestStore(t)
-			scope, err := store.sessionScope(context.Background(), tt.tenant, tt.session)
+			scope, err := store.deriveSessionScope(tt.tenant, tt.session)
 			if err != nil {
 				t.Fatalf("sessionScope: %v", err)
 			}
@@ -212,11 +231,11 @@ func TestTenantSessionScopeUsesOpaqueSafeNames(t *testing.T) {
 	}
 
 	store := openTestStore(t)
-	a, err := store.sessionScope(context.Background(), "tenant-a", "same")
+	a, err := store.deriveSessionScope("tenant-a", "same")
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := store.sessionScope(context.Background(), "tenant-b", "same")
+	b, err := store.deriveSessionScope("tenant-b", "same")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,8 +245,8 @@ func TestTenantSessionScopeUsesOpaqueSafeNames(t *testing.T) {
 	if lastNameSegment(a.SessionNamespace) == lastNameSegment(b.SessionNamespace) {
 		t.Fatal("session digest did not include tenant identity")
 	}
-	nfc, _ := store.sessionScope(context.Background(), "é", "same")
-	nfd, _ := store.sessionScope(context.Background(), "e\u0301", "same")
+	nfc, _ := store.deriveSessionScope("é", "same")
+	nfd, _ := store.deriveSessionScope("e\u0301", "same")
 	if nfc.TenantNamespace == nfd.TenantNamespace {
 		t.Fatal("NFC and NFD identities were normalized")
 	}
@@ -235,7 +254,7 @@ func TestTenantSessionScopeUsesOpaqueSafeNames(t *testing.T) {
 
 func TestTenantSessionTokenGolden(t *testing.T) {
 	store := openTestStore(t)
-	scope, err := store.sessionScope(context.Background(), "tenant-a", "session-a")
+	scope, err := store.deriveSessionScope("tenant-a", "session-a")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,6 +263,118 @@ func TestTenantSessionTokenGolden(t *testing.T) {
 	}
 	if got, want := scope.SessionNamespace, scope.TenantNamespace+"/sessions/0l176u4vnt2ldqnqa6el9mg3b9p0ulasj3tngninlj5ne6925fq0"; got != want {
 		t.Fatalf("SessionNamespace = %q, want %q", got, want)
+	}
+}
+
+func TestWitnessEncodingGoldenAndTupleBoundaries(t *testing.T) {
+	store := openTestStore(t)
+	scope, err := store.deriveSessionScope("a", "bc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := scope.tenantWitness, []byte{'L', 'R', 'W', 'B', 1, 1, 0, 1, 'a'}; !bytes.Equal(got, want) {
+		t.Fatalf("tenant witness = %x, want %x", got, want)
+	}
+	if got, want := scope.sessionWitness, []byte{'L', 'R', 'W', 'B', 1, 2, 0, 1, 'a', 0, 2, 'b', 'c'}; !bytes.Equal(got, want) {
+		t.Fatalf("session witness = %x, want %x", got, want)
+	}
+	other, err := store.deriveSessionScope("ab", "c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(scope.sessionWitness, other.sessionWitness) {
+		t.Fatal("length framing aliased (a,bc) with (ab,c)")
+	}
+}
+
+func TestVerifySessionScopeDoesNotCreateMissingWitness(t *testing.T) {
+	backend := memstore.New()
+	store, err := Open(context.Background(), backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close(context.Background())
+	scope, err := store.deriveSessionScope("tenant", "absent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = store.verifySessionScope(context.Background(), scope)
+	assertKeyspaceCode(t, err, KeyspaceBindingNotFound)
+	keys, err := backend.KV.Keys(context.Background(), "sessionstore/witnesses/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("read verification created witnesses: %v", keys)
+	}
+}
+
+func TestBindThenVerifySessionScope(t *testing.T) {
+	store := openTestStore(t)
+	scope, err := store.deriveSessionScope("tenant", "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.bindSessionScope(context.Background(), scope); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	if err := store.verifySessionScope(context.Background(), scope); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+}
+
+func TestWitnessStateMachine(t *testing.T) {
+	key := "sessionstore/witnesses/session/token"
+	want := []byte("wanted")
+	sentinel := errors.New("private backend detail")
+	notFound := func(subject string) exactGetResult {
+		return exactGetResult{err: &storage.KeyNotFoundError{Key: subject}}
+	}
+	conflict := func(subject string, expected uint64) error {
+		return &storage.ConflictError{Name: subject, Expected: expected}
+	}
+	tests := []struct {
+		name               string
+		gets               []exactGetResult
+		putErr             error
+		wantCode           KeyspaceErrorCode
+		wantGets, wantPuts int
+	}{
+		{name: "initial get backend error", gets: []exactGetResult{{err: sentinel}}, wantCode: KeyspaceBackend, wantGets: 1},
+		{name: "wrong not-found subject", gets: []exactGetResult{notFound("other")}, wantCode: KeyspaceBackend, wantGets: 1},
+		{name: "create put definite failure", gets: []exactGetResult{notFound(key)}, putErr: sentinel, wantCode: KeyspaceBackend, wantGets: 1, wantPuts: 1},
+		{name: "conflict wrong name", gets: []exactGetResult{notFound(key)}, putErr: conflict("other", 0), wantCode: KeyspaceBackend, wantGets: 1, wantPuts: 1},
+		{name: "conflict wrong expected", gets: []exactGetResult{notFound(key)}, putErr: conflict(key, 9), wantCode: KeyspaceBackend, wantGets: 1, wantPuts: 1},
+		{name: "conflict then absent", gets: []exactGetResult{notFound(key), notFound(key)}, putErr: conflict(key, 0), wantCode: KeyspaceBindingAmbiguous, wantGets: 2, wantPuts: 1},
+		{name: "conflict then backend error", gets: []exactGetResult{notFound(key), {err: sentinel}}, putErr: conflict(key, 0), wantCode: KeyspaceBackend, wantGets: 2, wantPuts: 1},
+		{name: "conflict then same", gets: []exactGetResult{notFound(key), {value: want, rev: 1}}, putErr: conflict(key, 0), wantGets: 2, wantPuts: 1},
+		{name: "conflict then different", gets: []exactGetResult{notFound(key), {value: []byte("different"), rev: 1}}, putErr: conflict(key, 0), wantCode: KeyspaceHashCollision, wantGets: 2, wantPuts: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kv := &exactScriptKV{getResults: append([]exactGetResult(nil), tt.gets...), putErr: tt.putErr}
+			err := (keyspace{kv: kv}).bindWitness(context.Background(), key, want)
+			if tt.wantCode == "" {
+				if err != nil {
+					t.Fatalf("bindWitness: %v", err)
+				}
+			} else {
+				assertKeyspaceCode(t, err, tt.wantCode)
+			}
+			if kv.getCalls != tt.wantGets || kv.putCalls != tt.wantPuts {
+				t.Fatalf("calls Get=%d Put=%d, want %d/%d", kv.getCalls, kv.putCalls, tt.wantGets, tt.wantPuts)
+			}
+			for _, got := range kv.getKeys {
+				if got != key {
+					t.Errorf("Get key = %q", got)
+				}
+			}
+			for _, put := range kv.puts {
+				if put.key != key || put.expected != 0 || !bytes.Equal(put.value, want) {
+					t.Errorf("Put = key %q expected %d value %x", put.key, put.expected, put.value)
+				}
+			}
+		})
 	}
 }
 
@@ -315,6 +446,60 @@ func TestLayoutMarkerStrictCodec(t *testing.T) {
 	}
 }
 
+func TestLegacyLayoutMarkerRawCorpus(t *testing.T) {
+	legacy := func(tenant []byte, declared int) []byte {
+		out := []byte{'L', 'R', 'K', 'S', 1, byte(layoutLegacySingleTenantV1), 1, byte(declared >> 8), byte(declared)}
+		return append(out, tenant...)
+	}
+	longTenant := bytes.Repeat([]byte{'x'}, sessionwire.MaxIDBytes+1)
+	tests := map[string][]byte{
+		"zero tenant":    legacy(nil, 0),
+		"invalid utf8":   legacy([]byte{0xff}, 1),
+		"over max":       legacy(longTenant, len(longTenant)),
+		"trailing":       append(legacy([]byte("tenant"), 6), 'x'),
+		"declared short": legacy([]byte("tenant"), 5),
+		"declared long":  legacy([]byte("tenant"), 7),
+	}
+	for name, marker := range tests {
+		t.Run(name, func(t *testing.T) {
+			backend := memstore.New()
+			if _, err := backend.KV.Put(context.Background(), layoutMarkerKey, 0, marker); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Open(context.Background(), backend, WithLegacySingleTenant("tenant"))
+			assertKeyspaceCode(t, err, KeyspaceMarkerMalformed)
+		})
+	}
+	t.Run("same tenant reopens", func(t *testing.T) {
+		backend := memstore.New()
+		if _, err := backend.KV.Put(context.Background(), layoutMarkerKey, 0, legacy([]byte("tenant"), 6)); err != nil {
+			t.Fatal(err)
+		}
+		store, err := Open(context.Background(), backend, WithLegacySingleTenant("tenant"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.Close(context.Background())
+	})
+}
+
+func TestLayoutMismatchBothDirections(t *testing.T) {
+	for _, legacyFirst := range []bool{false, true} {
+		backend := memstore.New()
+		first, second := []Option(nil), []Option{WithLegacySingleTenant("tenant")}
+		if legacyFirst {
+			first, second = second, first
+		}
+		store, err := Open(context.Background(), backend, first...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.Close(context.Background())
+		_, err = Open(context.Background(), backend, second...)
+		assertKeyspaceCode(t, err, KeyspaceLayoutMismatch)
+	}
+}
+
 func TestMarkerConflictRereadsExactlyOnceAndConverges(t *testing.T) {
 	want := []byte{'L', 'R', 'K', 'S', 1, byte(layoutTenantV1), 1, 0, 0}
 	kv := &scriptKV{
@@ -335,6 +520,27 @@ func TestMarkerConflictRereadsExactlyOnceAndConverges(t *testing.T) {
 	store.Close(context.Background())
 	if kv.gets != 2 || kv.puts != 1 {
 		t.Fatalf("calls Get=%d Put=%d, want 2/1", kv.gets, kv.puts)
+	}
+}
+
+func TestLayoutMarkerCreateUsesExactKeyAndRevisionZero(t *testing.T) {
+	kv := &exactScriptKV{getResults: []exactGetResult{{err: &storage.KeyNotFoundError{Key: layoutMarkerKey}}}}
+	backend := memstore.New()
+	backend.KV = kv
+	store, err := Open(context.Background(), backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.Close(context.Background())
+	if kv.getCalls != 1 || kv.putCalls != 1 {
+		t.Fatalf("calls Get=%d Put=%d", kv.getCalls, kv.putCalls)
+	}
+	if len(kv.puts) != 1 || kv.puts[0].key != layoutMarkerKey || kv.puts[0].expected != 0 {
+		t.Fatalf("marker Put = %+v", kv.puts)
+	}
+	want := []byte{'L', 'R', 'K', 'S', 1, byte(layoutTenantV1), 1, 0, 0}
+	if !bytes.Equal(kv.puts[0].value, want) {
+		t.Fatalf("marker value = %x, want %x", kv.puts[0].value, want)
 	}
 }
 
@@ -363,7 +569,7 @@ func TestSessionScopeRejectsInvalidOpaqueIDsBeforeProviderCall(t *testing.T) {
 			} else {
 				session = sessionwire.SessionID(value)
 			}
-			_, err = store.sessionScope(context.Background(), tenant, session)
+			_, err = store.deriveSessionScope(tenant, session)
 			var invalidErr *InvalidIdentityError
 			if !errors.As(err, &invalidErr) || invalidErr.Field != field {
 				t.Fatalf("%s invalid error = %T %v", field, err, err)
@@ -385,7 +591,7 @@ func TestLegacyLayoutRejectsForeignTenantAndNoncanonicalSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := counting.calls.Load()
-	if _, err := store.sessionScope(context.Background(), "foreign", "123e4567-e89b-12d3-a456-426614174000"); err == nil {
+	if _, err := store.deriveSessionScope("foreign", "123e4567-e89b-12d3-a456-426614174000"); err == nil {
 		t.Fatal("foreign tenant accepted")
 	} else {
 		assertKeyspaceCode(t, err, KeyspaceLegacyTenant)
@@ -395,32 +601,146 @@ func TestLegacyLayoutRejectsForeignTenantAndNoncanonicalSession(t *testing.T) {
 	}
 
 	for _, id := range []sessionwire.SessionID{"opaque", "123E4567-E89B-12D3-A456-426614174000", "{123e4567-e89b-12d3-a456-426614174000}"} {
-		if _, err := store.sessionScope(context.Background(), "local", id); err == nil {
+		if _, err := store.deriveSessionScope("local", id); err == nil {
 			t.Fatalf("legacy session %q accepted", id)
 		} else {
 			assertKeyspaceCode(t, err, KeyspaceLegacySession)
 		}
 	}
-	scope, err := store.sessionScope(context.Background(), "local", "123e4567-e89b-12d3-a456-426614174000")
+	scope, err := store.deriveSessionScope("local", "123e4567-e89b-12d3-a456-426614174000")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if scope.SessionNamespace != "sessions/123e4567-e89b-12d3-a456-426614174000" {
 		t.Fatalf("legacy namespace = %q", scope.SessionNamespace)
 	}
+	if scope.LedgerName != scope.SessionNamespace {
+		t.Fatalf("legacy ledger = %q, want %q", scope.LedgerName, scope.SessionNamespace)
+	}
+	if scope.JournalName != scope.SessionNamespace {
+		t.Fatalf("legacy journal = %q, want %q", scope.JournalName, scope.SessionNamespace)
+	}
+	if scope.CatalogKey != scope.SessionNamespace {
+		t.Fatalf("legacy catalog = %q, want %q", scope.CatalogKey, scope.SessionNamespace)
+	}
+	if scope.LeaseName != scope.SessionNamespace {
+		t.Fatalf("legacy lease = %q, want %q", scope.LeaseName, scope.SessionNamespace)
+	}
+	if scope.CatalogListPrefix != "sessions/" {
+		t.Fatalf("legacy catalog list prefix = %q", scope.CatalogListPrefix)
+	}
+	if scope.BlobPrefix != scope.SessionNamespace+"/blobs/" {
+		t.Fatalf("legacy blob prefix = %q", scope.BlobPrefix)
+	}
+	for label, name := range map[string]string{"ledger": scope.LedgerName, "lease": scope.LeaseName, "catalog": scope.CatalogKey} {
+		if strings.HasSuffix(name, "/journal") || strings.HasSuffix(name, "/lease") || strings.HasSuffix(name, "/catalog") {
+			t.Errorf("legacy %s incorrectly gained suffix: %q", label, name)
+		}
+	}
+	for label, name := range map[string]string{
+		"namespace": scope.SessionNamespace, "journal": scope.JournalName,
+		"ledger": scope.LedgerName, "lease": scope.LeaseName,
+		"catalog": scope.CatalogKey, "blobs": scope.BlobPrefix,
+	} {
+		for _, forbidden := range []string{"tenants/", "/journal", "/lease", "/writer", "/catalog", "/objects"} {
+			if strings.Contains(name, forbidden) {
+				t.Errorf("legacy %s %q contains forbidden %q", label, name, forbidden)
+			}
+		}
+	}
 	if counting.calls.Load() != before {
 		t.Fatal("legacy scope derivation touched provider")
+	}
+	if err := store.verifySessionScope(context.Background(), scope); err != nil {
+		t.Fatalf("legacy verify: %v", err)
+	}
+	if err := store.bindSessionScope(context.Background(), scope); err != nil {
+		t.Fatalf("legacy bind: %v", err)
+	}
+	if counting.calls.Load() != before {
+		t.Fatal("legacy verify/bind touched provider")
+	}
+	keys, err := backend.KV.Keys(context.Background(), "sessionstore/witnesses/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("legacy created canonical witnesses: %v", keys)
+	}
+	zero, err := store.deriveSessionScope("local", "00000000-0000-0000-0000-000000000000")
+	if err != nil {
+		t.Fatalf("canonical zero UUID: %v", err)
+	}
+	if zero.SessionNamespace != "sessions/00000000-0000-0000-0000-000000000000" {
+		t.Fatalf("zero UUID namespace = %q", zero.SessionNamespace)
 	}
 }
 
 func TestSessionScopeDetectsInjectedDigestCollision(t *testing.T) {
-	store := openTestStore(t)
-	store.keys.digest = func([]byte) [32]byte { return [32]byte{1} }
-	if _, err := store.sessionScope(context.Background(), "tenant-a", "session-a"); err != nil {
-		t.Fatalf("first scope: %v", err)
+	tests := []struct {
+		name                        string
+		firstTenant, secondTenant   sessionwire.TenantID
+		firstSession, secondSession sessionwire.SessionID
+	}{
+		{name: "tenant witness", firstTenant: "tenant-a", firstSession: "session", secondTenant: "tenant-b", secondSession: "session"},
+		{name: "session witness", firstTenant: "tenant", firstSession: "session-a", secondTenant: "tenant", secondSession: "session-b"},
 	}
-	_, err := store.sessionScope(context.Background(), "tenant-b", "session-b")
-	assertKeyspaceCode(t, err, KeyspaceHashCollision)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend := memstore.New()
+			store, err := Open(context.Background(), backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close(context.Background())
+			store.keys.digest = func([]byte) [32]byte { return [32]byte{1} }
+			first, err := store.deriveSessionScope(tt.firstTenant, tt.firstSession)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.bindSessionScope(context.Background(), first); err != nil {
+				t.Fatalf("first bind: %v", err)
+			}
+
+			token := "04" + strings.Repeat("0", 50)
+			wantKeys := []string{"sessionstore/witnesses/session/" + token, "sessionstore/witnesses/tenant/" + token}
+			gotKeys, err := backend.KV.Keys(context.Background(), "sessionstore/witnesses/")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(gotKeys, wantKeys) {
+				t.Fatalf("witness keys = %v, want %v", gotKeys, wantKeys)
+			}
+			if got, _, err := backend.KV.Get(context.Background(), first.tenantWitnessKey); err != nil || !bytes.Equal(got, first.tenantWitness) {
+				t.Fatalf("tenant witness = %x, %v; want %x", got, err, first.tenantWitness)
+			}
+			if got, _, err := backend.KV.Get(context.Background(), first.sessionWitnessKey); err != nil || !bytes.Equal(got, first.sessionWitness) {
+				t.Fatalf("session witness = %x, %v; want %x", got, err, first.sessionWitness)
+			}
+
+			second, err := store.deriveSessionScope(tt.secondTenant, tt.secondSession)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = store.verifySessionScope(context.Background(), second)
+			assertKeyspaceCode(t, err, KeyspaceHashCollision)
+			err = store.bindSessionScope(context.Background(), second)
+			assertKeyspaceCode(t, err, KeyspaceHashCollision)
+			afterKeys, _ := backend.KV.Keys(context.Background(), "sessionstore/witnesses/")
+			if !reflect.DeepEqual(afterKeys, wantKeys) {
+				t.Fatalf("collision mutated witnesses: %v", afterKeys)
+			}
+			if tip, err := backend.Ledger.Tip(context.Background(), first.LedgerName); err != nil || tip != 0 {
+				t.Fatalf("ledger mutated: tip=%d err=%v", tip, err)
+			}
+			if _, _, err := backend.KV.Get(context.Background(), first.CatalogKey); !errors.As(err, new(*storage.KeyNotFoundError)) {
+				t.Fatalf("catalog mutated: %v", err)
+			}
+			if blobs, err := backend.Blobs.List(context.Background(), first.BlobPrefix); err != nil || len(blobs) != 0 {
+				t.Fatalf("blobs mutated: %v %v", blobs, err)
+			}
+		})
+	}
 }
 
 func TestWithLegacySingleTenantRejectsInvalidTenantBeforeProviderCall(t *testing.T) {
@@ -435,6 +755,64 @@ func TestWithLegacySingleTenantRejectsInvalidTenantBeforeProviderCall(t *testing
 		if counting.calls.Load() != 0 {
 			t.Fatal("invalid option touched provider")
 		}
+	}
+}
+
+func TestInvalidAndForeignLegacyIdentitiesTouchNoProviderPrimitive(t *testing.T) {
+	t.Run("invalid canonical", func(t *testing.T) {
+		backend, calls := instrumentComposite(memstore.New())
+		store, err := Open(context.Background(), backend)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close(context.Background())
+		before := calls.snapshot()
+		if _, err := store.deriveSessionScope("", "session"); err == nil {
+			t.Fatal("invalid tenant accepted")
+		}
+		if got := calls.snapshot(); got != before {
+			t.Fatalf("provider calls changed from %+v to %+v", before, got)
+		}
+	})
+	t.Run("foreign legacy", func(t *testing.T) {
+		backend, calls := instrumentComposite(memstore.New())
+		store, err := Open(context.Background(), backend, WithLegacySingleTenant("local"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close(context.Background())
+		before := calls.snapshot()
+		if _, err := store.deriveSessionScope("foreign", "123e4567-e89b-12d3-a456-426614174000"); err == nil {
+			t.Fatal("foreign tenant accepted")
+		}
+		if got := calls.snapshot(); got != before {
+			t.Fatalf("provider calls changed from %+v to %+v", before, got)
+		}
+	})
+}
+
+func TestBindingFailurePrecedesEverySessionDataPrimitive(t *testing.T) {
+	backend, calls := instrumentComposite(memstore.New())
+	store, err := Open(context.Background(), backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close(context.Background())
+	store.keys.digest = func([]byte) [32]byte { return [32]byte{1} }
+	first, _ := store.deriveSessionScope("tenant-a", "session")
+	if err := store.bindSessionScope(context.Background(), first); err != nil {
+		t.Fatal(err)
+	}
+	before := calls.snapshot()
+	second, _ := store.deriveSessionScope("tenant-b", "session")
+	err = store.bindSessionScope(context.Background(), second)
+	assertKeyspaceCode(t, err, KeyspaceHashCollision)
+	after := calls.snapshot()
+	if after.Ledger != before.Ledger || after.Leaser != before.Leaser || after.Ordered != before.Ordered || after.Blobs != before.Blobs {
+		t.Fatalf("binding failure touched session data primitives: before=%+v after=%+v", before, after)
+	}
+	if after.KV <= before.KV {
+		t.Fatalf("binding validation did not touch witness KV: before=%+v after=%+v", before, after)
 	}
 }
 
@@ -519,3 +897,172 @@ func conflictPut(int, []byte) (uint64, error) {
 type countingProviderCloser struct{ calls atomic.Int32 }
 
 func (c *countingProviderCloser) Close(context.Context) error { c.calls.Add(1); return nil }
+
+type exactGetResult struct {
+	value []byte
+	rev   uint64
+	err   error
+}
+
+type exactPutCall struct {
+	key      string
+	expected uint64
+	value    []byte
+}
+
+type exactScriptKV struct {
+	getResults         []exactGetResult
+	putErr             error
+	getCalls, putCalls int
+	getKeys            []string
+	puts               []exactPutCall
+}
+
+func (k *exactScriptKV) Get(_ context.Context, key string) ([]byte, uint64, error) {
+	k.getCalls++
+	k.getKeys = append(k.getKeys, key)
+	if len(k.getResults) == 0 {
+		return nil, 0, errors.New("unexpected Get")
+	}
+	result := k.getResults[0]
+	k.getResults = k.getResults[1:]
+	return append([]byte(nil), result.value...), result.rev, result.err
+}
+func (k *exactScriptKV) Put(_ context.Context, key string, expected uint64, value []byte) (uint64, error) {
+	k.putCalls++
+	k.puts = append(k.puts, exactPutCall{key: key, expected: expected, value: append([]byte(nil), value...)})
+	if k.putErr != nil {
+		return 0, k.putErr
+	}
+	return 1, nil
+}
+func (*exactScriptKV) Keys(context.Context, string) ([]string, error) { return nil, nil }
+func (*exactScriptKV) Delete(context.Context, string) error           { return nil }
+
+type providerCallSnapshot struct{ Ledger, Leaser, KV, Ordered, Blobs int32 }
+type providerCalls struct{ ledger, leaser, kv, ordered, blobs atomic.Int32 }
+
+func (c *providerCalls) snapshot() providerCallSnapshot {
+	return providerCallSnapshot{c.ledger.Load(), c.leaser.Load(), c.kv.Load(), c.ordered.Load(), c.blobs.Load()}
+}
+
+func instrumentComposite(base *storage.Composite) (*storage.Composite, *providerCalls) {
+	calls := &providerCalls{}
+	return &storage.Composite{
+		Ledger:       &countAllLedger{Ledger: base.Ledger, calls: calls},
+		Leaser:       &countAllLeaser{Leaser: base.Leaser, calls: calls},
+		KV:           &countAllKV{KV: base.KV, calls: calls},
+		Blobs:        &countAllBlobs{Blobs: base.Blobs, calls: calls},
+		OrderedIndex: &countAllOrdered{OrderedIndex: base.OrderedIndex, calls: calls},
+	}, calls
+}
+
+type countAllLedger struct {
+	storage.Ledger
+	calls *providerCalls
+}
+
+func (c *countAllLedger) Append(ctx context.Context, name string, expected uint64, value []byte) error {
+	c.calls.ledger.Add(1)
+	return c.Ledger.Append(ctx, name, expected, value)
+}
+func (c *countAllLedger) Read(ctx context.Context, name string, from uint64) (storage.Cursor, error) {
+	c.calls.ledger.Add(1)
+	return c.Ledger.Read(ctx, name, from)
+}
+func (c *countAllLedger) Tip(ctx context.Context, name string) (uint64, error) {
+	c.calls.ledger.Add(1)
+	return c.Ledger.Tip(ctx, name)
+}
+func (c *countAllLedger) Delete(ctx context.Context, name string) error {
+	c.calls.ledger.Add(1)
+	return c.Ledger.Delete(ctx, name)
+}
+
+type countAllLeaser struct {
+	storage.Leaser
+	calls *providerCalls
+}
+
+func (c *countAllLeaser) Acquire(ctx context.Context, name string) (storage.Lease, error) {
+	c.calls.leaser.Add(1)
+	return c.Leaser.Acquire(ctx, name)
+}
+
+type countAllKV struct {
+	storage.KV
+	calls *providerCalls
+}
+
+func (c *countAllKV) Get(ctx context.Context, key string) ([]byte, uint64, error) {
+	c.calls.kv.Add(1)
+	return c.KV.Get(ctx, key)
+}
+func (c *countAllKV) Put(ctx context.Context, key string, rev uint64, value []byte) (uint64, error) {
+	c.calls.kv.Add(1)
+	return c.KV.Put(ctx, key, rev, value)
+}
+func (c *countAllKV) Keys(ctx context.Context, prefix string) ([]string, error) {
+	c.calls.kv.Add(1)
+	return c.KV.Keys(ctx, prefix)
+}
+func (c *countAllKV) Delete(ctx context.Context, key string) error {
+	c.calls.kv.Add(1)
+	return c.KV.Delete(ctx, key)
+}
+
+type countAllBlobs struct {
+	storage.Blobs
+	calls *providerCalls
+}
+
+func (c *countAllBlobs) Put(ctx context.Context, key string, r io.Reader) error {
+	c.calls.blobs.Add(1)
+	return c.Blobs.Put(ctx, key, r)
+}
+func (c *countAllBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	c.calls.blobs.Add(1)
+	return c.Blobs.Get(ctx, key)
+}
+func (c *countAllBlobs) Delete(ctx context.Context, key string) error {
+	c.calls.blobs.Add(1)
+	return c.Blobs.Delete(ctx, key)
+}
+func (c *countAllBlobs) List(ctx context.Context, prefix string) ([]string, error) {
+	c.calls.blobs.Add(1)
+	return c.Blobs.List(ctx, prefix)
+}
+
+type countAllOrdered struct {
+	storage.OrderedIndex
+	calls *providerCalls
+}
+
+func (c *countAllOrdered) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
+	c.calls.ordered.Add(1)
+	return c.OrderedIndex.Get(ctx, id)
+}
+func (c *countAllOrdered) Create(ctx context.Context, id storage.OrderedID, rankingScope string, value []byte, rank storage.Rank, due storage.Due) (storage.OrderedRecord, bool, error) {
+	c.calls.ordered.Add(1)
+	return c.OrderedIndex.Create(ctx, id, rankingScope, value, rank, due)
+}
+func (c *countAllOrdered) Update(ctx context.Context, id storage.OrderedID, rev uint64, value []byte, rank storage.Rank, due storage.Due) (storage.OrderedRecord, error) {
+	c.calls.ordered.Add(1)
+	return c.OrderedIndex.Update(ctx, id, rev, value, rank, due)
+}
+func (c *countAllOrdered) Delete(ctx context.Context, id storage.OrderedID, rev uint64) (storage.OrderedRecord, error) {
+	c.calls.ordered.Add(1)
+	return c.OrderedIndex.Delete(ctx, id, rev)
+}
+func (c *countAllOrdered) ListOrdered(ctx context.Context, namespace, scope string, after uint64, limit int) (storage.OrderedPage, error) {
+	c.calls.ordered.Add(1)
+	return c.OrderedIndex.ListOrdered(ctx, namespace, scope, after, limit)
+}
+func (c *countAllOrdered) ListRanked(ctx context.Context, namespace, scope string, after storage.RankedCursor, limit int) (storage.RankedPage, error) {
+	c.calls.ordered.Add(1)
+	return c.OrderedIndex.ListRanked(ctx, namespace, scope, after, limit)
+}
+func (c *countAllOrdered) ListDue(ctx context.Context, namespace string, before int64, after storage.DueCursor, limit int) (storage.DuePage, error) {
+	c.calls.ordered.Add(1)
+	return c.OrderedIndex.ListDue(ctx, namespace, before, after, limit)
+}

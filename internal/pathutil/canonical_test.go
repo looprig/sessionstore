@@ -24,6 +24,22 @@ func TestCanonicalize(t *testing.T) {
 			}
 			return []string{string(os.PathSeparator)}, []string{root}
 		}},
+		{name: "relative existing input", setup: func(t *testing.T) ([]string, []string) {
+			cwd, err := os.Getwd()
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := t.TempDir()
+			relative, err := filepath.Rel(cwd, target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonical, err := filepath.EvalSymlinks(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return []string{relative}, []string{canonical}
+		}},
 		{name: "sorted deduplicated and empty ignored", setup: func(t *testing.T) ([]string, []string) {
 			a, b := t.TempDir(), t.TempDir()
 			a, _ = filepath.EvalSymlinks(a)

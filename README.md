@@ -25,3 +25,7 @@ SessionStore never probes for old data, auto-migrates, or dual-writes layouts.
 Migration must be performed offline with SessionStore stopped, into a new backend
 already initialized for `tenant-v1`. Validate the migrated data before switching
 the composition root; do not rewrite a live backend's immutable layout marker.
+
+Provider ownership options take effect only after `Open` has successfully validated
+and bound the backend layout. If `Open` fails, the provider remains caller-owned and
+SessionStore does not close it.

@@ -138,7 +138,8 @@ func WithLogger(logger *slog.Logger) Option {
 }
 
 // WithProviderOwnership explicitly transfers provider lifecycle ownership to
-// Store. Without this option Close never closes caller-supplied storage.
+// Store after Open succeeds. A failed Open leaves the provider caller-owned and
+// never closes it. Without this option Close never closes caller-supplied storage.
 func WithProviderOwnership(closer ProviderCloser) Option {
 	return func(cfg *config) error {
 		if isNilDynamic(reflect.ValueOf(closer)) {

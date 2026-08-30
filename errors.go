@@ -6,13 +6,15 @@ import "fmt"
 type KeyspaceErrorCode string
 
 const (
-	KeyspaceBackend         KeyspaceErrorCode = "backend"
-	KeyspaceMarkerMalformed KeyspaceErrorCode = "marker_malformed"
-	KeyspaceLayoutMismatch  KeyspaceErrorCode = "layout_mismatch"
-	KeyspaceMarkerAmbiguous KeyspaceErrorCode = "marker_ambiguous"
-	KeyspaceHashCollision   KeyspaceErrorCode = "hash_collision"
-	KeyspaceLegacyTenant    KeyspaceErrorCode = "legacy_tenant"
-	KeyspaceLegacySession   KeyspaceErrorCode = "legacy_session"
+	KeyspaceBackend          KeyspaceErrorCode = "backend"
+	KeyspaceMarkerMalformed  KeyspaceErrorCode = "marker_malformed"
+	KeyspaceLayoutMismatch   KeyspaceErrorCode = "layout_mismatch"
+	KeyspaceMarkerAmbiguous  KeyspaceErrorCode = "marker_ambiguous"
+	KeyspaceBindingNotFound  KeyspaceErrorCode = "binding_not_found"
+	KeyspaceBindingAmbiguous KeyspaceErrorCode = "binding_ambiguous"
+	KeyspaceHashCollision    KeyspaceErrorCode = "hash_collision"
+	KeyspaceLegacyTenant     KeyspaceErrorCode = "legacy_tenant"
+	KeyspaceLegacySession    KeyspaceErrorCode = "legacy_session"
 )
 
 // KeyspaceError reports a fail-closed layout or physical-key failure. Cause is
