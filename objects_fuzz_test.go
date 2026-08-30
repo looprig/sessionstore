@@ -12,12 +12,25 @@ import (
 
 func FuzzParseObjectMetadata(f *testing.F) {
 	body := []byte("seed")
-	digest := sha256.Sum256(body)
-	valid := objectMetadataFor(ObjectKindArtifact, [16]byte{1}, uint64(len(body)), digest, "application/octet-stream")
+	bodyDigest := sha256.Sum256(body)
+	valid := objectMetadataFor(ObjectKindArtifact, [16]byte{1}, uint64(len(body)), bodyDigest, "application/octet-stream")
 	f.Add(valid.Reference.ObjectID, valid.Digest, valid.SizeBytes, valid.MediaType)
 	f.Add("v1:artifact:bad:bad", "sha256:bad", uint64(0), "")
 	f.Fuzz(func(t *testing.T, id, digest string, size uint64, mediaType string) {
-		_, _ = parseObjectMetadata(sessionwire.ObjectMetadata{Reference: sessionwire.ObjectReference{ObjectID: id}, Digest: digest, SizeBytes: size, MediaType: mediaType})
+		metadata := sessionwire.ObjectMetadata{Reference: sessionwire.ObjectReference{ObjectID: id}, Digest: digest, SizeBytes: size, MediaType: mediaType}
+		parsed, err := parseObjectMetadata(metadata)
+		if metadata == valid && err != nil {
+			t.Fatalf("canonical seed rejected: %v", err)
+		}
+		if err == nil {
+			roundTrip := objectMetadataFor(parsed.kind, parsedGeneration(parsed.generation), parsed.size, parsed.digest, metadata.MediaType)
+			if roundTrip != metadata {
+				t.Fatalf("accepted noncanonical metadata: got=%+v canonical=%+v", metadata, roundTrip)
+			}
+			if _, err := parseObjectMetadata(roundTrip); err != nil {
+				t.Fatalf("canonical reparse: %v", err)
+			}
+		}
 	})
 }
 
@@ -35,8 +48,9 @@ func FuzzExactVerifier(f *testing.F) {
 		}
 		verifier := newExactVerifier(context.Background(), bytes.NewReader(body), size, digest)
 		_, err := io.ReadAll(verifier)
-		if err == nil != verifier.verified {
-			t.Fatalf("err=%v verified=%v", err, verifier.verified)
+		wantSuccess := matching && size == uint64(len(body))
+		if (err == nil) != wantSuccess || verifier.verified != wantSuccess {
+			t.Fatalf("len=%d size=%d matching=%v err=%v verified=%v wantSuccess=%v", len(body), size, matching, err, verifier.verified, wantSuccess)
 		}
 	})
 }

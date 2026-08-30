@@ -156,19 +156,15 @@ func TestObjectReaderHoldsLifecycleUntilClose(t *testing.T) {
 	go func() { closeDone <- store.Close(context.Background()) }()
 	select {
 	case err := <-closeDone:
-		t.Fatalf("Close returned before reader Close: %v", err)
-	case <-time.After(20 * time.Millisecond):
-	}
-	if err := reader.Close(); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case err := <-closeDone:
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("Close remained blocked")
+		t.Fatal("Close did not cancel idle reader")
+	}
+	var objectErr *ObjectError
+	if err := reader.Close(); !errors.As(err, &objectErr) || objectErr.Code != ObjectErrorCanceled {
+		t.Fatalf("reader Close = %T %v, want canceled", err, err)
 	}
 }
 
@@ -472,8 +468,9 @@ func TestPutObjectStaticValidationPrecedesProviderAndGeneration(t *testing.T) {
 	store.objectGeneration = func() ([16]byte, error) { generations++; return [16]byte{}, nil }
 	before := calls.snapshot()
 	invalidUTF8 := string([]byte{0xff})
+	digest := sha256.Sum256(nil)
 	for _, mediaType := range []string{"not a media type", invalidUTF8, strings.Repeat("x", 257)} {
-		_, err := store.PutObject(context.Background(), PutObjectRequest{TenantID: "tenant", SessionID: "session", Kind: ObjectKindArtifact, Body: bytes.NewReader(nil), MediaType: mediaType})
+		_, err := store.PutObject(context.Background(), PutObjectRequest{TenantID: "tenant", SessionID: "session", Kind: ObjectKindArtifact, SHA256: digest, Body: bytes.NewReader(nil), MediaType: mediaType})
 		var objectErr *ObjectError
 		if !errors.As(err, &objectErr) || objectErr.Field != "media_type" {
 			t.Fatalf("media type %q: error = %T %v", mediaType, err, err)
@@ -528,8 +525,8 @@ func TestGetObjectDetectsCorruptionAndReleasesLifecycle(t *testing.T) {
 	if _, err := io.ReadAll(reader); err == nil {
 		t.Fatal("corrupt Get reached successful EOF")
 	}
-	if err := reader.Close(); err != nil {
-		t.Fatal(err)
+	if err := reader.Close(); err == nil {
+		t.Fatal("Close lost latched corruption error")
 	}
 	if err := store.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -588,8 +585,8 @@ func TestGetObjectCallerCancellationClosesAndReleases(t *testing.T) {
 	if !errors.As(err, &objectErr) || objectErr.Code != ObjectErrorCanceled {
 		t.Fatalf("Read error = %T %v, want canceled", err, err)
 	}
-	if err := reader.Close(); err != nil {
-		t.Fatal(err)
+	if err := reader.Close(); !errors.As(err, &objectErr) || objectErr.Code != ObjectErrorCanceled {
+		t.Fatalf("Close error = %T %v, want canceled", err, err)
 	}
 }
 

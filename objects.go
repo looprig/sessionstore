@@ -10,6 +10,8 @@ import (
 	"hash"
 	"io"
 	"mime"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -18,6 +20,7 @@ import (
 	"github.com/looprig/storage"
 )
 
+// ObjectKind is a closed semantic class for immutable session objects.
 type ObjectKind string
 
 const (
@@ -44,6 +47,9 @@ func (k ObjectKind) valid() bool {
 	}
 }
 
+// PutObjectRequest declares an immutable object's exact content properties.
+// MediaType is optional, bounded, validated descriptive metadata; it is
+// untrusted and does not participate in object identity.
 type PutObjectRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
@@ -54,6 +60,16 @@ type PutObjectRequest struct {
 	Body      io.Reader
 }
 
+// ObjectReader is a verified object stream. Integrity succeeds only when Read
+// observes terminal EOF after the declared size and SHA-256 match. Close before
+// that terminal EOF returns a typed incomplete-integrity error.
+type ObjectReader interface {
+	io.Reader
+	io.Closer
+}
+
+// GetObjectRequest names a verified object and the semantic kind the caller is
+// authorized to consume.
 type GetObjectRequest struct {
 	TenantID     sessionwire.TenantID
 	SessionID    sessionwire.SessionID
@@ -61,6 +77,7 @@ type GetObjectRequest struct {
 	Metadata     sessionwire.ObjectMetadata
 }
 
+// ObjectErrorCode classifies redacted object operation failures.
 type ObjectErrorCode string
 
 const (
@@ -74,6 +91,7 @@ const (
 	ObjectErrorCanceled  ObjectErrorCode = "canceled"
 )
 
+// ObjectError is a typed, redacted object operation failure.
 type ObjectError struct {
 	Code  ObjectErrorCode
 	Field string
@@ -98,12 +116,17 @@ func randomObjectGeneration() ([16]byte, error) {
 	return generation, err
 }
 
+// PutObject streams, verifies, persists, and re-verifies an immutable object
+// before returning its metadata.
 func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwire.ObjectMetadata, error) {
 	if !req.Kind.valid() {
 		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorInvalid, "kind", nil)
 	}
-	if req.Body == nil {
+	if isNilDynamic(reflect.ValueOf(req.Body)) {
 		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorInvalid, "body", nil)
+	}
+	if req.SHA256 == ([32]byte{}) {
+		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorInvalid, "sha256", nil)
 	}
 	if err := validateMediaType(req.MediaType); err != nil {
 		return sessionwire.ObjectMetadata{}, err
@@ -112,6 +135,11 @@ func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwir
 	if err != nil {
 		return sessionwire.ObjectMetadata{}, err
 	}
+	opCtx, release, err := s.admitForeground(ctx)
+	if err != nil {
+		return sessionwire.ObjectMetadata{}, err
+	}
+	defer release()
 	generation, err := s.objectGeneration()
 	if err != nil {
 		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorSource, "generation", err)
@@ -121,11 +149,6 @@ func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwir
 	if err != nil {
 		return sessionwire.ObjectMetadata{}, err
 	}
-	opCtx, release, err := s.admitForeground(ctx)
-	if err != nil {
-		return sessionwire.ObjectMetadata{}, err
-	}
-	defer release()
 	if err := s.bindSessionScope(opCtx, scope); err != nil {
 		return sessionwire.ObjectMetadata{}, err
 	}
@@ -151,10 +174,16 @@ func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwir
 	if err != nil {
 		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorBackend, "post_get", err)
 	}
+	if isNilDynamic(reflect.ValueOf(stored)) {
+		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorBackend, "post_get", nil)
+	}
 	post := newBackendExactVerifier(opCtx, stored, req.SizeBytes, req.SHA256)
 	_, copyErr := io.Copy(io.Discard, post)
 	closeErr := stored.Close()
 	if copyErr != nil {
+		if closeErr != nil {
+			return sessionwire.ObjectMetadata{}, errors.Join(copyErr, objectErr(ObjectErrorBackend, "post_close", closeErr))
+		}
 		return sessionwire.ObjectMetadata{}, copyErr
 	}
 	if !post.verified {
@@ -166,7 +195,11 @@ func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwir
 	return metadata, nil
 }
 
-func (s *Store) GetObject(ctx context.Context, req GetObjectRequest) (io.ReadCloser, error) {
+// GetObject returns a lifecycle-held verified stream. A caller establishes
+// integrity only by reading through terminal EOF; premature Close is an error.
+// Provider readers must make concurrent Close unblock Read so Store shutdown
+// can cancel outstanding streams before closing an owned provider.
+func (s *Store) GetObject(ctx context.Context, req GetObjectRequest) (ObjectReader, error) {
 	if !req.ExpectedKind.valid() {
 		return nil, objectErr(ObjectErrorInvalid, "expected_kind", nil)
 	}
@@ -194,7 +227,22 @@ func (s *Store) GetObject(ctx context.Context, req GetObjectRequest) (io.ReadClo
 		release()
 		return nil, objectErr(ObjectErrorBackend, "get", err)
 	}
-	return &objectReader{verifier: newBackendExactVerifier(opCtx, reader, parsed.size, parsed.digest), underlying: reader, release: release}, nil
+	if isNilDynamic(reflect.ValueOf(reader)) {
+		release()
+		return nil, objectErr(ObjectErrorBackend, "get", nil)
+	}
+	result := &objectReader{verifier: newBackendExactVerifier(opCtx, reader, parsed.size, parsed.digest), underlying: reader, release: release}
+	stopCancel := context.AfterFunc(opCtx, func() {
+		result.beginTermination(objectErr(ObjectErrorCanceled, "stream", opCtx.Err()))
+	})
+	result.mu.Lock()
+	result.stopCancel = stopCancel
+	done := result.done
+	result.mu.Unlock()
+	if done {
+		stopCancel()
+	}
+	return result, nil
 }
 
 type parsedObject struct {
@@ -205,10 +253,25 @@ type parsedObject struct {
 }
 
 func parseObjectMetadata(metadata sessionwire.ObjectMetadata) (parsedObject, error) {
-	if err := metadata.Reference.Validate(); err != nil {
+	parsed, err := parseObjectReference(metadata.Reference)
+	if err != nil {
+		return parsedObject{}, err
+	}
+	if metadata.Digest != "sha256:"+hex.EncodeToString(parsed.digest[:]) {
+		return parsedObject{}, objectErr(ObjectErrorDigest, "digest", nil)
+	}
+	if err := validateMediaType(metadata.MediaType); err != nil {
+		return parsedObject{}, err
+	}
+	parsed.size = metadata.SizeBytes
+	return parsed, nil
+}
+
+func parseObjectReference(reference sessionwire.ObjectReference) (parsedObject, error) {
+	if err := reference.Validate(); err != nil {
 		return parsedObject{}, objectErr(ObjectErrorInvalid, "object_id", err)
 	}
-	parts := strings.Split(metadata.Reference.ObjectID, ":")
+	parts := strings.Split(reference.ObjectID, ":")
 	if len(parts) != 4 || parts[0] != "v1" {
 		return parsedObject{}, objectErr(ObjectErrorInvalid, "object_id", nil)
 	}
@@ -230,13 +293,7 @@ func parseObjectMetadata(metadata sessionwire.ObjectMetadata) (parsedObject, err
 	if _, err := hex.Decode(digest[:], []byte(parts[3])); err != nil || hex.EncodeToString(digest[:]) != parts[3] {
 		return parsedObject{}, objectErr(ObjectErrorInvalid, "digest", err)
 	}
-	if metadata.Digest != "sha256:"+parts[3] {
-		return parsedObject{}, objectErr(ObjectErrorDigest, "digest", nil)
-	}
-	if err := validateMediaType(metadata.MediaType); err != nil {
-		return parsedObject{}, err
-	}
-	return parsedObject{kind: kind, generation: parts[2], digest: digest, size: metadata.SizeBytes}, nil
+	return parsedObject{kind: kind, generation: parts[2], digest: digest}, nil
 }
 
 func objectMetadataFor(kind ObjectKind, generation [16]byte, size uint64, digest [32]byte, mediaType string) sessionwire.ObjectMetadata {
@@ -247,6 +304,103 @@ func objectMetadataFor(kind ObjectKind, generation [16]byte, size uint64, digest
 
 func objectKey(scope sessionScope, object parsedObject) string {
 	return scope.BlobPrefix + "v1/" + string(object.kind) + "/" + hex.EncodeToString(object.digest[:]) + "/" + object.generation
+}
+
+// listObjectReferences is an internal administrative operation over one
+// verified tenant/session and one exact V1 kind prefix. Historical legacy
+// digest-only keys are intentionally excluded for the later replay resolver.
+func (s *Store) listObjectReferences(ctx context.Context, tenantID sessionwire.TenantID, sessionID sessionwire.SessionID, kind ObjectKind) ([]sessionwire.ObjectReference, error) {
+	if !kind.valid() {
+		return nil, objectErr(ObjectErrorInvalid, "kind", nil)
+	}
+	scope, err := s.deriveSessionScope(tenantID, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	opCtx, release, err := s.admitForeground(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := s.verifySessionScope(opCtx, scope); err != nil {
+		return nil, err
+	}
+	prefix := scope.BlobPrefix + "v1/" + string(kind) + "/"
+	keys, err := s.backend.Blobs.List(opCtx, prefix)
+	if err != nil {
+		return nil, objectErr(ObjectErrorBackend, "list", err)
+	}
+	refs := make([]sessionwire.ObjectReference, 0, len(keys))
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		parsed, err := parsePhysicalObjectKey(prefix, kind, key)
+		if err != nil {
+			return nil, err
+		}
+		ref := objectMetadataFor(parsed.kind, parsedGeneration(parsed.generation), 0, parsed.digest, "").Reference
+		if _, exists := seen[ref.ObjectID]; exists {
+			return nil, objectErr(ObjectErrorIntegrity, "list_duplicate", nil)
+		}
+		seen[ref.ObjectID] = struct{}{}
+		refs = append(refs, ref)
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].ObjectID < refs[j].ObjectID })
+	return refs, nil
+}
+
+// deleteObject is an internal administrative deletion of one strictly parsed
+// V1 reference after Get-only scope verification. It never resolves historical
+// digest-only keys and never binds a missing session.
+func (s *Store) deleteObject(ctx context.Context, tenantID sessionwire.TenantID, sessionID sessionwire.SessionID, expectedKind ObjectKind, reference sessionwire.ObjectReference) error {
+	if !expectedKind.valid() {
+		return objectErr(ObjectErrorInvalid, "expected_kind", nil)
+	}
+	parsed, err := parseObjectReference(reference)
+	if err != nil {
+		return err
+	}
+	if parsed.kind != expectedKind {
+		return objectErr(ObjectErrorInvalid, "expected_kind", nil)
+	}
+	scope, err := s.deriveSessionScope(tenantID, sessionID)
+	if err != nil {
+		return err
+	}
+	opCtx, release, err := s.admitForeground(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := s.verifySessionScope(opCtx, scope); err != nil {
+		return err
+	}
+	if err := s.backend.Blobs.Delete(opCtx, objectKey(scope, parsed)); err != nil {
+		return objectErr(ObjectErrorBackend, "delete", err)
+	}
+	return nil
+}
+
+func parsePhysicalObjectKey(prefix string, kind ObjectKind, key string) (parsedObject, error) {
+	if prefix == "" || !strings.HasPrefix(key, prefix) {
+		return parsedObject{}, objectErr(ObjectErrorIntegrity, "list_key", nil)
+	}
+	parts := strings.Split(strings.TrimPrefix(key, prefix), "/")
+	if len(parts) != 2 {
+		return parsedObject{}, objectErr(ObjectErrorIntegrity, "list_key", nil)
+	}
+	reference := sessionwire.ObjectReference{ObjectID: "v1:" + string(kind) + ":" + parts[1] + ":" + parts[0]}
+	parsed, err := parseObjectReference(reference)
+	if err != nil || prefix+parts[0]+"/"+parts[1] != key {
+		return parsedObject{}, objectErr(ObjectErrorIntegrity, "list_key", err)
+	}
+	return parsed, nil
+}
+
+func parsedGeneration(value string) [16]byte {
+	decoded, _ := base32.HexEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ToUpper(value))
+	var generation [16]byte
+	copy(generation[:], decoded)
+	return generation
 }
 
 func validateMediaType(value string) error {
@@ -328,6 +482,13 @@ func (v *exactVerifier) Read(p []byte) (int, error) {
 }
 
 func (v *exactVerifier) finishRead(n int, err error) (int, error) {
+	if v.ctx.Err() != nil {
+		v.failure = objectErr(ObjectErrorCanceled, "stream", v.ctx.Err())
+		if err != nil && !errors.Is(err, io.EOF) {
+			v.failure = joinErrors(v.failure, objectErr(v.readCode, "stream", err))
+		}
+		return n, v.failure
+	}
 	if err != nil && !errors.Is(err, io.EOF) {
 		v.failure = objectErr(v.readCode, "stream", err)
 		return n, v.failure
@@ -366,16 +527,150 @@ type objectReader struct {
 	verifier   *exactVerifier
 	underlying io.Closer
 	release    func()
-	once       sync.Once
+	mu         sync.Mutex
+	cond       *sync.Cond
+	reading    bool
+	closing    bool
+	done       bool
+	primary    error
+	readErr    error
+	terminal   error
 	closeErr   error
+	stopCancel func() bool
 }
 
 func (r *objectReader) Read(p []byte) (int, error) {
-	n, err := r.verifier.Read(p)
-	if err != nil {
-		r.finish()
+	r.mu.Lock()
+	cond := r.condLocked()
+	for r.reading && !r.closing {
+		cond.Wait()
 	}
-	return n, err
+	if r.done {
+		terminal := r.terminal
+		r.mu.Unlock()
+		return 0, terminal
+	}
+	if r.closing {
+		for !r.done {
+			cond.Wait()
+		}
+		terminal := r.terminal
+		r.mu.Unlock()
+		return 0, terminal
+	}
+	r.reading = true
+	r.mu.Unlock()
+
+	n, err := r.verifier.Read(p)
+	r.mu.Lock()
+	r.reading = false
+	cond.Broadcast()
+	owner := false
+	if err != nil {
+		if !r.closing {
+			r.closing = true
+			r.primary = err
+			owner = true
+		} else {
+			r.readErr = err
+		}
+	}
+	if err == nil && !r.closing {
+		r.mu.Unlock()
+		return n, nil
+	}
+	r.mu.Unlock()
+	if owner {
+		r.completeTermination()
+	}
+	return n, r.waitTerminal()
 }
-func (r *objectReader) Close() error { r.finish(); return r.closeErr }
-func (r *objectReader) finish()      { r.once.Do(func() { r.closeErr = r.underlying.Close(); r.release() }) }
+func (r *objectReader) Close() error {
+	r.beginTermination(objectErr(ObjectErrorIntegrity, "incomplete", nil))
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.closeErr
+}
+
+func (r *objectReader) beginTermination(cause error) {
+	r.mu.Lock()
+	cond := r.condLocked()
+	if r.done {
+		r.mu.Unlock()
+		return
+	}
+	if r.closing {
+		for !r.done {
+			cond.Wait()
+		}
+		r.mu.Unlock()
+		return
+	}
+	r.closing = true
+	r.primary = cause
+	r.mu.Unlock()
+	r.completeTermination()
+}
+
+func (r *objectReader) completeTermination() {
+	r.mu.Lock()
+	stopCancel := r.stopCancel
+	r.mu.Unlock()
+	if stopCancel != nil {
+		stopCancel()
+	}
+	closeErr := r.underlying.Close()
+	var wrappedClose error
+	if closeErr != nil {
+		wrappedClose = objectErr(ObjectErrorBackend, "close", closeErr)
+	}
+
+	r.mu.Lock()
+	cond := r.condLocked()
+	for r.reading {
+		cond.Wait()
+	}
+	r.terminal = joinErrors(r.primary, r.readErr, wrappedClose)
+	if errors.Is(r.primary, io.EOF) {
+		r.closeErr = joinErrors(r.readErr, wrappedClose)
+	} else {
+		r.closeErr = r.terminal
+	}
+	r.done = true
+	cond.Broadcast()
+	r.mu.Unlock()
+	r.release()
+}
+
+func (r *objectReader) waitTerminal() error {
+	r.mu.Lock()
+	cond := r.condLocked()
+	for !r.done {
+		cond.Wait()
+	}
+	terminal := r.terminal
+	r.mu.Unlock()
+	return terminal
+}
+
+func (r *objectReader) condLocked() *sync.Cond {
+	if r.cond == nil {
+		r.cond = sync.NewCond(&r.mu)
+	}
+	return r.cond
+}
+
+func joinErrors(values ...error) error {
+	var result error
+	for _, value := range values {
+		if value == nil {
+			continue
+		}
+		if result == nil {
+			result = value
+		} else {
+			result = errors.Join(result, value)
+		}
+	}
+	return result
+}
