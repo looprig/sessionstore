@@ -99,6 +99,21 @@ func testHostStateRequest(epoch uint64) UpdateCatalogHostStateRequest {
 	}
 }
 
+// assertNoCatalogRecord fails unless the session has no ordered record at all.
+// It reads the provider directly, because a rejected write that nonetheless
+// persisted a bad record would surface through the store API as a decode
+// failure — indistinguishable, from the outside, from never having written.
+func assertNoCatalogRecord(t *testing.T, store *Store, tenant sessionwire.TenantID, session sessionwire.SessionID) {
+	t.Helper()
+	scope, err := store.deriveSessionScope(tenant, session)
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	if _, err := store.backend.OrderedIndex.Get(context.Background(), catalogID(scope, session)); !errors.As(err, new(*storage.OrderedRecordNotFoundError)) {
+		t.Fatalf("a rejected write left a record behind: %v", err)
+	}
+}
+
 func assertCatalogCode(t *testing.T, err error, want CatalogErrorCode) *CatalogError {
 	t.Helper()
 	var got *CatalogError
@@ -866,26 +881,31 @@ func TestCatalogRejectsInvalidIdentities(t *testing.T) {
 	if _, _, err := store.CreateCatalogEntry(context.Background(), bad); !errors.As(err, new(*InvalidIdentityError)) {
 		t.Fatalf("empty session = %v", err)
 	}
-	bad = testCreateRequest()
-	bad.AgentID = ""
-	if _, _, err := store.CreateCatalogEntry(context.Background(), bad); err == nil {
-		t.Fatal("an empty AgentID was accepted")
-	} else {
-		assertCatalogCode(t, err, CatalogErrorInvalid)
-	}
-	bad = testCreateRequest()
-	bad.LastActiveAt = time.Time{}
-	if _, _, err := store.CreateCatalogEntry(context.Background(), bad); err == nil {
-		t.Fatal("a zero LastActiveAt was accepted")
-	} else {
-		assertCatalogCode(t, err, CatalogErrorInvalid)
-	}
-	bad = testCreateRequest()
-	bad.LastActiveAt = time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
-	if _, _, err := store.CreateCatalogEntry(context.Background(), bad); err == nil {
-		t.Fatal("a LastActiveAt outside the rankable range was accepted")
-	} else {
-		assertCatalogCode(t, err, CatalogErrorInvalid)
+	// Each of these must be refused BEFORE anything is persisted. Rejecting a
+	// record only when it is read back would leave the store holding a value
+	// no later read can decode.
+	for _, tt := range []struct {
+		name  string
+		apply func(*CreateCatalogEntryRequest)
+	}{
+		{"empty agent", func(r *CreateCatalogEntryRequest) { r.AgentID = "" }},
+		{"zero last active", func(r *CreateCatalogEntryRequest) { r.LastActiveAt = time.Time{} }},
+		{"unrankable last active", func(r *CreateCatalogEntryRequest) {
+			r.LastActiveAt = time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
+		}},
+		{"unknown placement", func(r *CreateCatalogEntryRequest) { r.DesiredPlacement = "anywhere" }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fresh := openTestStore(t)
+			req := testCreateRequest()
+			tt.apply(&req)
+			if _, _, err := fresh.CreateCatalogEntry(context.Background(), req); err == nil {
+				t.Fatal("an invalid create was accepted")
+			} else {
+				assertCatalogCode(t, err, CatalogErrorInvalid)
+			}
+			assertNoCatalogRecord(t, fresh, req.TenantID, req.SessionID)
+		})
 	}
 }
 
@@ -945,3 +965,192 @@ var (
 	_ func(*Store, context.Context, UpdateCatalogDesiredStateRequest) (CatalogEntry, error) = (*Store).UpdateCatalogDesiredState
 	_ func(*Store, context.Context, CreateCatalogEntryRequest) (CatalogEntry, bool, error)  = (*Store).CreateCatalogEntry
 )
+
+// --- create-time desired state, opaque bounds, and replace semantics ------
+
+func TestCatalogCreateRecordsItsIdempotencyKey(t *testing.T) {
+	store := openTestStore(t)
+	created := mustCreateCatalog(t, store)
+	if created.Record.DesiredIdempotencyKey != "create-1" {
+		t.Fatalf("create key = %q, want create-1", created.Record.DesiredIdempotencyKey)
+	}
+
+	// The consequence, not just the field: a Factory retry of the very intent
+	// the create already applied must short-circuit as a replay. A create that
+	// dropped its key would leave this write free to apply.
+	replay := UpdateCatalogDesiredStateRequest{
+		TenantID:               catalogTenant,
+		SessionID:              catalogSession,
+		ExpectedRevision:       created.Revision,
+		IdempotencyKey:         "create-1",
+		DesiredPlacement:       sessionwire.HostPlacementDedicated,
+		RuntimeCompatibilityID: "runtime-v9",
+	}
+	entry, err := store.UpdateCatalogDesiredState(context.Background(), replay)
+	if err != nil {
+		t.Fatalf("replay of the create key: %v", err)
+	}
+	if entry.Revision != created.Revision {
+		t.Fatalf("replay advanced the revision %d -> %d", created.Revision, entry.Revision)
+	}
+	if entry.Record.DesiredPlacement != created.Record.DesiredPlacement {
+		t.Fatalf("replay applied desired placement %q", entry.Record.DesiredPlacement)
+	}
+	if entry.Record.RuntimeCompatibilityID != created.Record.RuntimeCompatibilityID {
+		t.Fatalf("replay applied runtime compatibility %q", entry.Record.RuntimeCompatibilityID)
+	}
+
+	// A different key with the same revision is a new intent and applies, so
+	// the replay above is the key doing the work rather than the write being
+	// rejected for some unrelated reason.
+	fresh := replay
+	fresh.IdempotencyKey = "place-9"
+	applied, err := store.UpdateCatalogDesiredState(context.Background(), fresh)
+	if err != nil {
+		t.Fatalf("fresh key: %v", err)
+	}
+	if applied.Record.DesiredPlacement != sessionwire.HostPlacementDedicated || applied.Revision == created.Revision {
+		t.Fatalf("a fresh key did not apply: %+v rev=%d", applied.Record, applied.Revision)
+	}
+}
+
+func TestCatalogBoundsOpaqueFields(t *testing.T) {
+	atLimit := strings.Repeat("r", sessionwire.MaxIDBytes)
+	tooLong := atLimit + "r"
+	invalidUTF8 := "runtime-\xff"
+
+	tests := []struct {
+		name  string
+		field string
+		apply func(*CreateCatalogEntryRequest)
+		want  bool
+	}{
+		{"runtime id at limit", "", func(r *CreateCatalogEntryRequest) { r.RuntimeCompatibilityID = atLimit }, true},
+		{"runtime id too long", "runtime_compatibility_id", func(r *CreateCatalogEntryRequest) { r.RuntimeCompatibilityID = tooLong }, false},
+		{"runtime id invalid utf8", "runtime_compatibility_id", func(r *CreateCatalogEntryRequest) { r.RuntimeCompatibilityID = invalidUTF8 }, false},
+		{"idempotency key at limit", "", func(r *CreateCatalogEntryRequest) { r.IdempotencyKey = atLimit }, true},
+		{"idempotency key too long", "desired_idempotency_key", func(r *CreateCatalogEntryRequest) { r.IdempotencyKey = tooLong }, false},
+		{"idempotency key invalid utf8", "desired_idempotency_key", func(r *CreateCatalogEntryRequest) { r.IdempotencyKey = invalidUTF8 }, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := openTestStore(t)
+			req := testCreateRequest()
+			tt.apply(&req)
+			_, _, err := store.CreateCatalogEntry(context.Background(), req)
+			if tt.want {
+				if err != nil {
+					t.Fatalf("a value at the inclusive bound was rejected: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("an out-of-bounds opaque value was accepted")
+			}
+			if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != tt.field {
+				t.Fatalf("field = %q, want %q", got.Field, tt.field)
+			}
+		})
+	}
+}
+
+func TestCatalogHostUpdateReplacesCheckpointAndGates(t *testing.T) {
+	store := openTestStore(t)
+	mustCreateCatalog(t, store)
+
+	withState := testHostStateRequest(1)
+	withState.Checkpoint = CheckpointSummary{
+		JournalSeq: 9,
+		Reference:  sessionwire.ObjectReference{ObjectID: "v1:checkpoint:abcd:ef01"},
+		CapturedAt: catalogCreatedAt,
+	}
+	withState.OpenGates = []sessionwire.GateProjection{testGate("gate-a", 5)}
+	if _, err := store.UpdateCatalogHostState(context.Background(), withState); err != nil {
+		t.Fatalf("UpdateCatalogHostState: %v", err)
+	}
+	stored, err := store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{TenantID: catalogTenant, SessionID: catalogSession})
+	if err != nil {
+		t.Fatalf("GetCatalogEntry: %v", err)
+	}
+	if stored.Record.Checkpoint.JournalSeq != 9 ||
+		stored.Record.Checkpoint.Reference.ObjectID != "v1:checkpoint:abcd:ef01" ||
+		!stored.Record.Checkpoint.CapturedAt.Equal(catalogCreatedAt) {
+		t.Fatalf("checkpoint summary did not survive the write path: %+v", stored.Record.Checkpoint)
+	}
+	if len(stored.Record.OpenGates) != 1 || stored.Record.OpenGates[0].GateID != "gate-a" {
+		t.Fatalf("open gates did not survive the write path: %+v", stored.Record.OpenGates)
+	}
+
+	// Replace, not merge: a later Host write that omits both simply clears
+	// them. The catalog holds a summary, not the retained high-water pointer.
+	cleared := testHostStateRequest(2)
+	cleared.LastJournalSeq = stored.Record.LastJournalSeq
+	if _, err := store.UpdateCatalogHostState(context.Background(), cleared); err != nil {
+		t.Fatalf("clearing UpdateCatalogHostState: %v", err)
+	}
+	after, err := store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{TenantID: catalogTenant, SessionID: catalogSession})
+	if err != nil {
+		t.Fatalf("GetCatalogEntry: %v", err)
+	}
+	if !after.Record.Checkpoint.isZero() {
+		t.Fatalf("an omitted checkpoint was merged forward: %+v", after.Record.Checkpoint)
+	}
+	if after.Record.OpenGates != nil {
+		t.Fatalf("omitted gates were merged forward: %+v", after.Record.OpenGates)
+	}
+	// The journal summary is deliberately NOT replace-anything: it keeps its
+	// monotonicity guard, so the asymmetry is intentional and pinned.
+	if after.Record.LastJournalSeq != stored.Record.LastJournalSeq {
+		t.Fatalf("journal summary = %d, want %d", after.Record.LastJournalSeq, stored.Record.LastJournalSeq)
+	}
+}
+
+func TestCatalogHostUpdateValidatesProjectionsOnTheWritePath(t *testing.T) {
+	manyGates := func() []sessionwire.GateProjection {
+		gates := make([]sessionwire.GateProjection, 0, MaxCatalogOpenGates+1)
+		for i := 0; i <= MaxCatalogOpenGates; i++ {
+			gates = append(gates, testGate("gate-"+string(rune('a'+i)), uint64(i+1)))
+		}
+		return gates
+	}
+	tests := []struct {
+		name  string
+		field string
+		apply func(*UpdateCatalogHostStateRequest)
+	}{
+		{"checkpoint without a reference", "checkpoint.reference", func(r *UpdateCatalogHostStateRequest) {
+			r.Checkpoint = CheckpointSummary{JournalSeq: 3, CapturedAt: catalogCreatedAt}
+		}},
+		{"checkpoint without a capture time", "checkpoint.captured_at", func(r *UpdateCatalogHostStateRequest) {
+			r.Checkpoint = CheckpointSummary{JournalSeq: 3, Reference: sessionwire.ObjectReference{ObjectID: "v1:checkpoint:abcd:ef01"}}
+		}},
+		// The bounded-gate rule must be enforced by the write path, not only by
+		// the decoder that reads a record back.
+		{"more gates than the bound", "open_gates", func(r *UpdateCatalogHostStateRequest) {
+			r.OpenGates = manyGates()
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A fresh store per case: a case judged against a record an earlier
+			// case had already corrupted would pass for the wrong reason.
+			store := openTestStore(t)
+			created := mustCreateCatalog(t, store)
+			req := testHostStateRequest(1)
+			tt.apply(&req)
+			if _, err := store.UpdateCatalogHostState(context.Background(), req); err == nil {
+				t.Fatal("an invalid projection was accepted by the write path")
+			} else if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != tt.field {
+				t.Fatalf("field = %q, want %q", got.Field, tt.field)
+			}
+			after, err := store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{TenantID: catalogTenant, SessionID: catalogSession})
+			if err != nil {
+				t.Fatalf("the rejected write corrupted the stored record: %v", err)
+			}
+			if after.Revision != created.Revision || after.Record.LeaseEpoch != 0 ||
+				!after.Record.Checkpoint.isZero() || after.Record.OpenGates != nil {
+				t.Fatalf("a rejected write reached the record: rev=%d %+v", after.Revision, after.Record)
+			}
+		})
+	}
+}

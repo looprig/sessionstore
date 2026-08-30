@@ -14,10 +14,19 @@ import (
 // the gate list, and the checkpoint branch, instead of bouncing off the first
 // json.Unmarshal.
 //
-// The property is canonical stability: anything the decoder accepts must
-// re-encode, and re-decoding that encoding must produce the identical bytes. A
-// decoder that accepted two spellings of one record, or a canonicalizer that
-// did not reach a fixed point, would break it.
+// The property is that canonicalization reaches a fixed point: anything the
+// decoder accepts must re-encode, and decoding that encoding must produce the
+// identical bytes again.
+//
+// It deliberately does NOT claim the decoder rejects non-canonical input, and
+// it never compares the encoding against the fuzzer's own bytes. The decoder is
+// a NORMALIZER, not a canonical-form validator: an out-of-order open_gates list
+// is accepted and silently reordered, and a duplicate JSON member is accepted
+// with encoding/json's last-wins rule. Normalizing is the right behaviour for a
+// stored projection, so what this target guards is that normalizing twice can
+// never differ from normalizing once — a canonicalizer without a fixed point
+// would make a record's stored bytes depend on how many times it had been
+// rewritten.
 func FuzzCatalogRecordCodec(f *testing.F) {
 	seed := func(record CatalogRecord) []byte {
 		encoded, err := encodeCatalogRecord(record)

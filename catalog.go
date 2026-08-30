@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/storage"
@@ -173,6 +174,19 @@ type GetCatalogEntryRequest struct {
 // UpdateCatalogHostStateRequest writes the fields owned by the Host holding the
 // session's journal lease. LeaseEpoch is that grant's epoch and is compared
 // against the record's committed high-water mark.
+//
+// Every field here REPLACES its stored counterpart; nothing is merged. A write
+// that omits Checkpoint zeroes the stored checkpoint summary, and a write that
+// omits OpenGates clears the stored gate projections. That is deliberate and is
+// why the catalog holds a *summary*: the authoritative, retained high-water
+// checkpoint pointer is a separate epoch-fenced record, so clearing a summary
+// here loses no durable state. Callers therefore send the complete current
+// projection on every write rather than a delta.
+//
+// LastJournalSeq is the one exception, and its asymmetry is intentional: the
+// journal is append-only and a successor fence commits above its predecessor's
+// tip, so a durable sequence never moves backwards and a regressing one is
+// refused rather than stored.
 type UpdateCatalogHostStateRequest struct {
 	TenantID       sessionwire.TenantID
 	SessionID      sessionwire.SessionID
@@ -207,7 +221,7 @@ func (s *Store) CreateCatalogEntry(ctx context.Context, req CreateCatalogEntryRe
 	if err != nil {
 		return CatalogEntry{}, false, err
 	}
-	record, err := canonicalCatalogRecord(CatalogRecord{
+	record := CatalogRecord{
 		TenantID:               req.TenantID,
 		SessionID:              req.SessionID,
 		AgentID:                req.AgentID,
@@ -218,9 +232,6 @@ func (s *Store) CreateCatalogEntry(ctx context.Context, req CreateCatalogEntryRe
 		Residency:              req.Residency,
 		DesiredPlacement:       req.DesiredPlacement,
 		DesiredIdempotencyKey:  req.IdempotencyKey,
-	})
-	if err != nil {
-		return CatalogEntry{}, false, err
 	}
 	value, err := encodeCatalogRecord(record)
 	if err != nil {
@@ -363,7 +374,11 @@ func (s *Store) readCatalogEntry(
 	return catalogEntry(stored, tenant, session)
 }
 
-// writeCatalogRecord canonicalizes, encodes, and compare-and-swaps one record.
+// writeCatalogRecord encodes and compare-and-swaps one record. Canonicalization
+// and validation belong to encodeCatalogRecord and are deliberately not
+// restated here: a second call would validate the same record twice and could
+// later drift from the copy that actually decides the stored bytes.
+//
 // Rank is recomputed from the record being written, so a path that leaves
 // LastActiveAt alone necessarily leaves the rank alone too.
 func (s *Store) writeCatalogRecord(
@@ -372,10 +387,6 @@ func (s *Store) writeCatalogRecord(
 	record CatalogRecord,
 	expectedRevision uint64,
 ) (CatalogEntry, error) {
-	record, err := canonicalCatalogRecord(record)
-	if err != nil {
-		return CatalogEntry{}, err
-	}
 	value, err := encodeCatalogRecord(record)
 	if err != nil {
 		return CatalogEntry{}, err
@@ -402,6 +413,12 @@ func catalogID(scope sessionScope, session sessionwire.SessionID) storage.Ordere
 // catalogRank is the single definition of a catalog record's rank. Every write
 // path calls it rather than restating the expression, so no path can drift into
 // ranking by something other than recency.
+//
+// It is safe to call with a record that has not been canonicalized yet, which
+// is what the write paths do: canonicalization's only change to LastActiveAt is
+// .UTC(), which relabels the zone and preserves the instant, so the rank is the
+// same either way. encodeCatalogRecord on the line above has already refused
+// anything whose UnixNano is undefined.
 func catalogRank(record CatalogRecord) storage.Rank {
 	return storage.Rank{Ranked: true, Value: record.LastActiveAt.UnixNano()}
 }
@@ -597,8 +614,8 @@ func canonicalCatalogRecord(record CatalogRecord) (CatalogRecord, error) {
 	if err := record.AgentID.Validate(); err != nil {
 		return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "agent_id", err)
 	}
-	if record.RuntimeCompatibilityID != "" && len(record.RuntimeCompatibilityID) > sessionwire.MaxIDBytes {
-		return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "runtime_compatibility_id", nil)
+	if err := validateOptionalOpaque(record.RuntimeCompatibilityID, "runtime_compatibility_id"); err != nil {
+		return CatalogRecord{}, err
 	}
 	if record.State == "" {
 		return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "state", nil)
@@ -622,8 +639,8 @@ func canonicalCatalogRecord(record CatalogRecord) (CatalogRecord, error) {
 			return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "last_event_id", err)
 		}
 	}
-	if len(record.DesiredIdempotencyKey) > sessionwire.MaxIDBytes {
-		return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "desired_idempotency_key", nil)
+	if err := validateOptionalOpaque(record.DesiredIdempotencyKey, "desired_idempotency_key"); err != nil {
+		return CatalogRecord{}, err
 	}
 	if !record.Checkpoint.isZero() {
 		if err := record.Checkpoint.Reference.Validate(); err != nil {
@@ -668,6 +685,26 @@ func canonicalCatalogRecord(record CatalogRecord) (CatalogRecord, error) {
 	}
 	record.OpenGates = gates
 	return record, nil
+}
+
+// validateOptionalOpaque bounds one optional caller-chosen opaque value. Both
+// such fields share it, so neither can drift away from the other.
+//
+// Valid UTF-8 is a durability requirement here rather than decoration:
+// json.Marshal silently substitutes U+FFFD for an invalid byte, so a value that
+// skipped this check would be persisted as something other than what the caller
+// wrote and read back as something the caller never supplied.
+func validateOptionalOpaque(value, field string) error {
+	if value == "" {
+		return nil
+	}
+	if len(value) > sessionwire.MaxIDBytes {
+		return catalogErr(CatalogErrorInvalid, field, nil)
+	}
+	if !utf8.ValidString(value) {
+		return catalogErr(CatalogErrorInvalid, field, nil)
+	}
+	return nil
 }
 
 // rankableTime reports whether t is a present instant whose UnixNano is defined.
