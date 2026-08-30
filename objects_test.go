@@ -491,8 +491,12 @@ func TestPutObjectCanceledContextReturnsNoMetadata(t *testing.T) {
 	body := []byte("x")
 	digest := sha256.Sum256(body)
 	metadata, err := store.PutObject(ctx, PutObjectRequest{TenantID: "tenant", SessionID: "session", Kind: ObjectKindArtifact, SizeBytes: 1, SHA256: digest, Body: bytes.NewReader(body)})
-	if err == nil || metadata.Reference.ObjectID != "" {
-		t.Fatalf("PutObject = %+v, %v", metadata, err)
+	var objErr *ObjectError
+	if !errors.As(err, &objErr) || objErr.Code != ObjectErrorCanceled {
+		t.Fatalf("PutObject error = %T %v, want canceled", err, err)
+	}
+	if metadata != (sessionwire.ObjectMetadata{}) {
+		t.Fatalf("PutObject = %+v, want zero metadata", metadata)
 	}
 }
 

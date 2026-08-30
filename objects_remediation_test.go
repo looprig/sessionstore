@@ -763,3 +763,168 @@ func objectErrorCodes(err error) map[ObjectErrorCode]bool {
 }
 
 var _ storage.BlobReaderLifecycle = (*scriptedBlobs)(nil)
+
+func withObjectEntropy(t *testing.T, source io.Reader) {
+	t.Helper()
+	previous := objectEntropy
+	objectEntropy = source
+	t.Cleanup(func() { objectEntropy = previous })
+}
+
+// shortEntropy yields limit bytes in total and then reports EOF, modelling a
+// truncated entropy source.
+func shortEntropy(limit int) io.Reader {
+	remaining := limit
+	return readerFunc(func(p []byte) (int, error) {
+		if remaining == 0 {
+			return 0, io.EOF
+		}
+		if len(p) > remaining {
+			p = p[:remaining]
+		}
+		for i := range p {
+			p[i] = 0xa5
+		}
+		remaining -= len(p)
+		return len(p), nil
+	})
+}
+
+func TestRandomObjectGenerationFailsClosedOnEntropyFault(t *testing.T) {
+	for name, source := range map[string]io.Reader{
+		"read error": readerFunc(func([]byte) (int, error) { return 0, errors.New("entropy unavailable") }),
+		"short read": shortEntropy(15),
+	} {
+		t.Run(name, func(t *testing.T) {
+			withObjectEntropy(t, source)
+			generation, err := randomObjectGeneration()
+			if err == nil {
+				t.Fatalf("randomObjectGeneration() = %x, want error", generation)
+			}
+			if generation != ([16]byte{}) {
+				t.Fatalf("randomObjectGeneration() leaked partial generation %x", generation)
+			}
+		})
+	}
+}
+
+func TestPutObjectEntropyFaultTouchesNoProviderAndMintsNoReference(t *testing.T) {
+	for name, source := range map[string]io.Reader{
+		"read error": readerFunc(func([]byte) (int, error) { return 0, errors.New("entropy unavailable") }),
+		"short read": shortEntropy(15),
+	} {
+		t.Run(name, func(t *testing.T) {
+			withObjectEntropy(t, source)
+			backend, calls := instrumentComposite(memstore.New())
+			store, err := Open(context.Background(), backend)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close(context.Background())
+			before := calls.snapshot()
+			body := []byte("x")
+			digest := sha256.Sum256(body)
+			metadata, err := store.PutObject(context.Background(), PutObjectRequest{TenantID: "tenant", SessionID: "session", Kind: ObjectKindArtifact, SizeBytes: 1, SHA256: digest, Body: bytes.NewReader(body)})
+			var objErr *ObjectError
+			if !errors.As(err, &objErr) || objErr.Code != ObjectErrorSource || objErr.Field != "generation" {
+				t.Fatalf("PutObject error = %T %v, want source/generation", err, err)
+			}
+			if objErr.Unwrap() == nil {
+				t.Fatalf("PutObject error dropped its cause: %v", err)
+			}
+			if metadata != (sessionwire.ObjectMetadata{}) {
+				t.Fatalf("PutObject minted metadata %+v on entropy fault", metadata)
+			}
+			if got := calls.snapshot(); got != before {
+				t.Fatalf("provider calls changed: before=%+v after=%+v", before, got)
+			}
+		})
+	}
+}
+
+// TestRandomObjectGenerationIsUnpredictable rejects any generation source whose
+// draws are ordered or whose byte positions are near-constant, which is what a
+// sequential counter (of either endianness) produces.
+func TestRandomObjectGenerationIsUnpredictable(t *testing.T) {
+	const draws = 64
+	generations := make([][16]byte, 0, draws)
+	distinct := make(map[[16]byte]struct{}, draws)
+	for i := 0; i < draws; i++ {
+		generation, err := randomObjectGeneration()
+		if err != nil {
+			t.Fatalf("randomObjectGeneration: %v", err)
+		}
+		if _, repeated := distinct[generation]; repeated {
+			t.Fatalf("draw %d repeated generation %x", i, generation)
+		}
+		distinct[generation] = struct{}{}
+		generations = append(generations, generation)
+	}
+	ascending, descending := true, true
+	for i := 1; i < draws; i++ {
+		if bytes.Compare(generations[i][:], generations[i-1][:]) <= 0 {
+			ascending = false
+		}
+		if bytes.Compare(generations[i][:], generations[i-1][:]) >= 0 {
+			descending = false
+		}
+	}
+	if ascending || descending {
+		t.Fatalf("generations are monotonic (ascending=%v descending=%v); source is not random", ascending, descending)
+	}
+	for position := 0; position < 16; position++ {
+		values := make(map[byte]struct{}, draws)
+		for _, generation := range generations {
+			values[generation[position]] = struct{}{}
+		}
+		if len(values) < 16 {
+			t.Fatalf("byte %d took only %d distinct values across %d draws; source is not random", position, len(values), draws)
+		}
+	}
+}
+
+// TestExactVerifierCancellationBoundsNextRead proves the pre-read cancellation
+// check: once the operation context is done, the verifier must refuse the next
+// read instead of entering a source read that may never return.
+func TestExactVerifierCancellationBoundsNextRead(t *testing.T) {
+	body := []byte("ab")
+	digest := sha256.Sum256(body)
+	unblock := make(chan struct{})
+	t.Cleanup(func() { close(unblock) })
+	reads := 0
+	source := readerFunc(func(p []byte) (int, error) {
+		reads++
+		if reads == 1 {
+			p[0] = body[0]
+			return 1, nil
+		}
+		<-unblock
+		return 0, io.EOF
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	verifier := newExactVerifier(ctx, source, uint64(len(body)), digest)
+	p := make([]byte, 1)
+	if n, err := verifier.Read(p); n != 1 || err != nil {
+		t.Fatalf("first Read = %d, %v", n, err)
+	}
+	cancel()
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := verifier.Read(p)
+		done <- result{n: n, err: err}
+	}()
+	select {
+	case got := <-done:
+		var objErr *ObjectError
+		if !errors.As(got.err, &objErr) || objErr.Code != ObjectErrorCanceled {
+			t.Fatalf("post-cancel Read = %d, %T %v, want canceled", got.n, got.err, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("post-cancel Read entered a blocking source read instead of failing closed")
+	}
+}

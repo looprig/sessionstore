@@ -102,10 +102,20 @@ func objectErr(code ObjectErrorCode, field string, cause error) error {
 	return &ObjectError{Code: code, Field: field, Cause: cause}
 }
 
+// objectEntropy is the process-wide source of object generation randomness. It
+// is a variable only so tests can substitute a faulting source; production code
+// never rebinds it and the package exposes no way to inject one.
+var objectEntropy io.Reader = rand.Reader
+
+// randomObjectGeneration draws a cryptographically random 128-bit immutable
+// instance generation. Any entropy fault, including a short read, fails closed
+// with a zero generation so no caller can persist a partially random one.
 func randomObjectGeneration() ([16]byte, error) {
 	var generation [16]byte
-	_, err := io.ReadFull(rand.Reader, generation[:])
-	return generation, err
+	if _, err := io.ReadFull(objectEntropy, generation[:]); err != nil {
+		return [16]byte{}, err
+	}
+	return generation, nil
 }
 
 // PutObject streams, verifies, persists, and re-verifies an immutable object
@@ -444,6 +454,10 @@ func (v *exactVerifier) Read(p []byte) (int, error) {
 	if v.failure != nil {
 		return 0, v.failure
 	}
+	// Refuse a new source read once the operation context is done. The
+	// post-read check cannot bound a source that never returns from Read, so
+	// this window is real and is covered by
+	// TestExactVerifierCancellationBoundsNextRead.
 	select {
 	case <-v.ctx.Done():
 		v.failure = objectErr(ObjectErrorCanceled, "stream", v.ctx.Err())
