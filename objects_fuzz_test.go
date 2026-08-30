@@ -42,6 +42,9 @@ func FuzzExactVerifier(f *testing.F) {
 	f.Add([]byte("seed"), uint64(4), true)
 	f.Add([]byte{}, uint64(0), true)
 	f.Add([]byte("long"), uint64(3), false)
+	// Exact length with a wrong digest: the one seed that reaches the digest
+	// comparison rather than failing on size first.
+	f.Add([]byte("seed"), uint64(4), false)
 	f.Fuzz(func(t *testing.T, body []byte, size uint64, matching bool) {
 		if size > uint64(len(body)+8) {
 			size = uint64(len(body) + 8)
@@ -52,16 +55,18 @@ func FuzzExactVerifier(f *testing.F) {
 		}
 		verifier := newExactVerifier(context.Background(), bytes.NewReader(body), size, digest)
 		_, err := io.ReadAll(verifier)
-		wantSuccess := matching && size == uint64(len(body))
-		if (err == nil) != wantSuccess || verifier.verified != wantSuccess {
-			t.Fatalf("len=%d size=%d matching=%v err=%v verified=%v wantSuccess=%v", len(body), size, matching, err, verifier.verified, wantSuccess)
+		// Draining without an error must imply verification, and verification
+		// must imply a clean drain. verifyPersisted relies on the first half to
+		// have no separate "copied but unverified" branch, so the implication is
+		// enforced here rather than argued in a comment.
+		if (err == nil) != verifier.verified {
+			t.Fatalf("drain and verification disagree: err=%v verified=%v (len=%d size=%d matching=%v)", err, verifier.verified, len(body), size, matching)
 		}
-		// Reading to a nil error must imply verification. verifyPersisted
-		// relies on exactly this to have no separate "copied but unverified"
-		// branch, so the implication is asserted here rather than argued in a
-		// comment.
-		if err == nil && !verifier.verified {
-			t.Fatalf("drained without error but unverified: len=%d size=%d matching=%v", len(body), size, matching)
+		// The oracle: exactly a body of the declared length with the declared
+		// digest verifies, and nothing else does.
+		wantSuccess := matching && size == uint64(len(body))
+		if verifier.verified != wantSuccess {
+			t.Fatalf("verified=%v wantSuccess=%v (len=%d size=%d matching=%v err=%v)", verifier.verified, wantSuccess, len(body), size, matching, err)
 		}
 	})
 }
