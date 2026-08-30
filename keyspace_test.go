@@ -753,6 +753,53 @@ func TestVerifyAndBindRejectMalformedInternalScope(t *testing.T) {
 	}
 }
 
+func TestVerifyAndBindRejectValidCrossLayoutScopeWithoutProviderIO(t *testing.T) {
+	canonicalSource := openTestStore(t)
+	legacySourceBackend := memstore.New()
+	legacySource, err := Open(context.Background(), legacySourceBackend, WithLegacySingleTenant("local"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { legacySource.Close(context.Background()) })
+
+	canonicalScope, err := canonicalSource.deriveSessionScope("tenant", "session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyScope, err := legacySource.deriveSessionScope("local", "123e4567-e89b-12d3-a456-426614174000")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		options []Option
+		scope   sessionScope
+	}{
+		{name: "canonical store with legacy scope", scope: legacyScope},
+		{name: "legacy store with canonical scope", options: []Option{WithLegacySingleTenant("local")}, scope: canonicalScope},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			backend, calls := instrumentComposite(memstore.New())
+			store, err := Open(context.Background(), backend, tt.options...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close(context.Background())
+			before := calls.snapshot()
+			assertKeyspaceCode(t, store.verifySessionScope(context.Background(), tt.scope), KeyspaceScopeInvalid)
+			if got := calls.snapshot(); got != before {
+				t.Fatalf("verify touched provider: before=%+v after=%+v", before, got)
+			}
+			assertKeyspaceCode(t, store.bindSessionScope(context.Background(), tt.scope), KeyspaceScopeInvalid)
+			if got := calls.snapshot(); got != before {
+				t.Fatalf("bind touched provider: before=%+v after=%+v", before, got)
+			}
+		})
+	}
+}
+
 func TestSessionScopeDetectsInjectedDigestCollision(t *testing.T) {
 	tests := []struct {
 		name                        string
