@@ -138,7 +138,12 @@ func TestEnvelopeRejectsMalformedFrames(t *testing.T) {
 		{"declared fields bytes long", EnvelopeErrorLength, func(b []byte) []byte { b[11]++; return b }},
 		{"count mismatch", EnvelopeErrorLength, func(b []byte) []byte { b[7]++; return b }},
 		{"truncated tlv header", EnvelopeErrorLength, func(b []byte) []byte { b[7] = 1; b[11] = 4; return b[:16] }},
-		{"truncated tlv value", EnvelopeErrorLength, func(b []byte) []byte { return b[:len(b)-1] }},
+		{"truncated tlv value", EnvelopeErrorLength, func(b []byte) []byte {
+			b = bytes.Clone(b[:len(b)-1])
+			b = b[:len(b):len(b)]
+			b[11]--
+			return b
+		}},
 		{"unknown tag", EnvelopeErrorField, func(b []byte) []byte { b[12] = 9; return b }},
 		{"duplicate tag", EnvelopeErrorOrder, func(b []byte) []byte { b[24] = 1; return b }},
 		{"out of order tag", EnvelopeErrorOrder, func(b []byte) []byte { b[12], b[24] = b[24], b[12]; return b }},
@@ -184,17 +189,20 @@ func TestEnvelopeRejectsInvalidShapesAndFields(t *testing.T) {
 		{"total frame cap", EnvelopeErrorTooLarge, Envelope{Kind: EnvelopeKindPublicEvent, EventID: "e", Public: BodySlot{Inline: canonicalLargeJSON(MaxInlineBodyBytes)}, Runtime: BodySlot{Inline: make([]byte, MaxInlineBodyBytes)}}},
 		{"runtime missing id", EnvelopeErrorMissing, Envelope{Kind: EnvelopeKindRuntimeControl, Runtime: BodySlot{Inline: []byte{}}}},
 		{"runtime invalid id", EnvelopeErrorInvalid, Envelope{Kind: EnvelopeKindRuntimeControl, RecordID: string([]byte{0xff}), Runtime: BodySlot{Inline: []byte{}}}},
+		{"runtime long id", EnvelopeErrorInvalid, Envelope{Kind: EnvelopeKindRuntimeControl, RecordID: strings.Repeat("r", sessionwire.MaxIDBytes+1), Runtime: BodySlot{Inline: []byte{}}}},
 		{"runtime missing body", EnvelopeErrorMissing, Envelope{Kind: EnvelopeKindRuntimeControl, RecordID: "r"}},
 		{"runtime has public body", EnvelopeErrorField, Envelope{Kind: EnvelopeKindRuntimeControl, RecordID: "r", Public: BodySlot{Inline: []byte(`{}`)}, Runtime: BodySlot{Inline: []byte{}}}},
 		{"fence zero epoch", EnvelopeErrorInvalid, Envelope{Kind: EnvelopeKindOpeningFence}},
 		{"fence has identity", EnvelopeErrorField, Envelope{Kind: EnvelopeKindOpeningFence, RecordID: "r", LeaseEpoch: 1}},
 		{"prefix missing command id", EnvelopeErrorMissing, Envelope{Kind: EnvelopeKindApplicationPrefix, RuntimeCommandID: uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff"), LeaseEpoch: 1, CommandKind: "input"}},
+		{"prefix invalid command id", EnvelopeErrorInvalid, Envelope{Kind: EnvelopeKindApplicationPrefix, CommandID: sessionwire.CommandID(string([]byte{0xff})), RuntimeCommandID: uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff"), LeaseEpoch: 1, CommandKind: "input"}},
 		{"prefix zero runtime id", EnvelopeErrorInvalid, Envelope{Kind: EnvelopeKindApplicationPrefix, CommandID: "c", LeaseEpoch: 1, CommandKind: "input"}},
 		{"prefix zero epoch", EnvelopeErrorInvalid, Envelope{Kind: EnvelopeKindApplicationPrefix, CommandID: "c", RuntimeCommandID: uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff"), CommandKind: "input"}},
 		{"prefix missing kind", EnvelopeErrorMissing, Envelope{Kind: EnvelopeKindApplicationPrefix, CommandID: "c", RuntimeCommandID: uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff"), LeaseEpoch: 1}},
 		{"prefix long kind", EnvelopeErrorInvalid, Envelope{Kind: EnvelopeKindApplicationPrefix, CommandID: "c", RuntimeCommandID: uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff"), LeaseEpoch: 1, CommandKind: strings.Repeat("x", 65)}},
 		{"prefix invalid utf8 kind", EnvelopeErrorInvalid, Envelope{Kind: EnvelopeKindApplicationPrefix, CommandID: "c", RuntimeCommandID: uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff"), LeaseEpoch: 1, CommandKind: string([]byte{0xff})}},
 		{"prefix has body", EnvelopeErrorField, Envelope{Kind: EnvelopeKindApplicationPrefix, CommandID: "c", RuntimeCommandID: uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff"), LeaseEpoch: 1, CommandKind: "input", Runtime: BodySlot{Reference: ref()}}},
+		{"reference invalid object id", EnvelopeErrorInvalid, Envelope{Kind: EnvelopeKindPublicEvent, EventID: "e", Public: BodySlot{Reference: &BodyReference{Reference: sessionwire.ObjectReference{}, SHA256: digest}}}},
 		{"unrelated field", EnvelopeErrorField, func() Envelope { e := validPublic; e.LeaseEpoch = 1; return e }()},
 	}
 	for _, tt := range tests {
@@ -242,6 +250,12 @@ func TestDecodeRejectsWireShapeViolations(t *testing.T) {
 			testWireField{tagIdentity, []byte("c")},
 			testWireField{tagLeaseEpoch, []byte{0, 0, 0, 0, 0, 0, 0, 1}},
 			testWireField{tagRuntimeCommandID, make([]byte, 16)},
+			testWireField{tagCommandKind, []byte("x")},
+		)},
+		{"prefix invalid command id", EnvelopeErrorInvalid, testFrame(EnvelopeKindApplicationPrefix,
+			testWireField{tagIdentity, []byte{0xff}},
+			testWireField{tagLeaseEpoch, []byte{0, 0, 0, 0, 0, 0, 0, 1}},
+			testWireField{tagRuntimeCommandID, bytes.Repeat([]byte{1}, 16)},
 			testWireField{tagCommandKind, []byte("x")},
 		)},
 		{"reference unknown algorithm", EnvelopeErrorDigest, testFrame(EnvelopeKindPublicEvent,
@@ -348,6 +362,14 @@ func TestEnvelopeBodyOwnership(t *testing.T) {
 	frame[publicOffset+2] = 'X'
 	if string(decoded.Public.Inline) != `{"value":"original"}` {
 		t.Fatalf("decoded public body aliases frame: %q", decoded.Public.Inline)
+	}
+	runtimeOffset := bytes.Index(frame, []byte("runtime-original"))
+	if runtimeOffset < 0 {
+		t.Fatal("runtime body not found in encoded frame")
+	}
+	frame[runtimeOffset] = 'X'
+	if string(decoded.Runtime.Inline) != "runtime-original" {
+		t.Fatalf("decoded runtime body aliases frame: %q", decoded.Runtime.Inline)
 	}
 	decoded.Public.Inline[2] = 'Y'
 	if decoded.Runtime.Inline[0] != 'r' {
