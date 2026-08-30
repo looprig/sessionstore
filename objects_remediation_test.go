@@ -3,6 +3,7 @@ package sessionstore
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -926,5 +927,24 @@ func TestExactVerifierCancellationBoundsNextRead(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("post-cancel Read entered a blocking source read instead of failing closed")
+	}
+}
+
+// objectEntropyAtInit captures the production binding during package variable
+// initialization, before any test body (and therefore before any
+// withObjectEntropy swap or its t.Cleanup restore) can run. Asserting on it as
+// well as on the live variable makes the default independent of test ordering.
+var objectEntropyAtInit = objectEntropy
+
+// TestObjectEntropyDefaultsToCryptoRandReader pins the binding structurally: a
+// statistically flat but predictable PRNG passes every distributional check, so
+// the default must be the crypto source itself, not merely something random
+// looking.
+func TestObjectEntropyDefaultsToCryptoRandReader(t *testing.T) {
+	if objectEntropyAtInit != rand.Reader {
+		t.Fatalf("objectEntropy initialized to %T (%v), want crypto/rand.Reader", objectEntropyAtInit, objectEntropyAtInit)
+	}
+	if objectEntropy != rand.Reader {
+		t.Fatalf("objectEntropy is %T (%v), want crypto/rand.Reader", objectEntropy, objectEntropy)
 	}
 }
