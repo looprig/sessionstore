@@ -737,6 +737,21 @@ func (b *gatedBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error)
 // reach this reliably — an earlier version of this test looped a hundred times
 // without once exposing an unsynchronized publish.
 func TestGetObjectRacesStoreClose(t *testing.T) {
+	// The repetition is what makes this guard reliable, and is not incidental:
+	// the defect it catches has no consequence other than the race itself, so
+	// only -race can see it, and only when the accesses actually interleave. A
+	// single window kills the unsynchronized publish about four times in five.
+	// Each window costs a few milliseconds; do not collapse this back into one.
+	for attempt := 0; attempt < 24; attempt++ {
+		getObjectShutdownWindow(t)
+		if t.Failed() {
+			return
+		}
+	}
+}
+
+func getObjectShutdownWindow(t *testing.T) {
+	t.Helper()
 	body := []byte("streamed during shutdown")
 	digest := sha256.Sum256(body)
 	backend := memstore.New()
