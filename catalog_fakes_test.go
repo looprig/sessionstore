@@ -24,10 +24,14 @@ type orderedCall struct {
 	rank             storage.Rank
 	due              storage.Due
 	expectedRevision uint64
-	namespace        string
-	limit            int
 }
 
+// The three list methods below record only the op. They look redundant next to
+// listAuditOrdered, and deleting them still builds and passes — but they are
+// what makes "a direct get or update performs no listing" a live assertion
+// rather than a vacuous one: without an override the call reaches the embedded
+// provider unrecorded, and a regression that started listing would go unseen.
+//
 // recordingOrdered logs every OrderedIndex call and can run a side effect
 // immediately before an Update reaches the provider, which is the only place a
 // test can interleave two compare-and-swap writers deterministically.
@@ -96,17 +100,17 @@ func (o *recordingOrdered) Delete(ctx context.Context, id storage.OrderedID, exp
 }
 
 func (o *recordingOrdered) ListOrdered(ctx context.Context, namespace, orderingScope string, afterOrder uint64, limit int) (storage.OrderedPage, error) {
-	o.add(orderedCall{op: "list_ordered", namespace: namespace, limit: limit})
+	o.add(orderedCall{op: "list_ordered"})
 	return o.OrderedIndex.ListOrdered(ctx, namespace, orderingScope, afterOrder, limit)
 }
 
 func (o *recordingOrdered) ListRanked(ctx context.Context, namespace, rankingScope string, after storage.RankedCursor, limit int) (storage.RankedPage, error) {
-	o.add(orderedCall{op: "list_ranked", namespace: namespace, rankingScope: rankingScope, limit: limit})
+	o.add(orderedCall{op: "list_ranked"})
 	return o.OrderedIndex.ListRanked(ctx, namespace, rankingScope, after, limit)
 }
 
 func (o *recordingOrdered) ListDue(ctx context.Context, namespace string, dueAtOrBefore int64, after storage.DueCursor, limit int) (storage.DuePage, error) {
-	o.add(orderedCall{op: "list_due", namespace: namespace, limit: limit})
+	o.add(orderedCall{op: "list_due"})
 	return o.OrderedIndex.ListDue(ctx, namespace, dueAtOrBefore, after, limit)
 }
 

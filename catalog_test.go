@@ -975,7 +975,7 @@ func TestCatalogOperationsRefuseAfterClose(t *testing.T) {
 	}
 	for name := range operations {
 		if !declared[name] {
-			t.Errorf("this test exercises %s, which catalog.go no longer declares", name)
+			t.Errorf("this test exercises %s, which catalog.go no longer declares (was it moved to another file?)", name)
 		}
 	}
 
@@ -1610,16 +1610,7 @@ func openAuditedListStore(t *testing.T, opts ...Option) (*Store, *listAuditOrder
 	base.OrderedIndex = audit
 	kv := &keysCountingKV{KV: base.KV}
 	base.KV = kv
-	store, err := Open(context.Background(), base, opts...)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(context.Background()); err != nil {
-			t.Errorf("Close: %v", err)
-		}
-	})
-	return store, audit, kv
+	return openStore(t, base, opts...), audit, kv
 }
 
 func openHostileListStore(t *testing.T) (*Store, *hostileOrdered) {
@@ -1627,16 +1618,7 @@ func openHostileListStore(t *testing.T) (*Store, *hostileOrdered) {
 	base := memstore.New()
 	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
 	base.OrderedIndex = hostile
-	store, err := Open(context.Background(), base)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(context.Background()); err != nil {
-			t.Errorf("Close: %v", err)
-		}
-	})
-	return store, hostile
+	return openStore(t, base), hostile
 }
 
 func mustListSessions(t *testing.T, store *Store, req ListSessionsRequest) sessionwire.SessionPage {
@@ -1853,10 +1835,10 @@ func splitCatalogCursor(t *testing.T, cursor sessionwire.Cursor) (header, payloa
 	if err != nil {
 		t.Fatalf("a cursor this store issued is not base64url: %v", err)
 	}
-	if len(token) <= catalogCursorTokenAt {
-		t.Fatalf("cursor is %d bytes, want more than the %d-byte envelope", len(token), catalogCursorTokenAt)
+	if len(token) <= cursorPayloadAt {
+		t.Fatalf("cursor is %d bytes, want more than the %d-byte envelope", len(token), cursorPayloadAt)
 	}
-	return token[:catalogCursorTokenAt:catalogCursorTokenAt], token[catalogCursorTokenAt:]
+	return token[:cursorPayloadAt:cursorPayloadAt], token[cursorPayloadAt:]
 }
 
 func joinCatalogCursor(header, payload []byte) sessionwire.Cursor {
@@ -1909,15 +1891,11 @@ func TestListSessionsRejectsACursorIssuedForAnotherTenant(t *testing.T) {
 func TestListSessionsBindsItsCursorToTheTenantEvenIfTheProviderDoesNot(t *testing.T) {
 	backend := memstore.New()
 	backend.OrderedIndex = permissiveRankedOrdered{OrderedIndex: backend.OrderedIndex}
-	store, err := Open(context.Background(), backend)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { store.Close(context.Background()) })
+	store := openStore(t, backend)
 	seedTwoTenants(t, store)
 	cursor := mustTruncatedCursor(t, store, catalogOtherTenant)
 
-	_, err = store.ListSessions(context.Background(), ListSessionsRequest{
+	_, err := store.ListSessions(context.Background(), ListSessionsRequest{
 		TenantID: catalogTenant,
 		Cursor:   cursor,
 		Limit:    1,
@@ -1977,9 +1955,9 @@ func TestListSessionsRejectsACursorEnvelopeItDidNotIssue(t *testing.T) {
 	journal := store.encodeJournalCursor(journalCursorPublic, catalogTenant, catalogSession, 1, 1)
 
 	for name, cursor := range map[string]sessionwire.Cursor{
-		"unknown version": rewrite(func(header []byte) { header[catalogCursorVersionAt]++ }),
-		"foreign magic":   rewrite(func(header []byte) { copy(header[catalogCursorMagicAt:], "XXXX") }),
-		"foreign scope":   rewrite(func(header []byte) { header[catalogCursorScopeAt]++ }),
+		"unknown version": rewrite(func(header []byte) { header[cursorVersionAt]++ }),
+		"foreign magic":   rewrite(func(header []byte) { copy(header[cursorMagicAt:], "XXXX") }),
+		"foreign scope":   rewrite(func(header []byte) { header[cursorScopeAt]++ }),
 		"empty payload":   joinCatalogCursor(header, nil),
 		"journal cursor":  journal,
 	} {
@@ -2011,7 +1989,7 @@ func TestListSessionsBoundsACursorBeforeDecodingIt(t *testing.T) {
 	seedTwoTenants(t, store)
 	valid := mustTruncatedCursor(t, store, catalogTenant)
 	header, payload := splitCatalogCursor(t, valid)
-	oversized := joinCatalogCursor(header, append(payload, bytes.Repeat([]byte{'x'}, MaxCatalogCursorBytes)...))
+	oversized := joinCatalogCursor(header, append(payload, bytes.Repeat([]byte{'x'}, maxCatalogCursorBytes)...))
 
 	scope, err := store.deriveSessionScope(catalogTenant, "session-a1")
 	if err != nil {
@@ -2039,25 +2017,38 @@ func TestListSessionsBoundsACursorBeforeDecodingIt(t *testing.T) {
 // TestListSessionsHoldsEveryRecordToTheRequestedIdentity covers both halves of
 // the identity check a listed record must pass: the tenant it claims and the
 // stable key it was stored under.
+//
+// The poisoned row is neither first nor last in the page, and the error must
+// name its position. One unreadable row fails the whole page — skipping it
+// would hide a keyspace collision indefinitely — so without a locator a tenant
+// becomes permanently unlistable with an error that names nothing an operator
+// can repair.
 func TestListSessionsHoldsEveryRecordToTheRequestedIdentity(t *testing.T) {
+	const poisonedRow = 1
 	for name, corrupt := range map[string]struct{ from, to string }{
 		"foreign tenant": {`"tenant_id":"tenant-a"`, `"tenant_id":"tenant-z"`},
-		"foreign key":    {`"session_id":"session-a1"`, `"session_id":"session-z"`},
+		"foreign key":    {`"session_id":"session-a2"`, `"session_id":"session-z"`},
 	} {
 		t.Run(name, func(t *testing.T) {
 			store, hostile := openHostileListStore(t)
+			// Ranked descending, so the page is a3, a2, a1 and the poisoned
+			// row is a2 in the middle.
 			mustCreateSession(t, store, catalogTenant, "session-a1", catalogActiveAt)
+			mustCreateSession(t, store, catalogTenant, "session-a2", catalogActiveAt.Add(time.Minute))
+			mustCreateSession(t, store, catalogTenant, "session-a3", catalogActiveAt.Add(2*time.Minute))
 			hostile.answerRanked(func(page storage.RankedPage, err error) (storage.RankedPage, error) {
 				if err != nil {
 					return page, err
 				}
-				for i := range page.Records {
-					rewritten := bytes.Replace(page.Records[i].Value, []byte(corrupt.from), []byte(corrupt.to), 1)
-					if bytes.Equal(rewritten, page.Records[i].Value) {
-						t.Fatalf("could not corrupt %s in %s", name, page.Records[i].Value)
-					}
-					page.Records[i].Value = rewritten
+				if len(page.Records) != 3 {
+					t.Fatalf("provider returned %d records, want 3", len(page.Records))
 				}
+				record := &page.Records[poisonedRow]
+				rewritten := bytes.Replace(record.Value, []byte(corrupt.from), []byte(corrupt.to), 1)
+				if bytes.Equal(rewritten, record.Value) {
+					t.Fatalf("could not corrupt %s in %s", name, record.Value)
+				}
+				record.Value = rewritten
 				return page, nil
 			})
 
@@ -2065,7 +2056,10 @@ func TestListSessionsHoldsEveryRecordToTheRequestedIdentity(t *testing.T) {
 			if err == nil {
 				t.Fatalf("a listing returned %v for a record it could not hold to its identity", listedSessionIDs(page))
 			}
-			assertCatalogCode(t, err, CatalogErrorIdentity)
+			got := assertCatalogCode(t, err, CatalogErrorIdentity)
+			if want := "sessions[1].record"; got.Field != want {
+				t.Fatalf("field = %q, want %q: a failed page must name the row an operator has to repair", got.Field, want)
+			}
 			if len(page.Sessions) != 0 {
 				t.Fatalf("a failed listing returned %d sessions", len(page.Sessions))
 			}
@@ -2191,12 +2185,10 @@ func TestListSessionsDefaultsAnUnsetLimitToTheStoreCeiling(t *testing.T) {
 	}
 }
 
-// TestListSessionsOfAnUnusedTenantIsEmpty documents the deliberate difference
-// between a list and a direct get. A get names a session and must prove that
-// session's collision binding before it trusts a derived name; a list names no
-// session, and a tenant that has never created one has no binding to prove. Its
-// answer is an empty page rather than a failure, and cross-tenant safety comes
-// from holding every returned record to the tenant it claims.
+// TestListSessionsOfAnUnusedTenantIsEmpty pins the observable half of the
+// no-witness decision: an unused tenant answers with an empty page rather than
+// a binding failure, and touches KV not at all. The reasoning for the decision
+// lives on ListSessions itself, where a caller reads it.
 func TestListSessionsOfAnUnusedTenantIsEmpty(t *testing.T) {
 	store, _, kv := openAuditedListStore(t)
 	mustCreateSession(t, store, catalogOtherTenant, "session-b1", catalogActiveAt)
@@ -2273,7 +2265,7 @@ func TestListSessionsRefusesToIssueACursorItCouldNotAccept(t *testing.T) {
 		if err != nil {
 			return page, err
 		}
-		page.NextCursor = storage.RankedCursor(strings.Repeat("t", MaxCatalogCursorBytes))
+		page.NextCursor = storage.RankedCursor(strings.Repeat("t", maxCatalogCursorBytes))
 		return page, nil
 	})
 

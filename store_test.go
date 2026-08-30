@@ -14,6 +14,25 @@ import (
 	"github.com/looprig/storage/memstore"
 )
 
+// openStore opens a Store over backend and closes it when the test ends,
+// reporting a Close failure rather than discarding it: a Store that cannot
+// drain is a defect in the code under test, not test noise. Every test store
+// builder in this package funnels through it so none of them can grow its own
+// slightly different lifecycle.
+func openStore(t *testing.T, backend *storage.Composite, opts ...Option) *Store {
+	t.Helper()
+	store, err := Open(context.Background(), backend, opts...)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	return store
+}
+
 func TestOpenRejectsMissingPrimitive(t *testing.T) {
 	t.Parallel()
 

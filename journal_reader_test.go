@@ -406,6 +406,11 @@ func TestPublicPageCursorRejectsForgedTokens(t *testing.T) {
 		// intact, so only the span check rejects it.
 		{name: "start beyond the snapshot", cursor: mutate(func(b []byte) { b[len(b)-9] = 100 })},
 		{name: "trailing byte", cursor: sessionwire.Cursor(base64.RawURLEncoding.EncodeToString(append(append([]byte(nil), valid...), 0)))},
+		// A truncated payload is a memory-safety precondition, not a spelling
+		// rule: this cursor's two sequence numbers are read at fixed offsets,
+		// so a short token that reached them would slice out of range rather
+		// than be rejected. The envelope's payload width is what refuses it.
+		{name: "truncated payload", cursor: sessionwire.Cursor(base64.RawURLEncoding.EncodeToString(valid[:len(valid)-1]))},
 		// Unpadded base64's final character carries slack bits that the decoder
 		// discards, so this string decodes to the SAME token as the valid
 		// cursor. Only a canonical-spelling check rejects it. Found by

@@ -946,16 +946,7 @@ func TestBindingFailurePrecedesEverySessionDataPrimitive(t *testing.T) {
 
 func openTestStore(t *testing.T) *Store {
 	t.Helper()
-	store, err := Open(context.Background(), memstore.New())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := store.Close(context.Background()); err != nil {
-			t.Errorf("Close: %v", err)
-		}
-	})
-	return store
+	return openStore(t, memstore.New())
 }
 
 func assertKeyspaceCode(t *testing.T, err error, want KeyspaceErrorCode) {

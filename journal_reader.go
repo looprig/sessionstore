@@ -3,7 +3,6 @@ package sessionstore
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -19,8 +18,17 @@ type ReadPublicJournalRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
 	FromSeq   uint64
-	Cursor    sessionwire.Cursor
-	Limit     int
+
+	// Cursor is a token a previous page of THIS session issued. It is opaque:
+	// retain it and hand it back, but do not parse it or derive position,
+	// tenancy, or authority from it. Possessing one authorizes nothing — a
+	// caller must authorize TenantID and SessionID on its own — and a cursor
+	// this store did not issue for this session and this projection is refused
+	// with JournalErrorCursor, which means the walk restarts rather than that
+	// anything is wrong with the journal.
+	Cursor sessionwire.Cursor
+
+	Limit int
 }
 
 // ReadRuntimeJournalRequest positions one bounded privileged replay page. Its
@@ -29,8 +37,13 @@ type ReadRuntimeJournalRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
 	FromSeq   uint64
-	Cursor    sessionwire.Cursor
-	Limit     int
+
+	// Cursor carries the same rules as ReadPublicJournalRequest.Cursor, and the
+	// two are not interchangeable: a public token presented here, or a runtime
+	// token presented to the public read, is refused.
+	Cursor sessionwire.Cursor
+
+	Limit int
 }
 
 // RuntimeRecord is one raw journal record as it is stored. Object-backed bodies
@@ -359,18 +372,15 @@ const (
 	journalCursorRuntime journalCursorKind = "LRJR"
 )
 
-// The field layout is declared once, as offsets. Encode appends in this order
-// and decode slices at these bounds, so the two halves cannot drift and the
-// prose above describes exactly one definition.
+// The journal cursor's payload is a fixed 16 bytes: the next sequence and the
+// tip the walk's snapshot was captured at. See the envelope grammar in
+// cursor.go, including why the scope field is a binding tag and not a MAC.
 const (
 	journalCursorVersion byte = 1
 
-	journalCursorMagicAt   = 0
-	journalCursorVersionAt = journalCursorMagicAt + 4
-	journalCursorScopeAt   = journalCursorVersionAt + 1
-	journalCursorNextSeqAt = journalCursorScopeAt + 32
+	journalCursorNextSeqAt = 0
 	journalCursorTipAt     = journalCursorNextSeqAt + 8
-	journalCursorBytes     = journalCursorTipAt + 8
+	journalCursorPayload   = journalCursorTipAt + 8
 )
 
 type journalCursorPosition struct {
@@ -389,14 +399,11 @@ func (s *Store) encodeJournalCursor(
 	nextSeq uint64,
 	capturedTip uint64,
 ) sessionwire.Cursor {
+	payload := make([]byte, journalCursorPayload)
+	binary.BigEndian.PutUint64(payload[journalCursorNextSeqAt:journalCursorTipAt], nextSeq)
+	binary.BigEndian.PutUint64(payload[journalCursorTipAt:], capturedTip)
 	scope := s.journalCursorScope(tenant, session)
-	token := make([]byte, journalCursorBytes)
-	copy(token[journalCursorMagicAt:journalCursorVersionAt], kind)
-	token[journalCursorVersionAt] = journalCursorVersion
-	copy(token[journalCursorScopeAt:journalCursorNextSeqAt], scope[:])
-	binary.BigEndian.PutUint64(token[journalCursorNextSeqAt:journalCursorTipAt], nextSeq)
-	binary.BigEndian.PutUint64(token[journalCursorTipAt:], capturedTip)
-	return sessionwire.Cursor(base64.RawURLEncoding.EncodeToString(token))
+	return sessionwire.Cursor(encodeCursorEnvelope(string(kind), journalCursorVersion, scope, payload))
 }
 
 func (s *Store) decodeJournalCursor(
@@ -409,37 +416,15 @@ func (s *Store) decodeJournalCursor(
 	invalid := func() (journalCursorPosition, error) {
 		return journalCursorPosition{}, journalErr(JournalErrorCursor, "cursor", nil)
 	}
-	// Bound the decode BEFORE it allocates: DecodeString sizes its own
-	// destination from the caller's string, so an unbounded cursor would make
-	// this reader allocate in proportion to attacker-supplied input. For
-	// RawURLEncoding DecodedLen is exact, so a successful decode after this
-	// gate is necessarily journalCursorBytes long and no second length check
-	// is needed.
-	if base64.RawURLEncoding.DecodedLen(len(cursor)) != journalCursorBytes {
-		return invalid()
-	}
-	token, err := base64.RawURLEncoding.DecodeString(string(cursor))
-	if err != nil {
-		return invalid()
-	}
-	// Unpadded base64 has slack in its final character: the low bits of the
-	// last group are dropped, so several distinct strings decode to identical
-	// bytes. Require the exact spelling this reader emits, so one position has
-	// one cursor and a token cannot be perturbed while still being accepted.
-	if base64.RawURLEncoding.EncodeToString(token) != string(cursor) {
-		return invalid()
-	}
-	if string(token[journalCursorMagicAt:journalCursorVersionAt]) != string(kind) ||
-		token[journalCursorVersionAt] != journalCursorVersion {
-		return invalid()
-	}
-	scope := s.journalCursorScope(tenant, session)
-	if !bytes.Equal(token[journalCursorScopeAt:journalCursorNextSeqAt], scope[:]) {
+	payload, ok := decodeCursorEnvelope(
+		string(kind), journalCursorVersion, s.journalCursorScope(tenant, session),
+		string(cursor), journalCursorPayload, journalCursorPayload)
+	if !ok {
 		return invalid()
 	}
 	position := journalCursorPosition{
-		nextSeq:     binary.BigEndian.Uint64(token[journalCursorNextSeqAt:journalCursorTipAt]),
-		capturedTip: binary.BigEndian.Uint64(token[journalCursorTipAt:]),
+		nextSeq:     binary.BigEndian.Uint64(payload[journalCursorNextSeqAt:journalCursorTipAt]),
+		capturedTip: binary.BigEndian.Uint64(payload[journalCursorTipAt:]),
 	}
 	// Sequences are 1-based, so a zero start is not a position this reader ever
 	// issued.

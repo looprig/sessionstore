@@ -155,16 +155,16 @@ func FuzzCatalogCursorCodec(f *testing.F) {
 		f.Fatalf("a cursor this store issued is not base64url: %v", err)
 	}
 	for _, mutate := range []func([]byte){
-		func(t []byte) { copy(t[catalogCursorMagicAt:], "XXXX") },
-		func(t []byte) { t[catalogCursorVersionAt]++ },
-		func(t []byte) { t[catalogCursorScopeAt]++ },
+		func(t []byte) { copy(t[cursorMagicAt:], "XXXX") },
+		func(t []byte) { t[cursorVersionAt]++ },
+		func(t []byte) { t[cursorScopeAt]++ },
 	} {
 		copied := append([]byte(nil), token...)
 		mutate(copied)
 		f.Add(base64.RawURLEncoding.EncodeToString(copied))
 	}
-	f.Add(base64.RawURLEncoding.EncodeToString(token[:catalogCursorTokenAt]))
-	f.Add(valid + strings.Repeat("A", MaxCatalogCursorBytes))
+	f.Add(base64.RawURLEncoding.EncodeToString(token[:cursorPayloadAt]))
+	f.Add(valid + strings.Repeat("A", maxCatalogCursorBytes))
 	f.Add("")
 
 	f.Fuzz(func(t *testing.T, cursor string) {

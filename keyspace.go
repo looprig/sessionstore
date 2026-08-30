@@ -145,9 +145,17 @@ func validateLayoutMarker(data []byte) error {
 // listing and a direct write agreeing about which ordering scope a tenant's
 // catalog records occupy.
 type tenantScope struct {
-	layout           keyspaceLayout
-	TenantNamespace  string
-	CatalogScope     string
+	layout          keyspaceLayout
+	TenantNamespace string
+	CatalogScope    string
+
+	// tenantWitnessKey and tenantWitness belong to deriveSessionScope alone.
+	// They are computed here because the tenant token they are derived from is
+	// computed here, and recomputing it in the caller would restore exactly the
+	// duplication this type removed. A tenant-scoped read does not bind or
+	// verify a witness — it names no session — so a caller that only wants the
+	// catalog scope discards them, and their presence in this struct is not an
+	// invitation to start using them elsewhere.
 	tenantWitnessKey string
 	tenantWitness    []byte
 }

@@ -28,12 +28,7 @@ const (
 
 func openJournalStore(t *testing.T, backend *storage.Composite) *Store {
 	t.Helper()
-	store, err := Open(context.Background(), backend)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = store.Close(context.Background()) })
-	return store
+	return openStore(t, backend)
 }
 
 func openTestJournal(t *testing.T, store *Store) *JournalWriter {
