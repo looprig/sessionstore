@@ -153,3 +153,39 @@ resumes from the provider's frozen `(rank, stable_key, ordering_scope)` position
 rather than from a snapshot, so a session whose recency changes mid-walk may
 repeat or be skipped; a sweep that must see every session once reconciles by
 identity, not by page.
+
+## Open gates: one projection, one deadline index
+
+The catalog record is the only store of open gates. `ReadGates` returns Core's
+`GatePage` from that one record, in the record's canonical
+`(opened_seq, gate_id)` order, with no cursor and no limit: a session's open
+gates are bounded by `MaxCatalogOpenGates`, so the whole answer is one bounded
+read rather than a walk.
+
+`OpenGate` and `ResolveGate` add and remove one gate at a time and also maintain
+a deadline INTENT: one ordered record per open gate whose due state is the
+gate's absolute deadline, carrying its identity and opening event and nothing
+else. It is an index, not a second copy of the projection — the catalog cannot
+answer "what is due" without reading every session, and the ordered index's due
+view can, deployment-wide, in pages proportional to what is due.
+
+The two writes are ordered, and the order is the durability argument. An open
+makes the intent durable before it commits the projection; a resolve clears the
+projection before it retires the intent. So the only state an interrupted
+operation can leave is an intent with no matching open gate, never a gate open
+with no durable deadline. `ListDueGates` is the reader that closes that: it
+validates every due intent against the session's durable open projection and
+drops the ones that match nothing. It is a bounded read that takes no action —
+what a Host does about an expired gate is gate continuation, which this package
+does not yet implement.
+
+Retiring an intent is a tombstone rather than an erasure: the record stays
+readable for audit, its identity can never be reused to reopen the same gate,
+and a tombstone is not due by the provider's own contract, so it leaves the due
+pages without this package maintaining a flag.
+
+`UpdateCatalogHostState` still replaces the whole open-gate projection and
+deliberately leaves intents alone: it is the Host's re-projection path, not an
+incremental gate edit. A gate projected only that way is readable but has no
+deadline index, and a gate dropped that way leaves a remnant intent the due
+reader discards.

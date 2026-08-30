@@ -344,8 +344,8 @@ func (s *Store) UpdateCatalogHostState(ctx context.Context, req UpdateCatalogHos
 	if err != nil {
 		return CatalogEntry{}, err
 	}
-	if req.LeaseEpoch < current.Record.LeaseEpoch {
-		return CatalogEntry{}, &CatalogError{Code: CatalogErrorEpoch, Field: "lease_epoch", Epoch: current.Record.LeaseEpoch}
+	if err := hostEpochFence(current.Record, req.LeaseEpoch); err != nil {
+		return CatalogEntry{}, err
 	}
 	// The journal is append-only and its successor fence commits above the
 	// predecessor's tip, so a durable sequence never moves backwards. Accepting
@@ -553,6 +553,23 @@ func (s *Store) readCatalogEntry(
 	return catalogEntry(stored, tenant, session)
 }
 
+// hostEpochFence admits a Host-owned write against the record's committed
+// high-water epoch. Every path that writes Host-owned fields shares it —
+// UpdateCatalogHostState and both gate writes — so none of them can drift into
+// a different idea of when a Host has been superseded.
+//
+// An equal epoch is admitted because one grant legitimately writes many times;
+// only a strictly lower one has provably lost the session. The zero check is
+// deliberately NOT here: each caller makes it before its read, so an epochless
+// request is refused as the caller mistake it is rather than being reported as
+// whatever the read happened to find.
+func hostEpochFence(current CatalogRecord, epoch uint64) error {
+	if epoch < current.LeaseEpoch {
+		return &CatalogError{Code: CatalogErrorEpoch, Field: "lease_epoch", Epoch: current.LeaseEpoch}
+	}
+	return nil
+}
+
 // writeCatalogRecord encodes and compare-and-swaps one record. Canonicalization
 // and validation belong to encodeCatalogRecord and are deliberately not
 // restated here: a second call would validate the same record twice and could
@@ -752,37 +769,10 @@ func encodeCatalogRecord(record CatalogRecord) ([]byte, error) {
 // exceptions are core's own declared redaction boundaries, such as
 // ObjectReference, which drop an undeclared member rather than proxy it.
 func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
-	if len(value) > MaxCatalogRecordBytes {
-		return CatalogRecord{}, catalogErr(CatalogErrorTooLarge, "record", nil)
-	}
-	if len(value) == 0 {
-		return CatalogRecord{}, catalogErr(CatalogErrorMalformed, "record", nil)
-	}
-	// The version is read from a tolerant first pass so an unknown version is
-	// reported as a version failure rather than as whichever member the strict
-	// decoder happened to trip over first.
-	//
-	// This pass is also the package's one well-formedness rule: json.Unmarshal
-	// requires the whole value to be exactly one JSON document, so trailing
-	// content is rejected here. The streaming decoder below therefore never
-	// needs a second trailing check — a decoder.More() call there could not
-	// observe anything this has not already refused, and two statements of one
-	// rule is how one of them later rots.
-	var probe struct {
-		RecordVersion uint8 `json:"record_version"`
-	}
-	if err := json.Unmarshal(value, &probe); err != nil {
-		return CatalogRecord{}, catalogErr(CatalogErrorMalformed, "record", err)
-	}
-	if probe.RecordVersion != CatalogRecordVersion {
-		return CatalogRecord{}, catalogErr(CatalogErrorVersion, "record_version", nil)
-	}
-
-	decoder := json.NewDecoder(bytes.NewReader(value))
-	decoder.DisallowUnknownFields()
-	var wire catalogWire
-	if err := decoder.Decode(&wire); err != nil {
-		return CatalogRecord{}, catalogErr(CatalogErrorMalformed, "record", err)
+	wire, err := decodeVersionedRecord[catalogWire](
+		value, MaxCatalogRecordBytes, CatalogRecordVersion, "record", "record_version")
+	if err != nil {
+		return CatalogRecord{}, err
 	}
 	record := CatalogRecord{
 		TenantID:               wire.TenantID,
@@ -808,6 +798,61 @@ func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 		}
 	}
 	return canonicalCatalogRecord(record)
+}
+
+// decodeVersionedRecord is the one strict decode this package's stored records
+// share. Every durable record it writes is a versioned JSON document, and the
+// rules below are properties of that shape rather than of any one record, so
+// they are stated once: a second copy would be free to drop the bound, the
+// version gate, or the strictness that keeps an undeclared member from being
+// silently accepted.
+//
+// Order matters and is the reason for the two passes. The bound is checked
+// before anything decodes, so a reader never allocates in proportion to a
+// stored value it has already decided is too large. The version is then read
+// from a tolerant first pass, so an unknown version is reported as a version
+// failure rather than as whichever member the strict decoder happened to trip
+// over first.
+//
+// That first pass is also the package's one well-formedness rule:
+// json.Unmarshal requires the whole value to be exactly one JSON document, so
+// trailing content is rejected there. The streaming decoder below therefore
+// never needs a second trailing check — a decoder.More() call could not observe
+// anything the first pass has not already refused, and two statements of one
+// rule is how one of them later rots.
+//
+// Strictness is a RECORD-level property and stops at the record's own members.
+// What a caller does with the decoded wire value — validating it, walking
+// nested projections, canonicalizing it — belongs to that record's own decoder.
+func decodeVersionedRecord[T any](
+	value []byte,
+	maxBytes int,
+	wantVersion uint8,
+	field, versionField string,
+) (T, error) {
+	var wire T
+	if len(value) > maxBytes {
+		return wire, catalogErr(CatalogErrorTooLarge, field, nil)
+	}
+	if len(value) == 0 {
+		return wire, catalogErr(CatalogErrorMalformed, field, nil)
+	}
+	var probe struct {
+		RecordVersion uint8 `json:"record_version"`
+	}
+	if err := json.Unmarshal(value, &probe); err != nil {
+		return wire, catalogErr(CatalogErrorMalformed, field, err)
+	}
+	if probe.RecordVersion != wantVersion {
+		return wire, catalogErr(CatalogErrorVersion, versionField, nil)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(value))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil {
+		var zero T
+		return zero, catalogErr(CatalogErrorMalformed, field, err)
+	}
+	return wire, nil
 }
 
 // canonicalCatalogRecord validates a record and returns its one canonical
