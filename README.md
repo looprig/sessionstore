@@ -45,3 +45,19 @@ the composition root; do not rewrite a live backend's immutable layout marker.
 Provider ownership options take effect only after `Open` has successfully validated
 and bound the backend layout. If `Open` fails, the provider remains caller-owned and
 SessionStore does not close it.
+
+## Object orphans
+
+`PutObject` mints an object's identity before writing it and returns a reference
+only after re-reading the persisted bytes and verifying them against the declared
+length and digest. A provider failure after the blob has committed therefore
+returns an error and no reference while leaving a verified blob behind — an
+orphan.
+
+That is deliberate. Deleting on a post-commit failure would issue a delete
+against a provider that has just proved unreliable, and every object key is
+content- and generation-addressed, so an orphan can never be confused with, or
+served as, another object. Reclaiming orphans is the store operator's
+responsibility, over the tenant- and session-scoped blob prefix; SessionStore's
+only enumeration path is internal and unexported, so no caller-facing garbage
+collector exists yet.

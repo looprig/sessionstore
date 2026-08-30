@@ -1,6 +1,7 @@
 package sessionstore
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -50,6 +51,13 @@ func (k ObjectKind) valid() bool {
 // PutObjectRequest declares an immutable object's exact content properties.
 // MediaType is optional, bounded, validated descriptive metadata; it is
 // untrusted and does not participate in object identity.
+//
+// SizeBytes is the exact byte length of Body, not a hint: a body that ends
+// early or runs long is rejected. SessionStore imposes no ceiling on it, by
+// design — the effective bound is whatever the storage provider accepts.
+// Verification streams through a fixed buffer and nothing here allocates in
+// proportion to SizeBytes, so a large declared size costs a rejected write, not
+// memory.
 type PutObjectRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
@@ -86,7 +94,24 @@ func randomObjectGeneration() ([16]byte, error) {
 }
 
 // PutObject streams, verifies, persists, and re-verifies an immutable object
-// before returning its metadata.
+// before returning its metadata. The stages are: static validation, admission,
+// minting an identity, writing the blob, and re-reading it back.
+//
+// The declared SizeBytes and SHA256 are exact: the body is accepted only if it
+// ends at that length with that digest, and neither the caller's metadata nor
+// any reference is produced otherwise.
+//
+// Orphan policy. The identity is minted before the write, and PutObject returns
+// a reference only after the persisted bytes have been read back and verified.
+// A provider failure after the blob commits therefore leaves a persisted,
+// verified blob that no caller was ever told about — an orphan. That is
+// deliberate: the alternative, deleting on a post-commit error, would issue a
+// delete against a provider that has just proved unreliable, and the blob is
+// content- and generation-addressed so it can never be mistaken for another
+// object. Reclaiming orphans is the store operator's job, over the
+// tenant/session blob prefix; this package's only enumeration path,
+// listObjectReferences, is intentionally not exported, so no caller-facing GC
+// exists yet.
 func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwire.ObjectMetadata, error) {
 	if !req.Kind.valid() {
 		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorInvalid, "kind", nil)
@@ -139,29 +164,42 @@ func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwir
 		}
 		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorIntegrity, "put_eof", nil)
 	}
-	stored, err := s.backend.Blobs.Get(opCtx, key)
+	if err := s.verifyPersisted(opCtx, key, req.SizeBytes, req.SHA256); err != nil {
+		return sessionwire.ObjectMetadata{}, err
+	}
+	return metadata, nil
+}
+
+// verifyPersisted reads the just-written blob back and requires it to end at
+// exactly the promised length and digest. A Put that the provider accepted but
+// stored wrongly is caught here rather than at some later Get, and the Close
+// error is reported alongside a read failure rather than replacing it.
+//
+// A nil copy error already means verification succeeded: exactVerifier returns
+// io.EOF only after it has confirmed the length and digest, and reports every
+// other outcome as an error, so there is no separate "copied but unverified"
+// case to check for here.
+func (s *Store) verifyPersisted(ctx context.Context, key string, size uint64, digest [32]byte) error {
+	stored, err := s.backend.Blobs.Get(ctx, key)
 	if err != nil {
-		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorBackend, "post_get", err)
+		return objectErr(ObjectErrorBackend, "post_get", err)
 	}
 	if isNilDynamic(reflect.ValueOf(stored)) {
-		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorBackend, "post_get", nil)
+		return objectErr(ObjectErrorBackend, "post_get", nil)
 	}
-	post := newBackendExactVerifier(opCtx, stored, req.SizeBytes, req.SHA256)
+	post := newBackendExactVerifier(ctx, stored, size, digest)
 	_, copyErr := io.Copy(io.Discard, post)
 	closeErr := stored.Close()
 	if copyErr != nil {
 		if closeErr != nil {
-			return sessionwire.ObjectMetadata{}, errors.Join(copyErr, objectErr(ObjectErrorBackend, "post_close", closeErr))
+			return errors.Join(copyErr, objectErr(ObjectErrorBackend, "post_close", closeErr))
 		}
-		return sessionwire.ObjectMetadata{}, copyErr
-	}
-	if !post.verified {
-		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorIntegrity, "post_eof", post.failure)
+		return copyErr
 	}
 	if closeErr != nil {
-		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorBackend, "post_close", closeErr)
+		return objectErr(ObjectErrorBackend, "post_close", closeErr)
 	}
-	return metadata, nil
+	return nil
 }
 
 // GetObject returns a lifecycle-held verified stream. A caller establishes
@@ -203,7 +241,11 @@ func (s *Store) GetObject(ctx context.Context, req GetObjectRequest) (io.ReadClo
 		release()
 		return nil, objectErr(ObjectErrorBackend, "get", nil)
 	}
-	result := &objectReader{verifier: newBackendExactVerifier(opCtx, reader, parsed.size, parsed.digest), underlying: reader, release: release}
+	result := &objectReader{
+		verifier:   newBackendExactVerifier(opCtx, reader, parsed.size, parsed.digest),
+		underlying: reader,
+		release:    release,
+	}
 	stopCancel := context.AfterFunc(opCtx, func() {
 		result.beginTermination(objectErr(ObjectErrorCanceled, "stream", opCtx.Err()))
 	})
@@ -354,7 +396,13 @@ func parseObjectReference(reference sessionwire.ObjectReference) (parsedObject, 
 }
 
 // objectMetadataFor mints the metadata for one freshly identified object.
-func objectMetadataFor(kind ObjectKind, generation [16]byte, size uint64, digest [32]byte, mediaType string) sessionwire.ObjectMetadata {
+func objectMetadataFor(
+	kind ObjectKind,
+	generation [16]byte,
+	size uint64,
+	digest [32]byte,
+	mediaType string,
+) sessionwire.ObjectMetadata {
 	encodedDigest := hex.EncodeToString(digest[:])
 	return sessionwire.ObjectMetadata{
 		Reference: objectIDFor(kind, encodeObjectGeneration(generation), encodedDigest),
@@ -371,7 +419,12 @@ func objectKey(scope sessionScope, object parsedObject) string {
 // listObjectReferences is an internal administrative operation over one
 // verified tenant/session and one exact V1 kind prefix. Historical legacy
 // digest-only keys are intentionally excluded for the later replay resolver.
-func (s *Store) listObjectReferences(ctx context.Context, tenantID sessionwire.TenantID, sessionID sessionwire.SessionID, kind ObjectKind) ([]sessionwire.ObjectReference, error) {
+func (s *Store) listObjectReferences(
+	ctx context.Context,
+	tenantID sessionwire.TenantID,
+	sessionID sessionwire.SessionID,
+	kind ObjectKind,
+) ([]sessionwire.ObjectReference, error) {
 	if !kind.valid() {
 		return nil, objectErr(ObjectErrorInvalid, "kind", nil)
 	}
@@ -413,7 +466,13 @@ func (s *Store) listObjectReferences(ctx context.Context, tenantID sessionwire.T
 // deleteObject is an internal administrative deletion of one strictly parsed
 // V1 reference after Get-only scope verification. It never resolves historical
 // digest-only keys and never binds a missing session.
-func (s *Store) deleteObject(ctx context.Context, tenantID sessionwire.TenantID, sessionID sessionwire.SessionID, expectedKind ObjectKind, reference sessionwire.ObjectReference) error {
+func (s *Store) deleteObject(
+	ctx context.Context,
+	tenantID sessionwire.TenantID,
+	sessionID sessionwire.SessionID,
+	expectedKind ObjectKind,
+	reference sessionwire.ObjectReference,
+) error {
 	if !expectedKind.valid() {
 		return objectErr(ObjectErrorInvalid, "expected_kind", nil)
 	}
@@ -475,6 +534,23 @@ func validateMediaType(value string) error {
 	return nil
 }
 
+// exactVerifier wraps a byte source and lets exactly the promised content
+// through: the stream must end at expected bytes with a SHA-256 equal to digest,
+// and verified is set only when that terminal EOF is observed. Any other outcome
+// latches failure, which every later Read repeats, so a failed stream can never
+// recover into a success.
+//
+// It is single-consumer and NOT safe for concurrent use: none of its fields are
+// guarded by a mutex. The only concurrent user is objectReader, whose reading
+// flag serializes calls into it.
+//
+// EOF policy is deliberately strict and identity-based: only a bare io.EOF ends
+// the stream. A source returning an error that merely wraps io.EOF is treated as
+// a read failure even on byte-perfect content, because a wrapped EOF means the
+// source is reporting something in addition to end-of-stream and this type
+// fails closed on anything it does not exactly understand. Every EOF comparison
+// in this file is == for that reason; do not relax one to errors.Is without
+// relaxing the contract on purpose.
 type exactVerifier struct {
 	ctx      context.Context
 	source   io.Reader
@@ -495,9 +571,29 @@ func newBackendExactVerifier(ctx context.Context, source io.Reader, size uint64,
 	return newExactVerifierWithReadCode(ctx, source, size, digest, ObjectErrorBackend)
 }
 
-func newExactVerifierWithReadCode(ctx context.Context, source io.Reader, size uint64, digest [32]byte, readCode ObjectErrorCode) *exactVerifier {
-	return &exactVerifier{ctx: ctx, source: source, expected: size, digest: digest, hash: sha256.New(), readCode: readCode}
+func newExactVerifierWithReadCode(
+	ctx context.Context,
+	source io.Reader,
+	size uint64,
+	digest [32]byte,
+	readCode ObjectErrorCode,
+) *exactVerifier {
+	return &exactVerifier{
+		ctx:      ctx,
+		source:   source,
+		expected: size,
+		digest:   digest,
+		hash:     sha256.New(),
+		readCode: readCode,
+	}
 }
+
+// Read passes through at most the bytes still promised, hashing what it sees.
+// Once the promised length is reached it stops handing the source a real buffer
+// and instead probes for the terminal EOF, so a source with more to give is
+// detected as oversized rather than silently truncated. A source reporting a
+// negative count, or more bytes than the slice it was handed, is rejected
+// outright: those counts cannot be hashed and would corrupt the accounting.
 func (v *exactVerifier) Read(p []byte) (int, error) {
 	if v.verified {
 		return 0, io.EOF
@@ -548,6 +644,11 @@ func (v *exactVerifier) Read(p []byte) (int, error) {
 	return v.finishRead(n, err)
 }
 
+// finishRead classifies the outcome of one source read. Cancellation wins over
+// any other classification, a wrapped EOF is a read failure, and a bare EOF
+// verifies only when both the length and the digest match. A source that
+// returns neither bytes nor an error is refused as no-progress rather than
+// spun on.
 func (v *exactVerifier) finishRead(n int, err error) (int, error) {
 	if v.ctx.Err() != nil {
 		v.failure = objectErr(ObjectErrorCanceled, "stream", v.ctx.Err())
@@ -565,7 +666,7 @@ func (v *exactVerifier) finishRead(n int, err error) (int, error) {
 			v.failure = objectErr(ObjectErrorSize, "stream", nil)
 			return n, v.failure
 		}
-		if !equalBytes(v.hash.Sum(nil), v.digest[:]) {
+		if !bytes.Equal(v.hash.Sum(nil), v.digest[:]) {
 			v.failure = objectErr(ObjectErrorIntegrity, "stream", nil)
 			return n, v.failure
 		}
@@ -579,17 +680,29 @@ func (v *exactVerifier) finishRead(n int, err error) (int, error) {
 	return n, nil
 }
 
-func equalBytes(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := range a {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
-}
-
+// objectReader is the caller-visible object stream. It owns one exactVerifier,
+// the provider reader beneath it, and the admission release, and it guarantees
+// each is finished exactly once no matter which of three events terminates the
+// stream first: the verifier failing or reaching terminal EOF, the caller
+// calling Close, or the operation context being canceled (Store shutdown or the
+// caller's own context).
+//
+// Concurrency contract. mu guards every field below it: cond, reading, closing,
+// done, primary, readErr, terminal, closeErr, and stopCancel. reading is true
+// only while a single goroutine is inside verifier.Read, which is what keeps the
+// unsynchronized exactVerifier single-consumer; a second Read waits for it.
+// Only the goroutine that flips closing from false to true owns termination and
+// calls completeTermination, so the provider Close and release run exactly once.
+// done means terminal and closeErr are final; every later call returns them
+// unchanged, so Close is idempotent with a stable error.
+//
+// Read may return n > 0 together with a terminal error. Those bytes are
+// unverified and must be discarded: integrity is established only by reading
+// through terminal EOF, which is exactly what io.ReadAll and io.Copy do.
+//
+// Close reports nil if and only if terminal EOF was observed and the provider
+// closed cleanly; abandoning a stream early is an integrity error, not a
+// convenience.
 type objectReader struct {
 	verifier   *exactVerifier
 	underlying io.Closer
@@ -606,6 +719,10 @@ type objectReader struct {
 	stopCancel func() bool
 }
 
+// Read serializes callers, performs one verifier read, and on any error becomes
+// the terminating goroutine if no one else already is. A caller that arrives
+// while termination is in flight waits for it and observes the same terminal
+// error.
 func (r *objectReader) Read(p []byte) (int, error) {
 	r.mu.Lock()
 	cond := r.condLocked()
@@ -652,6 +769,11 @@ func (r *objectReader) Read(p []byte) (int, error) {
 	}
 	return n, r.waitTerminal()
 }
+
+// Close terminates the stream if it is not already terminated and returns the
+// latched result: nil after a verified terminal EOF, otherwise the terminal
+// error, including ObjectErrorIntegrity for a stream the caller abandoned.
+// Repeat calls return the same value.
 func (r *objectReader) Close() error {
 	r.beginTermination(objectErr(ObjectErrorIntegrity, "incomplete", nil))
 	r.mu.Lock()
@@ -659,6 +781,10 @@ func (r *objectReader) Close() error {
 	return r.closeErr
 }
 
+// beginTermination starts termination with cause, or waits for the termination
+// already in flight. It is the single entry point for the two asynchronous
+// terminators, Close and the context AfterFunc, and it returns only once the
+// stream is done.
 func (r *objectReader) beginTermination(cause error) {
 	r.mu.Lock()
 	cond := r.condLocked()
@@ -679,6 +805,12 @@ func (r *objectReader) beginTermination(cause error) {
 	r.completeTermination()
 }
 
+// completeTermination runs exactly once, on the goroutine that won the
+// false-to-true transition of closing. It stops the cancellation hook, closes
+// the provider reader — which is what bounds a Read blocked inside the provider,
+// hence the storage.BlobReaderLifecycle requirement at Open — waits for any
+// in-flight read to land so its error can be joined, publishes the terminal
+// result, and releases admission last so Store.Close cannot outrun it.
 func (r *objectReader) completeTermination() {
 	r.mu.Lock()
 	stopCancel := r.stopCancel
@@ -698,7 +830,8 @@ func (r *objectReader) completeTermination() {
 		cond.Wait()
 	}
 	r.terminal = joinErrors(r.primary, r.readErr, wrappedClose)
-	if errors.Is(r.primary, io.EOF) {
+	// == not errors.Is, matching exactVerifier's identity-based EOF policy.
+	if r.primary == io.EOF {
 		r.closeErr = joinErrors(r.readErr, wrappedClose)
 	} else {
 		r.closeErr = r.terminal
@@ -709,6 +842,7 @@ func (r *objectReader) completeTermination() {
 	r.release()
 }
 
+// waitTerminal blocks until the terminal result is published and returns it.
 func (r *objectReader) waitTerminal() error {
 	r.mu.Lock()
 	cond := r.condLocked()
@@ -727,6 +861,11 @@ func (r *objectReader) condLocked() *sync.Cond {
 	return r.cond
 }
 
+// joinErrors differs from errors.Join in exactly one way, and that difference is
+// its entire reason to exist: a single non-nil error is returned as itself
+// rather than boxed in a join. Callers and tests compare the terminal error's
+// identity and format, so boxing a lone cause would change both. Do not
+// "simplify" this to errors.Join.
 func joinErrors(values ...error) error {
 	var result error
 	for _, value := range values {
