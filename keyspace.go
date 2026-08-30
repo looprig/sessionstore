@@ -36,6 +36,7 @@ type keyspace struct {
 }
 
 type sessionScope struct {
+	layout            keyspaceLayout
 	TenantNamespace   string
 	SessionNamespace  string
 	LedgerName        string
@@ -145,6 +146,7 @@ func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionw
 		}
 		prefix := "sessions/" + string(session)
 		return sessionScope{
+			layout:            layoutLegacySingleTenantV1,
 			SessionNamespace:  prefix,
 			LedgerName:        prefix,
 			LeaseName:         prefix,
@@ -162,6 +164,7 @@ func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionw
 	tenantNamespace := "tenants/" + tenantToken
 	sessionNamespace := tenantNamespace + "/sessions/" + sessionToken
 	return sessionScope{
+		layout:            layoutTenantV1,
 		TenantNamespace:   tenantNamespace,
 		SessionNamespace:  sessionNamespace,
 		LedgerName:        sessionNamespace + "/journal",
@@ -180,7 +183,10 @@ func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionw
 // verifySessionScope verifies collision bindings for an already-derived
 // canonical scope without creating metadata. A missing binding fails closed.
 func (s *Store) verifySessionScope(ctx context.Context, scope sessionScope) error {
-	if scope.tenantWitnessKey == "" {
+	if err := s.validateSessionScope(scope); err != nil {
+		return err
+	}
+	if scope.layout == layoutLegacySingleTenantV1 {
 		return nil
 	}
 	if err := s.keys.verifyWitness(ctx, scope.tenantWitnessKey, scope.tenantWitness); err != nil {
@@ -195,7 +201,10 @@ func (s *Store) verifySessionScope(ctx context.Context, scope sessionScope) erro
 // bindSessionScope create-only binds collision witnesses before a caller may
 // create any canonical session data. Legacy scopes require no witnesses.
 func (s *Store) bindSessionScope(ctx context.Context, scope sessionScope) error {
-	if scope.tenantWitnessKey == "" {
+	if err := s.validateSessionScope(scope); err != nil {
+		return err
+	}
+	if scope.layout == layoutLegacySingleTenantV1 {
 		return nil
 	}
 	if err := s.keys.bindWitness(ctx, scope.tenantWitnessKey, scope.tenantWitness); err != nil {
@@ -203,6 +212,25 @@ func (s *Store) bindSessionScope(ctx context.Context, scope sessionScope) error 
 	}
 	if err := s.keys.bindWitness(ctx, scope.sessionWitnessKey, scope.sessionWitness); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (s *Store) validateSessionScope(scope sessionScope) error {
+	if scope.layout != s.keys.layout {
+		return &KeyspaceError{Code: KeyspaceScopeInvalid}
+	}
+	switch scope.layout {
+	case layoutTenantV1:
+		if scope.tenantWitnessKey == "" || len(scope.tenantWitness) == 0 || scope.sessionWitnessKey == "" || len(scope.sessionWitness) == 0 {
+			return &KeyspaceError{Code: KeyspaceScopeInvalid}
+		}
+	case layoutLegacySingleTenantV1:
+		if scope.tenantWitnessKey != "" || len(scope.tenantWitness) != 0 || scope.sessionWitnessKey != "" || len(scope.sessionWitness) != 0 {
+			return &KeyspaceError{Code: KeyspaceScopeInvalid}
+		}
+	default:
+		return &KeyspaceError{Code: KeyspaceScopeInvalid}
 	}
 	return nil
 }

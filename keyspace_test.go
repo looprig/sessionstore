@@ -158,6 +158,12 @@ func TestLayoutMarkerBackendStateMachineAndOwnership(t *testing.T) {
 			return 0, &storage.ConflictError{Name: layoutMarkerKey, Expected: 7}
 		}, wantCode: KeyspaceBackend, wantGets: 1, wantPuts: 1},
 		{name: "conflict reread absent", get: notFoundGet, put: conflictPut, wantCode: KeyspaceMarkerAmbiguous, wantGets: 2, wantPuts: 1},
+		{name: "conflict reread wrong not-found key", get: func(n int) ([]byte, uint64, error) {
+			if n == 1 {
+				return notFoundGet(n)
+			}
+			return nil, 0, &storage.KeyNotFoundError{Key: "other"}
+		}, put: conflictPut, wantCode: KeyspaceBackend, wantGets: 2, wantPuts: 1},
 		{name: "conflict reread backend failure", get: func(n int) ([]byte, uint64, error) {
 			if n == 1 {
 				return notFoundGet(n)
@@ -264,6 +270,49 @@ func TestTenantSessionTokenGolden(t *testing.T) {
 	if got, want := scope.SessionNamespace, scope.TenantNamespace+"/sessions/0l176u4vnt2ldqnqa6el9mg3b9p0ulasj3tngninlj5ne6925fq0"; got != want {
 		t.Fatalf("SessionNamespace = %q, want %q", got, want)
 	}
+	wantFields := map[string]string{
+		"TenantNamespace":   scope.TenantNamespace,
+		"SessionNamespace":  scope.SessionNamespace,
+		"LedgerName":        scope.SessionNamespace + "/journal",
+		"JournalName":       scope.SessionNamespace + "/journal",
+		"LeaseName":         scope.SessionNamespace + "/lease",
+		"CatalogKey":        scope.SessionNamespace + "/catalog",
+		"CatalogListPrefix": scope.TenantNamespace + "/sessions/",
+		"BlobPrefix":        scope.SessionNamespace + "/blobs/",
+	}
+	gotFields := map[string]string{
+		"TenantNamespace": scope.TenantNamespace, "SessionNamespace": scope.SessionNamespace,
+		"LedgerName": scope.LedgerName, "JournalName": scope.JournalName,
+		"LeaseName": scope.LeaseName, "CatalogKey": scope.CatalogKey,
+		"CatalogListPrefix": scope.CatalogListPrefix, "BlobPrefix": scope.BlobPrefix,
+	}
+	for field, want := range wantFields {
+		got := gotFields[field]
+		if got != want {
+			t.Errorf("%s = %q, want %q", field, got, want)
+		}
+		validName := strings.TrimSuffix(got, "/")
+		if err := storage.ValidateName(validName); err != nil {
+			t.Errorf("ValidateName(%s %q): %v", field, validName, err)
+		}
+		if len(validName) > 512 {
+			t.Errorf("%s length = %d", field, len(validName))
+		}
+		if strings.Contains(got, "tenant-a") || strings.Contains(got, "session-a") {
+			t.Errorf("%s leaks raw identity: %q", field, got)
+		}
+	}
+}
+
+func TestCanonicalLeaseNameNeverUsesRawTenantID(t *testing.T) {
+	store := openTestStore(t)
+	scope, err := store.deriveSessionScope("RawTenantID", "RawSessionID")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(scope.LeaseName, "RawTenantID") || strings.Contains(scope.LeaseName, "RawSessionID") {
+		t.Fatalf("LeaseName leaks raw identity: %q", scope.LeaseName)
+	}
 }
 
 func TestWitnessEncodingGoldenAndTupleBoundaries(t *testing.T) {
@@ -346,6 +395,7 @@ func TestWitnessStateMachine(t *testing.T) {
 		{name: "conflict wrong name", gets: []exactGetResult{notFound(key)}, putErr: conflict("other", 0), wantCode: KeyspaceBackend, wantGets: 1, wantPuts: 1},
 		{name: "conflict wrong expected", gets: []exactGetResult{notFound(key)}, putErr: conflict(key, 9), wantCode: KeyspaceBackend, wantGets: 1, wantPuts: 1},
 		{name: "conflict then absent", gets: []exactGetResult{notFound(key), notFound(key)}, putErr: conflict(key, 0), wantCode: KeyspaceBindingAmbiguous, wantGets: 2, wantPuts: 1},
+		{name: "conflict then wrong not-found key", gets: []exactGetResult{notFound(key), notFound("other")}, putErr: conflict(key, 0), wantCode: KeyspaceBackend, wantGets: 2, wantPuts: 1},
 		{name: "conflict then backend error", gets: []exactGetResult{notFound(key), {err: sentinel}}, putErr: conflict(key, 0), wantCode: KeyspaceBackend, wantGets: 2, wantPuts: 1},
 		{name: "conflict then same", gets: []exactGetResult{notFound(key), {value: want, rev: 1}}, putErr: conflict(key, 0), wantGets: 2, wantPuts: 1},
 		{name: "conflict then different", gets: []exactGetResult{notFound(key), {value: []byte("different"), rev: 1}}, putErr: conflict(key, 0), wantCode: KeyspaceHashCollision, wantGets: 2, wantPuts: 1},
@@ -375,6 +425,16 @@ func TestWitnessStateMachine(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestVerifyWitnessWrongNotFoundKeyIsBackendError(t *testing.T) {
+	key := "sessionstore/witnesses/session/token"
+	kv := &exactScriptKV{getResults: []exactGetResult{{err: &storage.KeyNotFoundError{Key: "other"}}}}
+	err := (keyspace{kv: kv}).verifyWitness(context.Background(), key, []byte("wanted"))
+	assertKeyspaceCode(t, err, KeyspaceBackend)
+	if kv.getCalls != 1 || kv.putCalls != 0 {
+		t.Fatalf("calls Get=%d Put=%d, want 1/0", kv.getCalls, kv.putCalls)
 	}
 }
 
@@ -614,6 +674,9 @@ func TestLegacyLayoutRejectsForeignTenantAndNoncanonicalSession(t *testing.T) {
 	if scope.SessionNamespace != "sessions/123e4567-e89b-12d3-a456-426614174000" {
 		t.Fatalf("legacy namespace = %q", scope.SessionNamespace)
 	}
+	if scope.TenantNamespace != "" {
+		t.Fatalf("legacy tenant namespace = %q, want empty", scope.TenantNamespace)
+	}
 	if scope.LedgerName != scope.SessionNamespace {
 		t.Fatalf("legacy ledger = %q, want %q", scope.LedgerName, scope.SessionNamespace)
 	}
@@ -638,7 +701,7 @@ func TestLegacyLayoutRejectsForeignTenantAndNoncanonicalSession(t *testing.T) {
 		}
 	}
 	for label, name := range map[string]string{
-		"namespace": scope.SessionNamespace, "journal": scope.JournalName,
+		"tenant namespace": scope.TenantNamespace, "namespace": scope.SessionNamespace, "journal": scope.JournalName,
 		"ledger": scope.LedgerName, "lease": scope.LeaseName,
 		"catalog": scope.CatalogKey, "blobs": scope.BlobPrefix,
 	} {
@@ -673,6 +736,20 @@ func TestLegacyLayoutRejectsForeignTenantAndNoncanonicalSession(t *testing.T) {
 	}
 	if zero.SessionNamespace != "sessions/00000000-0000-0000-0000-000000000000" {
 		t.Fatalf("zero UUID namespace = %q", zero.SessionNamespace)
+	}
+}
+
+func TestVerifyAndBindRejectMalformedInternalScope(t *testing.T) {
+	store := openTestStore(t)
+	for name, scope := range map[string]sessionScope{
+		"zero":                        {},
+		"canonical without witnesses": {layout: layoutTenantV1},
+		"legacy with witness":         {layout: layoutLegacySingleTenantV1, tenantWitnessKey: "unexpected"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assertKeyspaceCode(t, store.verifySessionScope(context.Background(), scope), KeyspaceScopeInvalid)
+			assertKeyspaceCode(t, store.bindSessionScope(context.Background(), scope), KeyspaceScopeInvalid)
+		})
 	}
 }
 

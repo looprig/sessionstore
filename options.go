@@ -157,7 +157,8 @@ func WithProviderOwnership(closer ProviderCloser) Option {
 // released lifecycle contract is the standard io.Closer shape. Because
 // io.Closer has no context, ShutdownTimeout can release the Store lifecycle but
 // cannot force the underlying Close to return; its adapter goroutine may outlive
-// the Store until the provider eventually returns.
+// the Store until the provider eventually returns. Transfer takes effect only
+// after Open succeeds; a failed Open never closes the provider.
 func WithIOProviderOwnership(closer io.Closer) Option {
 	return func(cfg *config) error {
 		if isNilDynamic(reflect.ValueOf(closer)) {

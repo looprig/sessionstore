@@ -12,6 +12,7 @@ const (
 	KeyspaceMarkerAmbiguous  KeyspaceErrorCode = "marker_ambiguous"
 	KeyspaceBindingNotFound  KeyspaceErrorCode = "binding_not_found"
 	KeyspaceBindingAmbiguous KeyspaceErrorCode = "binding_ambiguous"
+	KeyspaceScopeInvalid     KeyspaceErrorCode = "scope_invalid"
 	KeyspaceHashCollision    KeyspaceErrorCode = "hash_collision"
 	KeyspaceLegacyTenant     KeyspaceErrorCode = "legacy_tenant"
 	KeyspaceLegacySession    KeyspaceErrorCode = "legacy_session"
