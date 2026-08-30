@@ -177,7 +177,10 @@ with no durable deadline. `ListDueGates` is the reader that closes that: it
 validates every due intent against the session's durable open projection and
 drops the ones that match nothing. It is a bounded read that takes no action —
 what a Host does about an expired gate is gate continuation, which this package
-does not yet implement.
+does not yet implement. It also has no continuation cursor yet: it returns one
+bounded page and never reports whether more work is due behind it, so a caller
+must not treat it as a sweep. Pagination is a later addition, which is why the
+request carries no resume position.
 
 Retiring an intent is a tombstone rather than an erasure: the record stays
 readable for audit, its identity can never be reused to reopen the same gate,

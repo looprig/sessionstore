@@ -808,10 +808,14 @@ func TestGateFailuresAreRedacted(t *testing.T) {
 	base.OrderedIndex = hostile
 	store := openStore(t, base)
 	openGateFixture(t, store)
+	// A due gate exists before the provider is armed, so the due page really
+	// reaches a session read and fails there rather than returning empty.
+	mustOpenGateOn(t, store, catalogTenant, catalogSession,
+		gateWithDeadline(testGate("gate-due", 5), catalogDeadline.Add(-time.Hour)))
 	secret := errors.New("provider path /var/secret/tenant-a/session-a/gate-a")
 	hostile.failGets(secret)
 
-	secrets := []string{"secret", "tenant-a", "session-a", "gate-a", "Confirm", "Proceed?"}
+	secrets := []string{"secret", "tenant-a", "session-a", "gate-a", "gate-due", "Confirm", "Proceed?"}
 	for name, call := range map[string]func() error{
 		"OpenGate": func() error {
 			_, err := store.OpenGate(context.Background(), OpenGateRequest{
@@ -828,6 +832,14 @@ func TestGateFailuresAreRedacted(t *testing.T) {
 		"ReadGates": func() error {
 			_, err := store.ReadGates(context.Background(), ReadGatesRequest{
 				TenantID: catalogTenant, SessionID: catalogSession,
+			})
+			return err
+		},
+		// The due page is the only multi-session surface here, so it is the one
+		// whose failures could name a session the caller never asked about.
+		"ListDueGates": func() error {
+			_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
+				DueAtOrBefore: catalogDeadline, Limit: 10,
 			})
 			return err
 		},
@@ -1194,5 +1206,192 @@ func TestListDueGatesChecksEveryRowsFiling(t *testing.T) {
 	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
 	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[1].ordering_scope" {
 		t.Fatalf("failure field = %q, want due_gates[1].ordering_scope", got.Field)
+	}
+}
+
+// --- provider-supplied keys are held to the record's own bytes ------------
+
+// moveGateIntentDue rewrites one intent's provider due state out of band,
+// leaving its stored bytes alone. It is the only way to present the reader with
+// a row whose filing disagrees with the record it files.
+func moveGateIntentDue(
+	t *testing.T,
+	store *Store,
+	tenant sessionwire.TenantID,
+	session sessionwire.SessionID,
+	gate sessionwire.GateID,
+	due time.Time,
+) {
+	t.Helper()
+	scope, err := store.deriveSessionScope(tenant, session)
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	id := gateIntentID(scope, gate)
+	stored, err := store.backend.OrderedIndex.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read intent: %v", err)
+	}
+	if _, err := store.backend.OrderedIndex.Update(
+		context.Background(), id, stored.Revision, stored.Value, storage.Rank{}, gateDue(due),
+	); err != nil {
+		t.Fatalf("move intent due: %v", err)
+	}
+}
+
+// TestListDueGatesRejectsAnIntentDueAtSomethingElse closes the third member of
+// the same family as the stable key and the ordering scope: the due time is a
+// provider-supplied key component, and a page that trusted it would report a
+// gate as expired because its INDEX said so while the record's own bytes named
+// a deadline a day away.
+func TestListDueGatesRejectsAnIntentDueAtSomethingElse(t *testing.T) {
+	store := openTestStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	mustOpenGateOn(t, store, catalogTenant, "session-1",
+		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(24*time.Hour)))
+	moveGateIntentDue(t, store, catalogTenant, "session-1", "gate-a", catalogDeadline.Add(-time.Hour))
+
+	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
+	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[0].due" {
+		t.Fatalf("failure field = %q, want due_gates[0].due", got.Field)
+	}
+}
+
+// TestListDueGatesRejectsAnIntentRankedIntoAnotherSession is the fourth member.
+// A ranking scope cannot be changed after a record is created, so a disagreeing
+// one can only arrive by a provider filing the record wrongly in the first
+// place — the same reachability class as a misfiled ordering scope.
+func TestListDueGatesRejectsAnIntentRankedIntoAnotherSession(t *testing.T) {
+	store := openTestStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
+	other, err := store.deriveSessionScope(catalogTenant, "session-2")
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	intent := gateIntent{
+		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-a",
+		OpenedEventID: "event-gate-a", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
+	}
+	scope, err := store.deriveSessionScope(catalogTenant, "session-1")
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	if _, _, err := store.backend.OrderedIndex.Create(
+		context.Background(), gateIntentID(scope, "gate-a"), other.SessionNamespace,
+		mustEncodeGateIntent(t, intent), storage.Rank{}, gateDue(intent.Deadline),
+	); err != nil {
+		t.Fatalf("seed intent: %v", err)
+	}
+
+	_, err = store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
+	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[0].ranking_scope" {
+		t.Fatalf("failure field = %q, want due_gates[0].ranking_scope", got.Field)
+	}
+}
+
+// --- a provider failure is never read as an absent session ----------------
+
+// TestListDueGatesDoesNotReadAProviderFailureAsAnAbsentSession is what keeps
+// noSuchSession narrow. Dropping a row is a claim that the session does not
+// exist; a provider that is merely failing supports no such claim, and a page
+// that returned empty here would report "nothing is due" during an outage.
+func TestListDueGatesDoesNotReadAProviderFailureAsAnAbsentSession(t *testing.T) {
+	store, hostile := openHostileListStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	mustOpenGateOn(t, store, catalogTenant, "session-1",
+		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(-time.Hour)))
+	if rows := mustListDueGates(t, store, catalogDeadline); len(rows) != 1 {
+		t.Fatalf("fixture is not due: %v", dueGateIDs(rows))
+	}
+
+	hostile.failGets(errors.New("provider unavailable"))
+	rows, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
+		DueAtOrBefore: catalogDeadline, Limit: 10,
+	})
+	if err == nil {
+		t.Fatalf("a failing provider produced %d due rows and no error", len(rows))
+	}
+	assertCatalogCode(t, err, CatalogErrorBackend)
+	if rows != nil {
+		t.Fatalf("a failed page returned rows: %v", dueGateIDs(rows))
+	}
+}
+
+// --- resolve completes what an interrupted resolve left -------------------
+
+// TestResolveGateRetiresAnIntentWhoseGateIsNoLongerProjected reaches the state
+// the unconditional retire exists for: the projection no longer names the gate
+// while its intent is still live and due. A resolve gated on finding the gate
+// would report success and leave the deadline in the due pages forever.
+func TestResolveGateRetiresAnIntentWhoseGateIsNoLongerProjected(t *testing.T) {
+	store := openTestStore(t)
+	openGateFixture(t, store)
+	mustOpenGate(t, store, 1, testGate("gate-a", 5))
+	// A wholesale re-projection clears the gate and deliberately leaves the
+	// intent alone, which is exactly what an interrupted resolve looks like.
+	if _, err := store.UpdateCatalogHostState(context.Background(), testHostStateRequest(1)); err != nil {
+		t.Fatalf("UpdateCatalogHostState: %v", err)
+	}
+	if due := gateIntentRecord(t, store, "gate-a").Due; due.State != storage.DueAt {
+		t.Fatalf("the fixture retired the intent already: %+v", due)
+	}
+
+	if _, err := store.ResolveGate(context.Background(), ResolveGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, GateID: "gate-a",
+	}); err != nil {
+		t.Fatalf("ResolveGate: %v", err)
+	}
+	retired := gateIntentRecord(t, store, "gate-a")
+	if retired.Due.State != storage.NotDue {
+		t.Fatalf("resolving left an unprojected gate's intent due: %+v", retired.Due)
+	}
+	if !retired.Deleted {
+		t.Fatal("the intent was not tombstoned")
+	}
+}
+
+// TestResolveGateReportsAFailedRetire pins the other half. Retiring the intent
+// is not best-effort: a resolve that could not reach it must say so, because
+// reporting success would leave a deadline that outlives the gate it belongs to
+// with nothing recording that anything is wrong.
+func TestResolveGateReportsAFailedRetire(t *testing.T) {
+	base := memstore.New()
+	failing := &intentFailingOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = failing
+	store := openStore(t, base)
+	openGateFixture(t, store)
+	mustOpenGate(t, store, 1, testGate("gate-a", 5))
+
+	secret := errors.New("provider path /var/secret/tenant-a/session-a/gate-a")
+	failing.failIntentGets(secret)
+	_, err := store.ResolveGate(context.Background(), ResolveGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, GateID: "gate-a",
+	})
+	assertCatalogCode(t, err, CatalogErrorBackend)
+	if !errors.Is(err, secret) {
+		t.Fatal("cause was not preserved for errors.Is")
+	}
+	for _, leak := range []string{"secret", "tenant-a", "session-a", "gate-a"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Fatalf("%q leaked into %q", leak, err.Error())
+		}
+	}
+	// Read the intent back through an unarmed provider: it must still be due,
+	// because a resolve that could not read it cannot have retired it.
+	failing.failIntentGets(nil)
+	if due := gateIntentRecord(t, store, "gate-a").Due; due.State != storage.DueAt {
+		t.Fatalf("the intent was retired by a resolve that failed: %+v", due)
+	}
+
+	// The failure is recoverable by repeating the resolve, which is the whole
+	// reason it is idempotent.
+	if _, err := store.ResolveGate(context.Background(), ResolveGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, GateID: "gate-a",
+	}); err != nil {
+		t.Fatalf("retried ResolveGate: %v", err)
+	}
+	if due := gateIntentRecord(t, store, "gate-a").Due; due.State != storage.NotDue {
+		t.Fatalf("the retry did not retire the intent: %+v", due)
 	}
 }

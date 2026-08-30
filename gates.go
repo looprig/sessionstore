@@ -373,7 +373,13 @@ func (s *Store) ReadGates(ctx context.Context, req ReadGatesRequest) (sessionwir
 // be the reader that validates it away rather than acting on it.
 //
 // It has no continuation cursor, which also means it cannot sweep: it answers
-// "what is due, up to this many rows" and nothing more.
+// "what is due, up to this many rows" and nothing more. That is deferred, not
+// overlooked. The reconciler this eventually serves is a Factory component that
+// claims a session and acts on it, and it will need to page — a LATER task adds
+// the continuation, which is why ListDueGatesRequest has no resume position and
+// DueGate has no place to carry one. Until then a caller must not assume a
+// sweep exists: this returns one bounded page and never reports whether more
+// work is due behind it.
 func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) ([]DueGate, error) {
 	limit, ok := s.pageLimit(req.Limit)
 	if !ok {
@@ -433,13 +439,12 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) ([]Du
 			}
 			sessions[key] = session
 		}
-		// The intent must be filed under the identity it claims, which is what
-		// holds a hashed provider key to the record's own bytes. It is checked
-		// for every row rather than once per session: the identity being
+		// The intent must be FILED as its own bytes say it should be. It is
+		// checked for every row rather than once per session: what is being
 		// verified belongs to the ROW, and a cached session would otherwise let
 		// a misfiled intent through behind a well-filed one.
-		if stored.ID.OrderingScope != session.scope.SessionNamespace {
-			return nil, locateCatalogError(catalogErr(CatalogErrorIdentity, "ordering_scope", nil), position)
+		if err := verifyGateIntentFiling(stored, intent, session.scope); err != nil {
+			return nil, locateCatalogError(err, position)
 		}
 		if session.entry == nil {
 			continue
@@ -457,6 +462,52 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) ([]Du
 		}
 	}
 	return due, nil
+}
+
+// verifyGateIntentFiling holds every provider-supplied key component of one
+// stored intent to what the record's own bytes say it should be.
+//
+// A due page is provider-driven: unlike a direct get, the reader does not name
+// the row it is about to read, it learns the row's identity FROM the row. So
+// each component the provider chose has to be reconciled with the record it
+// files, and the components are enumerated here rather than checked wherever
+// each one happens to be used, because the interesting failure is the one
+// nobody thought to check.
+//
+// The enumeration, and why each entry is or is not here:
+//
+//   - StableKey — the gate id. Checked, in gateIntentFor, where the value is
+//     decoded; a provider that hashes the key stores the original for exactly
+//     this comparison.
+//   - OrderingScope and RankingScope — the session's physical namespace, which
+//     is derived from the tenant and session the bytes name. Checked here.
+//     Neither can be changed after Create, so a disagreement means the record
+//     was filed wrongly to begin with.
+//   - Due — the gate's absolute deadline. Checked here, and the reason this
+//     function exists at all: a due page selects rows BY this field, so a
+//     reader that trusted it would report a gate as expired because the index
+//     said so while the record's own deadline was still a day away.
+//   - Namespace and the deleted flag are not record-derived: they echo the
+//     query this reader itself issued, and the bytes carry no counterpart to
+//     compare them against.
+//   - Rank is written as unranked and nothing ranks or reads gate intents, so a
+//     check would guard a view with no consumer.
+//   - Revision and Order are provider state with no meaning in the record.
+func verifyGateIntentFiling(stored storage.OrderedRecord, intent gateIntent, scope sessionScope) error {
+	if stored.ID.OrderingScope != scope.SessionNamespace {
+		return catalogErr(CatalogErrorIdentity, "ordering_scope", nil)
+	}
+	if stored.RankingScope != scope.SessionNamespace {
+		return catalogErr(CatalogErrorIdentity, "ranking_scope", nil)
+	}
+	// Compared as a whole value through the one conversion every writer uses,
+	// so the due STATE is covered as well as the instant: a not-due record
+	// carries a zero UnixMillis, which a bare millisecond comparison would
+	// accept for a gate whose deadline really is the epoch.
+	if stored.Due != gateDue(intent.Deadline) {
+		return catalogErr(CatalogErrorIdentity, "due", nil)
+	}
+	return nil
 }
 
 // dueSessionKey is the identity a due page caches a catalog record under. It is
