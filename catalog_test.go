@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -111,6 +112,36 @@ func assertNoCatalogRecord(t *testing.T, store *Store, tenant sessionwire.Tenant
 	}
 	if _, err := store.backend.OrderedIndex.Get(context.Background(), catalogID(scope, session)); !errors.As(err, new(*storage.OrderedRecordNotFoundError)) {
 		t.Fatalf("a rejected write left a record behind: %v", err)
+	}
+}
+
+// assertCatalogUnchanged fails unless the session's stored record is byte-for-
+// byte the one want names. It is the update-path counterpart to
+// assertNoCatalogRecord: on an update a record already exists, so "nothing was
+// written" is expressed as an unmoved revision plus an identical record rather
+// than as absence.
+func assertCatalogUnchanged(t *testing.T, store *Store, want CatalogEntry) {
+	t.Helper()
+	got, err := store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{
+		TenantID:  want.Record.TenantID,
+		SessionID: want.Record.SessionID,
+	})
+	if err != nil {
+		t.Fatalf("a rejected write corrupted the stored record: %v", err)
+	}
+	if got.Revision != want.Revision {
+		t.Fatalf("a rejected write advanced the revision %d -> %d", want.Revision, got.Revision)
+	}
+	wantBytes, err := encodeCatalogRecord(want.Record)
+	if err != nil {
+		t.Fatalf("encode expected record: %v", err)
+	}
+	gotBytes, err := encodeCatalogRecord(got.Record)
+	if err != nil {
+		t.Fatalf("encode stored record: %v", err)
+	}
+	if !bytes.Equal(wantBytes, gotBytes) {
+		t.Fatalf("a rejected write changed the record:\nwant %s\ngot  %s", wantBytes, gotBytes)
 	}
 }
 
@@ -433,6 +464,8 @@ func TestCatalogGetVerifiesBindingBeforeProvider(t *testing.T) {
 
 func TestCatalogReadVerifiesStoredIdentity(t *testing.T) {
 	base := memstore.New()
+	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = hostile
 	store, err := Open(context.Background(), base)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -440,7 +473,7 @@ func TestCatalogReadVerifiesStoredIdentity(t *testing.T) {
 	defer store.Close(context.Background())
 	mustCreateCatalog(t, store)
 
-	base.OrderedIndex = &corruptingOrdered{OrderedIndex: base.OrderedIndex, rewrite: func(value []byte) []byte {
+	hostile.corruptGets(func(value []byte) []byte {
 		record, err := decodeCatalogRecord(value)
 		if err != nil {
 			t.Fatalf("decode stored: %v", err)
@@ -451,8 +484,7 @@ func TestCatalogReadVerifiesStoredIdentity(t *testing.T) {
 			t.Fatalf("re-encode: %v", err)
 		}
 		return out
-	}}
-	store.backend = base
+	})
 
 	if _, err := store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{TenantID: catalogTenant, SessionID: catalogSession}); err == nil {
 		t.Fatal("Get accepted a record naming another session")
@@ -588,13 +620,7 @@ func TestCatalogUpdateRejectsLowerEpoch(t *testing.T) {
 		}
 	}
 
-	after, err := store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{TenantID: catalogTenant, SessionID: catalogSession})
-	if err != nil {
-		t.Fatalf("GetCatalogEntry: %v", err)
-	}
-	if after.Record.LeaseEpoch != 5 || after.Record.State != high.Record.State || after.Revision != high.Revision {
-		t.Fatalf("a rejected epoch still changed the record: %+v", after)
-	}
+	assertCatalogUnchanged(t, store, high)
 
 	// The same grant writes more than once, so the guard must reject a lower
 	// epoch and admit an equal one.
@@ -621,7 +647,7 @@ func TestCatalogUpdateRejectsLowerEpoch(t *testing.T) {
 
 func TestCatalogHostUpdateRequiresNonZeroEpoch(t *testing.T) {
 	store := openTestStore(t)
-	mustCreateCatalog(t, store)
+	created := mustCreateCatalog(t, store)
 	req := testHostStateRequest(0)
 	if _, err := store.UpdateCatalogHostState(context.Background(), req); err == nil {
 		t.Fatal("a zero lease epoch was accepted")
@@ -631,6 +657,7 @@ func TestCatalogHostUpdateRequiresNonZeroEpoch(t *testing.T) {
 			t.Fatalf("field = %q, want lease_epoch", got.Field)
 		}
 	}
+	assertCatalogUnchanged(t, store, created)
 }
 
 func TestCatalogHostUpdateRejectsJournalRegression(t *testing.T) {
@@ -638,7 +665,8 @@ func TestCatalogHostUpdateRejectsJournalRegression(t *testing.T) {
 	mustCreateCatalog(t, store)
 	forward := testHostStateRequest(2)
 	forward.LastJournalSeq = 20
-	if _, err := store.UpdateCatalogHostState(context.Background(), forward); err != nil {
+	advanced, err := store.UpdateCatalogHostState(context.Background(), forward)
+	if err != nil {
 		t.Fatalf("UpdateCatalogHostState: %v", err)
 	}
 	// Only the journal sequence regresses; the epoch advances, so the epoch
@@ -650,6 +678,9 @@ func TestCatalogHostUpdateRejectsJournalRegression(t *testing.T) {
 	} else {
 		assertCatalogCode(t, err, CatalogErrorSequence)
 	}
+	// Refusing after writing would be worse than not refusing at all: the
+	// caller is told the sequence was rejected while the store holds it.
+	assertCatalogUnchanged(t, store, advanced)
 }
 
 func TestFactoryOwnedFieldsUseRevisionNotHostEpoch(t *testing.T) {
@@ -711,6 +742,7 @@ func TestFactoryOwnedFieldsUseRevisionNotHostEpoch(t *testing.T) {
 			t.Fatalf("reported revision = %d, want %d", got.Revision, updated.Revision)
 		}
 	}
+	assertCatalogUnchanged(t, store, updated)
 
 	// A retry of the accepted write replays idempotently even though its
 	// expected revision is now stale by construction.
@@ -750,6 +782,7 @@ func TestCatalogDesiredStateRequiresIdempotencyKey(t *testing.T) {
 			t.Fatalf("field = %q, want idempotency_key", got.Field)
 		}
 	}
+	assertCatalogUnchanged(t, store, entry)
 }
 
 func TestCatalogConcurrentHostEpochsKeepTheHighWaterMark(t *testing.T) {
@@ -939,6 +972,8 @@ func TestCatalogClassifiesProviderFailures(t *testing.T) {
 
 func TestCatalogSurfacesProviderErrorsWithoutLeakingProviderText(t *testing.T) {
 	base := memstore.New()
+	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = hostile
 	store, err := Open(context.Background(), base)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -947,8 +982,7 @@ func TestCatalogSurfacesProviderErrorsWithoutLeakingProviderText(t *testing.T) {
 	mustCreateCatalog(t, store)
 
 	secret := errors.New("provider path /var/secret/tenant-a")
-	base.OrderedIndex = &failingOrdered{OrderedIndex: base.OrderedIndex, getErr: secret}
-	store.backend = base
+	hostile.failGets(secret)
 	_, err = store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{TenantID: catalogTenant, SessionID: catalogSession})
 	assertCatalogCode(t, err, CatalogErrorBackend)
 	if strings.Contains(err.Error(), "secret") || strings.Contains(err.Error(), "tenant-a") {
@@ -1031,6 +1065,17 @@ func TestCatalogBoundsOpaqueFields(t *testing.T) {
 		{"idempotency key at limit", "", func(r *CreateCatalogEntryRequest) { r.IdempotencyKey = atLimit }, true},
 		{"idempotency key too long", "desired_idempotency_key", func(r *CreateCatalogEntryRequest) { r.IdempotencyKey = tooLong }, false},
 		{"idempotency key invalid utf8", "desired_idempotency_key", func(r *CreateCatalogEntryRequest) { r.IdempotencyKey = invalidUTF8 }, false},
+		// State and Residency are caller-supplied too. Core deliberately
+		// accepts any non-empty value for forward compatibility, so this
+		// package is the only place they are bounded at all.
+		{"state at limit", "", func(r *CreateCatalogEntryRequest) { r.State = sessionwire.SessionState(atLimit) }, true},
+		{"state too long", "state", func(r *CreateCatalogEntryRequest) { r.State = sessionwire.SessionState(tooLong) }, false},
+		{"state invalid utf8", "state", func(r *CreateCatalogEntryRequest) { r.State = sessionwire.SessionState(invalidUTF8) }, false},
+		{"state empty", "state", func(r *CreateCatalogEntryRequest) { r.State = "" }, false},
+		{"residency at limit", "", func(r *CreateCatalogEntryRequest) { r.Residency = sessionwire.SessionResidency(atLimit) }, true},
+		{"residency too long", "residency", func(r *CreateCatalogEntryRequest) { r.Residency = sessionwire.SessionResidency(tooLong) }, false},
+		{"residency invalid utf8", "residency", func(r *CreateCatalogEntryRequest) { r.Residency = sessionwire.SessionResidency(invalidUTF8) }, false},
+		{"residency empty", "residency", func(r *CreateCatalogEntryRequest) { r.Residency = "" }, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1050,6 +1095,7 @@ func TestCatalogBoundsOpaqueFields(t *testing.T) {
 			if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != tt.field {
 				t.Fatalf("field = %q, want %q", got.Field, tt.field)
 			}
+			assertNoCatalogRecord(t, store, req.TenantID, req.SessionID)
 		})
 	}
 }
@@ -1143,14 +1189,247 @@ func TestCatalogHostUpdateValidatesProjectionsOnTheWritePath(t *testing.T) {
 			} else if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != tt.field {
 				t.Fatalf("field = %q, want %q", got.Field, tt.field)
 			}
-			after, err := store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{TenantID: catalogTenant, SessionID: catalogSession})
-			if err != nil {
-				t.Fatalf("the rejected write corrupted the stored record: %v", err)
-			}
-			if after.Revision != created.Revision || after.Record.LeaseEpoch != 0 ||
-				!after.Record.Checkpoint.isZero() || after.Record.OpenGates != nil {
-				t.Fatalf("a rejected write reached the record: rev=%d %+v", after.Revision, after.Record)
-			}
+			assertCatalogUnchanged(t, store, created)
 		})
+	}
+}
+
+// --- text validation across the whole record ------------------------------
+
+// richCatalogRecord has exactly one gate, and that gate populates every nested
+// text-bearing member core's GatePrompt can carry, so a walk over it reaches
+// options and controls rather than only the members the simple fixture sets.
+func richCatalogRecord() CatalogRecord {
+	gate := testGate("gate-a", 5)
+	gate.Prompt.Origin = "https://example.test"
+	gate.Prompt.Schema.Fields = []sessionwire.GatePromptField{{
+		Name:  "answer",
+		Label: "Answer",
+		Kind:  sessionwire.GateFieldKindSelect,
+		Options: []sessionwire.GatePromptOption{
+			{Value: "yes", Label: "Yes"},
+			{Value: "no", Label: "No"},
+		},
+		Default: json.RawMessage(`"yes"`),
+	}}
+	gate.Prompt.Controls = []sessionwire.GateControl{{Action: "submit", Label: "Submit"}}
+	record := testCatalogRecord()
+	record.OpenGates = []sessionwire.GateProjection{gate}
+	return record
+}
+
+func TestCatalogRejectsInvalidTextInNestedProjections(t *testing.T) {
+	const bad = "va\xfflue"
+	tests := []struct {
+		name  string
+		apply func(*sessionwire.GateProjection)
+	}{
+		{"kind", func(g *sessionwire.GateProjection) { g.Kind = bad }},
+		{"prompt title", func(g *sessionwire.GateProjection) { g.Prompt.Title = bad }},
+		{"prompt body", func(g *sessionwire.GateProjection) { g.Prompt.Body = bad }},
+		{"field name", func(g *sessionwire.GateProjection) { g.Prompt.Schema.Fields[0].Name = bad }},
+		{"field label", func(g *sessionwire.GateProjection) { g.Prompt.Schema.Fields[0].Label = bad }},
+		{"option value", func(g *sessionwire.GateProjection) { g.Prompt.Schema.Fields[0].Options[0].Value = bad }},
+		{"option label", func(g *sessionwire.GateProjection) { g.Prompt.Schema.Fields[0].Options[0].Label = bad }},
+		{"control action", func(g *sessionwire.GateProjection) { g.Prompt.Controls[0].Action = bad }},
+		{"control label", func(g *sessionwire.GateProjection) { g.Prompt.Controls[0].Label = bad }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store := openTestStore(t)
+			created := mustCreateCatalog(t, store)
+			gate := richCatalogRecord().OpenGates[0]
+			tt.apply(&gate)
+			req := testHostStateRequest(1)
+			req.OpenGates = []sessionwire.GateProjection{gate}
+			if _, err := store.UpdateCatalogHostState(context.Background(), req); err == nil {
+				t.Fatal("invalid UTF-8 in a nested projection was accepted")
+			} else {
+				got := assertCatalogCode(t, err, CatalogErrorInvalid)
+				if !strings.HasPrefix(got.Field, "open_gates") {
+					t.Fatalf("field = %q, want an open_gates path", got.Field)
+				}
+			}
+			assertCatalogUnchanged(t, store, created)
+		})
+	}
+}
+
+// textSite is one settable string-kinded location inside a record.
+type textSite struct {
+	path  string
+	value reflect.Value
+}
+
+// enumerateTextSites is the test's own independent walk. It deliberately does
+// not call the production validator: if both used one implementation, a blind
+// spot in that implementation would hide itself.
+func enumerateTextSites(value reflect.Value, path string, out *[]textSite) {
+	switch value.Kind() {
+	case reflect.String:
+		if value.CanSet() {
+			*out = append(*out, textSite{path: path, value: value})
+		}
+	case reflect.Pointer, reflect.Interface:
+		if !value.IsNil() {
+			enumerateTextSites(value.Elem(), path, out)
+		}
+	case reflect.Slice, reflect.Array:
+		// A []byte is JSON text re-emitted verbatim, not a Go string the
+		// marshaller can rewrite; it is covered by its own explicit case.
+		if value.Kind() == reflect.Slice && value.Type().Elem().Kind() == reflect.Uint8 {
+			return
+		}
+		for i := range value.Len() {
+			enumerateTextSites(value.Index(i), fmt.Sprintf("%s[%d]", path, i), out)
+		}
+	case reflect.Struct:
+		// time.Time carries a *Location whose interior is neither caller
+		// supplied nor stored.
+		if value.Type() == reflect.TypeOf(time.Time{}) {
+			return
+		}
+		for i := range value.NumField() {
+			name := value.Type().Field(i).Name
+			enumerateTextSites(value.Field(i), path+"."+name, out)
+		}
+	}
+}
+
+// TestCatalogTextValidationCoversEveryStringField is the guard against a fourth
+// round of this: it enumerates every settable string in a fully populated
+// record and requires that corrupting any one of them is refused. A new text
+// member added to this record, or to a sessionwire projection it embeds, fails
+// here until something validates it.
+//
+// Some members are enums or identities whose own validator rejects the corrupt
+// value before any text rule sees it. That is a covered field either way; this
+// test asserts coverage, not which rule provides it.
+func TestCatalogTextValidationCoversEveryStringField(t *testing.T) {
+	count := func() int {
+		record := richCatalogRecord()
+		var sites []textSite
+		enumerateTextSites(reflect.ValueOf(&record).Elem(), "record", &sites)
+		return len(sites)
+	}()
+	if count < 15 {
+		t.Fatalf("the enumerator found only %d text sites; it is not reaching the nested projections", count)
+	}
+	for i := range count {
+		record := richCatalogRecord()
+		var sites []textSite
+		enumerateTextSites(reflect.ValueOf(&record).Elem(), "record", &sites)
+		site := sites[i]
+		if _, err := encodeCatalogRecord(record); err != nil {
+			t.Fatalf("%s: the unmodified fixture does not encode: %v", site.path, err)
+		}
+		site.value.SetString(site.value.String() + "\xff")
+		if _, err := encodeCatalogRecord(record); err == nil {
+			t.Errorf("%s accepts invalid UTF-8 and would be stored rewritten", site.path)
+		}
+	}
+}
+
+func TestCatalogRetainsAdditiveGateMembersAndRedactsObjectReference(t *testing.T) {
+	valid, err := encodeCatalogRecord(richCatalogRecord())
+	if err != nil {
+		t.Fatalf("encodeCatalogRecord: %v", err)
+	}
+	// Additive members inside a sessionwire projection are retained and
+	// re-emitted: core captures them for forward compatibility, and the
+	// record-level strictness this package adds does not reach inside them.
+	withExtra := strings.Replace(string(valid), `"gate_id":"gate-a"`, `"future_member":"kept","gate_id":"gate-a"`, 1)
+	if withExtra == string(valid) {
+		t.Fatal("could not inject an additive gate member")
+	}
+	record, err := decodeCatalogRecord([]byte(withExtra))
+	if err != nil {
+		t.Fatalf("an additive gate member was rejected: %v", err)
+	}
+	reencoded, err := encodeCatalogRecord(record)
+	if err != nil {
+		t.Fatalf("re-encode: %v", err)
+	}
+	if !strings.Contains(string(reencoded), `"future_member":"kept"`) {
+		t.Fatalf("an additive gate member was dropped: %s", reencoded)
+	}
+	// An ObjectReference is core's declared redaction boundary, so an extra
+	// member there is dropped rather than proxied.
+	withLeak := strings.Replace(string(valid), `{"object_id":`, `{"provider_url":"https://leak.test/x","object_id":`, 1)
+	if withLeak == string(valid) {
+		t.Fatal("could not inject into the object reference")
+	}
+	leaked, err := decodeCatalogRecord([]byte(withLeak))
+	if err != nil {
+		t.Fatalf("object reference decode: %v", err)
+	}
+	out, err := encodeCatalogRecord(leaked)
+	if err != nil {
+		t.Fatalf("re-encode: %v", err)
+	}
+	if strings.Contains(string(out), "leak.test") {
+		t.Fatalf("a provider URL was proxied through the redaction boundary: %s", out)
+	}
+	// A member undeclared at the RECORD level is still refused outright.
+	withRecordExtra := strings.Replace(string(valid), `"record_version":1`, `"record_version":1,"future_record_member":1`, 1)
+	if withRecordExtra == string(valid) {
+		t.Fatal("could not inject a record member")
+	}
+	if _, err := decodeCatalogRecord([]byte(withRecordExtra)); err == nil {
+		t.Fatal("an undeclared record member was accepted")
+	} else {
+		assertCatalogCode(t, err, CatalogErrorMalformed)
+	}
+}
+
+// TestCatalogRawJSONTextValidityIsCoresRule pins the assumption that lets
+// validateProjectionText skip json.RawMessage: this package does not check the
+// text validity of raw JSON because core already refuses it on both paths that
+// can carry any. If either half of this stops holding, the skip in the walk
+// becomes a real gap and this test is where that surfaces.
+func TestCatalogRawJSONTextValidityIsCoresRule(t *testing.T) {
+	field := sessionwire.GatePromptField{
+		Name:    "answer",
+		Label:   "Answer",
+		Kind:    sessionwire.GateFieldKindText,
+		Default: json.RawMessage("\"a\xffb\""),
+	}
+	if err := field.Validate(); err == nil {
+		t.Fatal("core now accepts an invalid-UTF-8 prompt default; the walk must check raw JSON itself")
+	}
+
+	valid, err := encodeCatalogRecord(richCatalogRecord())
+	if err != nil {
+		t.Fatalf("encodeCatalogRecord: %v", err)
+	}
+	injected := strings.Replace(string(valid), `"gate_id":"gate-a"`, "\"future_member\":\"a\xffb\",\"gate_id\":\"gate-a\"", 1)
+	if injected == string(valid) {
+		t.Fatal("could not inject an additive member")
+	}
+	if _, err := decodeCatalogRecord([]byte(injected)); err == nil {
+		t.Fatal("an additive member carrying invalid UTF-8 was retained; the walk must check captured extensions itself")
+	}
+}
+
+func TestCatalogNormalizesAnEmptyGateListToAbsent(t *testing.T) {
+	store := openTestStore(t)
+	mustCreateCatalog(t, store)
+	req := testHostStateRequest(1)
+	// An empty-but-present slice is a distinct Go value from nil and would
+	// otherwise survive the clone, giving "no open gates" two spellings.
+	req.OpenGates = []sessionwire.GateProjection{}
+	written, err := store.UpdateCatalogHostState(context.Background(), req)
+	if err != nil {
+		t.Fatalf("UpdateCatalogHostState: %v", err)
+	}
+	if written.Record.OpenGates != nil {
+		t.Fatalf("an empty gate list was returned as %#v, want nil", written.Record.OpenGates)
+	}
+	read, err := store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{TenantID: catalogTenant, SessionID: catalogSession})
+	if err != nil {
+		t.Fatalf("GetCatalogEntry: %v", err)
+	}
+	if read.Record.OpenGates != nil {
+		t.Fatalf("a read returned %#v, want nil", read.Record.OpenGates)
 	}
 }

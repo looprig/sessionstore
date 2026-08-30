@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -39,6 +41,13 @@ const (
 	MaxCatalogRecordBytes = 256 << 10
 )
 
+// The relationship above is the reason classifyCatalogOrderedError has no arm
+// for storage.OrderedValueTooLargeError: this package refuses an oversized
+// record before the provider can. Prose cannot enforce that, so state it as an
+// unsigned constant that fails to compile if the catalog bound ever exceeds the
+// provider's.
+const _ = uint(storage.MaxOrderedValueBytes - MaxCatalogRecordBytes)
+
 // minRankableTime and maxRankableTime bound the instants whose UnixNano is
 // defined. The catalog ranks by LastActiveAt.UnixNano(), and time.Time.UnixNano
 // is documented as undefined outside this range, so a timestamp beyond it would
@@ -46,6 +55,8 @@ const (
 var (
 	minRankableTime = time.Unix(0, math.MinInt64).UTC()
 	maxRankableTime = time.Unix(0, math.MaxInt64).UTC()
+
+	timeType = reflect.TypeOf(time.Time{})
 )
 
 // CheckpointSummary is the bounded durable description of the active workspace
@@ -204,6 +215,13 @@ type UpdateCatalogHostStateRequest struct {
 // deliberately has no lease epoch member: desired state is guarded by revision
 // compare-and-swap plus a retry-stable idempotency key, because Factory does not
 // hold the Host's lease and must not be able to spell a claim on it.
+//
+// IdempotencyKey names the INTENT, and exactly one key is retained. A request
+// whose key equals the retained one is treated as a replay of that intent and
+// returns the stored record unchanged with a nil error — including when the
+// rest of the request differs. Reusing a key for a NEW intent therefore
+// succeeds without applying anything, so a caller must mint a fresh key per
+// distinct desired state rather than per retry batch.
 type UpdateCatalogDesiredStateRequest struct {
 	TenantID               sessionwire.TenantID
 	SessionID              sessionwire.SessionID
@@ -538,9 +556,17 @@ func encodeCatalogRecord(record CatalogRecord) ([]byte, error) {
 }
 
 // decodeCatalogRecord strictly decodes one stored catalog record. It checks the
-// catalog bound before decoding, rejects an unknown record version and any
-// undeclared member, and re-validates the decoded record so a record that was
-// corrupted in place cannot be handed to a caller.
+// catalog bound before decoding, rejects an unknown record version, and
+// re-validates the decoded record so a record corrupted in place cannot be
+// handed to a caller.
+//
+// Strictness is a RECORD-level property and stops at the record's own members:
+// an undeclared member of this record is refused outright. It deliberately does
+// not reach inside the nested sessionwire projections, which are additive by
+// design — core captures an unknown member of a GateProjection and re-emits it,
+// so a future gate member survives a round trip through an older reader. The
+// exceptions are core's own declared redaction boundaries, such as
+// ObjectReference, which drop an undeclared member rather than proxy it.
 func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 	if len(value) > MaxCatalogRecordBytes {
 		return CatalogRecord{}, catalogErr(CatalogErrorTooLarge, "record", nil)
@@ -617,11 +643,11 @@ func canonicalCatalogRecord(record CatalogRecord) (CatalogRecord, error) {
 	if err := validateOptionalOpaque(record.RuntimeCompatibilityID, "runtime_compatibility_id"); err != nil {
 		return CatalogRecord{}, err
 	}
-	if record.State == "" {
-		return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "state", nil)
+	if err := validateOpaque(string(record.State), "state"); err != nil {
+		return CatalogRecord{}, err
 	}
-	if record.Residency == "" {
-		return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "residency", nil)
+	if err := validateOpaque(string(record.Residency), "residency"); err != nil {
+		return CatalogRecord{}, err
 	}
 	switch record.DesiredPlacement {
 	case sessionwire.HostPlacementPooled, sessionwire.HostPlacementDedicated:
@@ -658,14 +684,32 @@ func canonicalCatalogRecord(record CatalogRecord) (CatalogRecord, error) {
 	record.LastActiveAt = record.LastActiveAt.UTC()
 	record.Checkpoint.CapturedAt = record.Checkpoint.CapturedAt.UTC()
 
-	if len(record.OpenGates) == 0 {
-		record.OpenGates = nil
-		return record, nil
+	gates, err := canonicalGates(record.OpenGates)
+	if err != nil {
+		return CatalogRecord{}, err
 	}
-	gates := slices.Clone(record.OpenGates)
+	record.OpenGates = gates
+	return record, nil
+}
+
+// canonicalGates validates the open-gate projections and returns them in the
+// record's canonical (opened_seq, gate_id) order.
+//
+// The empty case returns nil so an in-memory record has one spelling for "no
+// open gates"; slices.Clone would otherwise preserve an empty-but-present
+// slice. This is a normalization, not a guard: the encoded form omits an empty
+// list either way, so no test can observe its absence and none pretends to.
+func canonicalGates(open []sessionwire.GateProjection) ([]sessionwire.GateProjection, error) {
+	if len(open) == 0 {
+		return nil, nil
+	}
+	gates := slices.Clone(open)
 	for i := range gates {
 		if err := gates[i].Validate(); err != nil {
-			return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "open_gates", err)
+			return nil, catalogErr(CatalogErrorInvalid, "open_gates", err)
+		}
+		if err := validateProjectionText(reflect.ValueOf(gates[i]), "open_gates["+strconv.Itoa(i)+"]"); err != nil {
+			return nil, err
 		}
 		gates[i].Deadline = gates[i].Deadline.UTC()
 	}
@@ -680,34 +724,115 @@ func canonicalCatalogRecord(record CatalogRecord) (CatalogRecord, error) {
 	})
 	for i := 1; i < len(gates); i++ {
 		if gates[i].GateID == gates[i-1].GateID {
-			return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "open_gates", nil)
+			return nil, catalogErr(CatalogErrorInvalid, "open_gates", nil)
 		}
 	}
-	record.OpenGates = gates
-	return record, nil
+	return gates, nil
 }
 
-// validateOptionalOpaque bounds one optional caller-chosen opaque value. Both
-// such fields share it, so neither can drift away from the other.
+// validateOpaque bounds one required caller-chosen opaque value. Every such
+// field shares it, so none can drift away from the others.
 //
 // Valid UTF-8 is a durability requirement here rather than decoration:
 // json.Marshal silently substitutes U+FFFD for an invalid byte, so a value that
 // skipped this check would be persisted as something other than what the caller
-// wrote and read back as something the caller never supplied.
-func validateOptionalOpaque(value, field string) error {
-	if value == "" {
-		return nil
-	}
-	if len(value) > sessionwire.MaxIDBytes {
-		return catalogErr(CatalogErrorInvalid, field, nil)
-	}
-	if !utf8.ValidString(value) {
+// wrote and read back as something the caller never supplied. Core's own
+// projections cannot supply this rule — SessionSummary, SessionStatus, and
+// GateProjection all accept any non-empty State, Residency, or Kind so a future
+// wire version can add one — so this package is where these fields are bounded
+// at all.
+func validateOpaque(value, field string) error {
+	if value == "" || len(value) > sessionwire.MaxIDBytes || !utf8.ValidString(value) {
 		return catalogErr(CatalogErrorInvalid, field, nil)
 	}
 	return nil
 }
 
-// rankableTime reports whether t is a present instant whose UnixNano is defined.
+// validateOptionalOpaque is validateOpaque for a field whose absence is legal.
+func validateOptionalOpaque(value, field string) error {
+	if value == "" {
+		return nil
+	}
+	return validateOpaque(value, field)
+}
+
+// validateProjectionText rejects invalid UTF-8 anywhere inside a nested
+// sessionwire projection, reporting the JSON path that carries it.
+//
+// It walks rather than naming members on purpose. Core validates a
+// GateProjection's structure but deliberately not its text — prompt titles,
+// bodies, origins, field names and labels, option values and labels, and
+// control actions and labels are all caller-supplied and all unchecked — and
+// that list is a moving target: core may add a member in a later wire version,
+// and an enumeration here would silently stop covering the record the day it
+// does. The record's own top-level members are each validated explicitly above
+// and are deliberately NOT walked, so no field is checked twice.
+//
+// The walk terminates because the projection types are non-recursive: a
+// GateProjection contains a prompt, which contains fixed-size slices of leaf
+// structs, plus captured extension bytes.
+func validateProjectionText(value reflect.Value, path string) error {
+	switch value.Kind() {
+	case reflect.String:
+		if !utf8.ValidString(value.String()) {
+			return catalogErr(CatalogErrorInvalid, path, nil)
+		}
+	case reflect.Pointer, reflect.Interface:
+		if !value.IsNil() {
+			return validateProjectionText(value.Elem(), path)
+		}
+	case reflect.Slice, reflect.Array:
+		// A byte slice here is a json.RawMessage, and it is deliberately not
+		// checked. It is re-emitted verbatim rather than re-encoded, so no
+		// substitution can occur, and its text validity is already core's rule
+		// on both paths that can carry one: GatePromptField.Validate refuses an
+		// invalid Default, and an additive member carrying invalid UTF-8 is
+		// refused when the projection is decoded. A check here would be a second
+		// statement of a rule this package does not own. Both halves of that
+		// claim are pinned by TestCatalogRawJSONTextValidityIsCoresRule, so if
+		// core ever relaxes either one, this decision is revisited rather than
+		// silently wrong.
+		if value.Kind() == reflect.Slice && value.Type().Elem().Kind() == reflect.Uint8 {
+			return nil
+		}
+		for i := range value.Len() {
+			if err := validateProjectionText(value.Index(i), path+"["+strconv.Itoa(i)+"]"); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		for _, key := range value.MapKeys() {
+			member := path + "." + key.String()
+			if err := validateProjectionText(key, member); err != nil {
+				return err
+			}
+			if err := validateProjectionText(value.MapIndex(key), member); err != nil {
+				return err
+			}
+		}
+	case reflect.Struct:
+		// A time.Time's interior is a *Location that is neither caller supplied
+		// nor stored; its own validity is checked as an instant, not as text.
+		if value.Type() == timeType {
+			return nil
+		}
+		for i := range value.NumField() {
+			field := value.Type().Field(i)
+			name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+			if name == "" {
+				name = field.Name
+			}
+			if err := validateProjectionText(value.Field(i), path+"."+name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// rankableTime reports whether t is an instant whose UnixNano is defined. The
+// zero Time is already earlier than minRankableTime, so it needs no separate
+// case: "unset" and "unrepresentable" are one rejection here, not two.
 func rankableTime(t time.Time) bool {
-	return !t.IsZero() && !t.Before(minRankableTime) && !t.After(maxRankableTime)
+	return !t.Before(minRankableTime) && !t.After(maxRankableTime)
 }

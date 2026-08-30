@@ -121,55 +121,50 @@ func (k *keysCountingKV) Keys(ctx context.Context, prefix string) ([]string, err
 	return k.KV.Keys(ctx, prefix)
 }
 
-// failingOrdered substitutes a provider outcome for one operation so the
-// catalog's error classification can be exercised without a live backend.
-type failingOrdered struct {
+// hostileOrdered is composed into the backend at Open and starts inert, then a
+// test arms it once its fixture is in place. Arming beats swapping Store.backend
+// after Open: a test that reaches into store internals is testing a state the
+// production lifecycle never produces.
+type hostileOrdered struct {
 	storage.OrderedIndex
-	getErr    error
-	createErr error
-	updateErr error
-}
 
-func (o *failingOrdered) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
-	if o.getErr != nil {
-		return storage.OrderedRecord{}, o.getErr
-	}
-	return o.OrderedIndex.Get(ctx, id)
-}
-
-func (o *failingOrdered) Create(ctx context.Context, id storage.OrderedID, rankingScope string, value []byte, rank storage.Rank, due storage.Due) (storage.OrderedRecord, bool, error) {
-	if o.createErr != nil {
-		return storage.OrderedRecord{}, false, o.createErr
-	}
-	return o.OrderedIndex.Create(ctx, id, rankingScope, value, rank, due)
-}
-
-func (o *failingOrdered) Update(ctx context.Context, id storage.OrderedID, expectedRevision uint64, value []byte, rank storage.Rank, due storage.Due) (storage.OrderedRecord, error) {
-	if o.updateErr != nil {
-		return storage.OrderedRecord{}, o.updateErr
-	}
-	return o.OrderedIndex.Update(ctx, id, expectedRevision, value, rank, due)
-}
-
-// corruptingOrdered rewrites the stored value a Get returns, so a read can be
-// held to the identity the record itself claims rather than to the identity the
-// caller happened to ask for.
-type corruptingOrdered struct {
-	storage.OrderedIndex
+	mu      sync.Mutex
+	getErr  error
 	rewrite func([]byte) []byte
 }
 
-func (o *corruptingOrdered) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
+// failGets makes every later Get return err.
+func (o *hostileOrdered) failGets(err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.getErr = err
+}
+
+// corruptGets rewrites the stored value every later Get returns, so a read can
+// be held to the identity the record itself claims rather than to the identity
+// the caller happened to ask for.
+func (o *hostileOrdered) corruptGets(rewrite func([]byte) []byte) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.rewrite = rewrite
+}
+
+func (o *hostileOrdered) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
+	o.mu.Lock()
+	getErr, rewrite := o.getErr, o.rewrite
+	o.mu.Unlock()
+	if getErr != nil {
+		return storage.OrderedRecord{}, getErr
+	}
 	record, err := o.OrderedIndex.Get(ctx, id)
-	if err != nil || o.rewrite == nil {
+	if err != nil || rewrite == nil {
 		return record, err
 	}
-	record.Value = o.rewrite(record.Value)
+	record.Value = rewrite(record.Value)
 	return record, nil
 }
 
 var (
 	_ storage.OrderedIndex = (*recordingOrdered)(nil)
-	_ storage.OrderedIndex = (*failingOrdered)(nil)
-	_ storage.OrderedIndex = (*corruptingOrdered)(nil)
+	_ storage.OrderedIndex = (*hostileOrdered)(nil)
 )
