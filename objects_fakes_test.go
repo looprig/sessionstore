@@ -232,4 +232,13 @@ func objectErrorCodes(err error) map[ObjectErrorCode]bool {
 	return result
 }
 
-var _ storage.BlobReaderLifecycle = (*scriptedBlobs)(nil)
+// Every Blobs fake must satisfy the capability Open requires, not just one.
+var (
+	_ storage.BlobReaderLifecycle = (*scriptedBlobs)(nil)
+	_ storage.BlobReaderLifecycle = (*bindingCheckingBlobs)(nil)
+	_ storage.BlobReaderLifecycle = (*countingBlobs)(nil)
+	_ storage.BlobReaderLifecycle = (*adminRecordingBlobs)(nil)
+	_ storage.BlobReaderLifecycle = (*countAllBlobs)(nil)
+	_ storage.BlobReaderLifecycle = (*closeCapableBlobs)(nil)
+	_ storage.BlobReaderLifecycle = lifecycleBlobs{}
+)

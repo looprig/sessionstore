@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -650,5 +651,54 @@ func TestObjectReaderConcurrentReadsAndCloseTerminateOnce(t *testing.T) {
 		if first, second := reader.Close(), reader.Close(); first != second {
 			t.Fatalf("iteration %d: Close is not stable: %v then %v", iteration, first, second)
 		}
+	}
+}
+
+// TestGetObjectRejectsProviderErrorWrappingEOF pins the identity-based EOF
+// policy where it decides an integrity outcome. A provider that returns an
+// error merely wrapping io.EOF on byte-perfect content has reported something
+// besides end of stream, so the stream is unverified: completeTermination must
+// compare with == and not errors.Is, or Close reports success on data that was
+// never verified.
+func TestGetObjectRejectsProviderErrorWrappingEOF(t *testing.T) {
+	body := []byte("persisted")
+	digest := sha256.Sum256(body)
+	base := memstore.New()
+	gets := 0
+	script := &scriptedBlobs{lifecycleBlobs: lifecycleBlobs{base.Blobs}, putFn: drainPut, getFn: func(string) (io.ReadCloser, error) {
+		gets++
+		if gets == 1 {
+			return io.NopCloser(bytes.NewReader(body)), nil
+		}
+		sent := false
+		return &readCloser{Reader: readerFunc(func(p []byte) (int, error) {
+			if sent {
+				return 0, io.EOF
+			}
+			sent = true
+			return copy(p, body), fmt.Errorf("provider drained: %w", io.EOF)
+		})}, nil
+	}}
+	base.Blobs = script
+	store, err := Open(context.Background(), base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close(context.Background())
+	metadata, err := store.PutObject(context.Background(), PutObjectRequest{TenantID: "tenant", SessionID: "session", Kind: ObjectKindArtifact, SizeBytes: uint64(len(body)), SHA256: digest, Body: bytes.NewReader(body)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := store.GetObject(context.Background(), GetObjectRequest{TenantID: "tenant", SessionID: "session", ExpectedKind: ObjectKindArtifact, Metadata: metadata})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(reader); err == nil {
+		t.Fatal("read of a stream whose provider wrapped io.EOF reached success")
+	}
+	closeErr := reader.Close()
+	var objErr *ObjectError
+	if !errors.As(closeErr, &objErr) || objErr.Code != ObjectErrorBackend {
+		t.Fatalf("Close = %T %v, want a backend failure, not success on unverified data", closeErr, closeErr)
 	}
 }

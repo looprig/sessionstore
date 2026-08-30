@@ -848,7 +848,11 @@ func (r *objectReader) completeTermination() {
 		cond.Wait()
 	}
 	r.terminal = joinErrors(r.primary, r.readErr, wrappedClose)
-	// == not errors.Is, matching exactVerifier's identity-based EOF policy.
+	// == and not errors.Is, matching exactVerifier's identity-based EOF policy.
+	// Only a bare io.EOF means the stream was verified through its terminal
+	// EOF. A provider error that merely wraps io.EOF reaches here as an
+	// *ObjectError whose cause chain contains io.EOF, and errors.Is would
+	// therefore report Close success on content this store never verified.
 	if r.primary == io.EOF {
 		r.closeErr = joinErrors(r.readErr, wrappedClose)
 	} else {

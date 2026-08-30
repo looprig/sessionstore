@@ -56,5 +56,12 @@ func FuzzExactVerifier(f *testing.F) {
 		if (err == nil) != wantSuccess || verifier.verified != wantSuccess {
 			t.Fatalf("len=%d size=%d matching=%v err=%v verified=%v wantSuccess=%v", len(body), size, matching, err, verifier.verified, wantSuccess)
 		}
+		// Reading to a nil error must imply verification. verifyPersisted
+		// relies on exactly this to have no separate "copied but unverified"
+		// branch, so the implication is asserted here rather than argued in a
+		// comment.
+		if err == nil && !verifier.verified {
+			t.Fatalf("drained without error but unverified: len=%d size=%d matching=%v", len(body), size, matching)
+		}
 	})
 }
