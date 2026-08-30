@@ -698,6 +698,9 @@ func (b *scriptedBlobs) Get(_ context.Context, key string) (io.ReadCloser, error
 	}
 	return b.Blobs.Get(context.Background(), key)
 }
+func (b *scriptedBlobs) BlobReaderCloseBound() time.Duration {
+	return forwardBlobReaderCloseBound(b.Blobs)
+}
 
 type bindingCheckingBlobs struct {
 	storage.Blobs
@@ -714,6 +717,9 @@ func (b *bindingCheckingBlobs) Put(ctx context.Context, key string, r io.Reader)
 func (b *bindingCheckingBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	b.gets++
 	return b.Blobs.Get(ctx, key)
+}
+func (b *bindingCheckingBlobs) BlobReaderCloseBound() time.Duration {
+	return forwardBlobReaderCloseBound(b.Blobs)
 }
 
 type errorReader struct{}
@@ -760,6 +766,9 @@ func (b *countingBlobs) Put(ctx context.Context, key string, r io.Reader) error 
 func (b *countingBlobs) Get(ctx context.Context, key string) (io.ReadCloser, error) {
 	b.gets++
 	return b.Blobs.Get(ctx, key)
+}
+func (b *countingBlobs) BlobReaderCloseBound() time.Duration {
+	return forwardBlobReaderCloseBound(b.Blobs)
 }
 
 func objectMetadata(kind ObjectKind, generation [16]byte, size uint64, digest [32]byte, mediaType string) sessionwire.ObjectMetadata {

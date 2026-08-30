@@ -15,6 +15,22 @@ Production imports are intentionally limited to the Go standard library, Core, a
 Storage. Published module files use exact released versions and contain no local
 `replace` directives or vendor tree.
 
+## Provider compatibility
+
+`Open` requires the backend's `Blobs` primitive to implement Storage's optional
+`BlobReaderLifecycle` capability, be a concrete non-nil implementation, and
+advertise a positive close bound. This lets Store shutdown stop an outstanding
+object read before an explicitly owned provider is closed. The reader close bound
+and `WithShutdownTimeout` cover separate shutdown phases and are not compared.
+
+Storage v0.6.0's memory backend and natsstore v0.5.1 satisfy the requirement.
+fsstore v0.5.1 intentionally does not claim bounded reader shutdown and is
+rejected with `*InvalidBackendError` naming `BlobReaderLifecycle`. Any other
+provider is compatible only after it implements the capability and its
+provider-specific blocked-I/O proof. Capability rejection happens before layout
+marker or other provider I/O; a provider passed to a failed `Open` remains
+caller-owned.
+
 ## Layout compatibility
 
 An unmarked backend is atomically initialized as the tenant-scoped `tenant-v1`

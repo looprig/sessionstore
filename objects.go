@@ -189,10 +189,11 @@ func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwir
 
 // GetObject returns a lifecycle-held verified stream. A caller establishes
 // integrity only by reading through terminal EOF; premature Close is an error.
-// Provider readers must make concurrent Close unblock Read so Store shutdown
-// can cancel outstanding streams before closing an owned provider. A shutdown-
-// triggered reader Close error is latched on that reader; Store.Close orders the
-// cleanup but does not aggregate an error from a reader the caller abandoned.
+// Open requires storage.BlobReaderLifecycle so concurrent Close bounds an active
+// provider Read and Store shutdown can cancel outstanding streams before closing
+// an owned provider. A shutdown-triggered reader Close error is latched on that
+// reader; Store.Close orders the cleanup but does not aggregate an error from a
+// reader the caller abandoned.
 func (s *Store) GetObject(ctx context.Context, req GetObjectRequest) (io.ReadCloser, error) {
 	if !req.ExpectedKind.valid() {
 		return nil, objectErr(ObjectErrorInvalid, "expected_kind", nil)

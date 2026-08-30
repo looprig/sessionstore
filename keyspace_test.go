@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/storage"
@@ -1155,6 +1156,9 @@ func (c *countAllBlobs) Delete(ctx context.Context, key string) error {
 func (c *countAllBlobs) List(ctx context.Context, prefix string) ([]string, error) {
 	c.calls.blobs.Add(1)
 	return c.Blobs.List(ctx, prefix)
+}
+func (c *countAllBlobs) BlobReaderCloseBound() time.Duration {
+	return forwardBlobReaderCloseBound(c.Blobs)
 }
 
 type countAllOrdered struct {

@@ -3,6 +3,7 @@ package sessionstore
 import (
 	"context"
 	"log/slog"
+	"reflect"
 	"sync"
 	"time"
 
@@ -33,9 +34,10 @@ type Store struct {
 	closeErr         error
 }
 
-// Open constructs a Store over a complete storage composite. Before publishing
-// a Store or starting its lifecycle it atomically establishes the immutable
-// backend keyspace marker.
+// Open constructs a Store over a complete storage composite whose Blobs
+// primitive provides bounded reader shutdown. Before provider I/O, publishing a
+// Store, or starting its lifecycle, it validates that capability; it then
+// atomically establishes the immutable backend keyspace marker.
 func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Store, error) {
 	if backend == nil {
 		return nil, &InvalidBackendError{Component: "Composite"}
@@ -54,6 +56,10 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 	}
 	if backend.Blobs == nil {
 		return nil, &InvalidBackendError{Component: "Blobs"}
+	}
+	blobLifecycle, ok := backend.Blobs.(storage.BlobReaderLifecycle)
+	if !ok || isNilDynamic(reflect.ValueOf(blobLifecycle)) || blobLifecycle.BlobReaderCloseBound() <= 0 {
+		return nil, &InvalidBackendError{Component: "BlobReaderLifecycle"}
 	}
 	cfg := defaultConfig()
 	for _, option := range opts {

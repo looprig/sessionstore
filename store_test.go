@@ -55,6 +55,94 @@ func TestOpenRejectsMissingPrimitive(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsInvalidBlobReaderLifecycleBeforeProviderIO(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		blobs          func(storage.Blobs, *atomic.Int32) storage.Blobs
+		wantBoundCalls int32
+	}{
+		{
+			name: "missing capability",
+			blobs: func(blobs storage.Blobs, _ *atomic.Int32) storage.Blobs {
+				return &baseOnlyBlobs{Blobs: blobs}
+			},
+		},
+		{
+			name: "dynamic typed nil capability",
+			blobs: func(_ storage.Blobs, _ *atomic.Int32) storage.Blobs {
+				var blobs *boundedLifecycleBlobs
+				return blobs
+			},
+		},
+		{
+			name: "zero bound",
+			blobs: func(blobs storage.Blobs, calls *atomic.Int32) storage.Blobs {
+				return &boundedLifecycleBlobs{Blobs: blobs, boundCalls: calls}
+			},
+			wantBoundCalls: 1,
+		},
+		{
+			name: "negative bound",
+			blobs: func(blobs storage.Blobs, calls *atomic.Int32) storage.Blobs {
+				return &boundedLifecycleBlobs{Blobs: blobs, bound: -time.Nanosecond, boundCalls: calls}
+			},
+			wantBoundCalls: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			base := memstore.New()
+			backend, providerCalls := instrumentComposite(base)
+			var boundCalls atomic.Int32
+			backend.Blobs = test.blobs(backend.Blobs, &boundCalls)
+			closer := &recordingCloser{}
+
+			store, err := Open(context.Background(), backend, WithProviderOwnership(closer))
+			if store != nil {
+				t.Fatal("Open returned a Store for an invalid Blob reader lifecycle")
+			}
+			var invalid *InvalidBackendError
+			if !errors.As(err, &invalid) || invalid.Component != "BlobReaderLifecycle" {
+				t.Fatalf("Open error = %T %v, want BlobReaderLifecycle *InvalidBackendError", err, err)
+			}
+			if got := boundCalls.Load(); got != test.wantBoundCalls {
+				t.Fatalf("BlobReaderCloseBound calls = %d, want %d", got, test.wantBoundCalls)
+			}
+			if got := providerCalls.snapshot(); got != (providerCallSnapshot{}) {
+				t.Fatalf("provider calls before rejection = %+v, want zero", got)
+			}
+			if got := closer.calls.Load(); got != 0 {
+				t.Fatalf("transferred provider Close calls = %d, want zero", got)
+			}
+			if _, _, markerErr := base.KV.Get(context.Background(), layoutMarkerKey); !isKeyNotFound(markerErr, layoutMarkerKey) {
+				t.Fatalf("layout marker after rejection = %v, want absent", markerErr)
+			}
+		})
+	}
+}
+
+func TestOpenAcceptsPositiveBlobReaderLifecycleIndependentOfShutdownTimeout(t *testing.T) {
+	t.Parallel()
+
+	backend := memstore.New()
+	var boundCalls atomic.Int32
+	backend.Blobs = &boundedLifecycleBlobs{Blobs: backend.Blobs, bound: time.Hour, boundCalls: &boundCalls}
+	store, err := Open(context.Background(), backend, WithShutdownTimeout(time.Nanosecond))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if got := boundCalls.Load(); got != 1 {
+		t.Fatalf("BlobReaderCloseBound calls = %d, want 1", got)
+	}
+	if err := store.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
 func TestOpenPreservesStorageTypedNilSemantics(t *testing.T) {
 	t.Parallel()
 
@@ -668,6 +756,26 @@ type closeCapableBlobs struct {
 }
 
 func (p *closeCapableBlobs) Close(ctx context.Context) error { return p.closer.Close(ctx) }
+func (p *closeCapableBlobs) BlobReaderCloseBound() time.Duration {
+	return forwardBlobReaderCloseBound(p.Blobs)
+}
+
+type baseOnlyBlobs struct{ storage.Blobs }
+
+type boundedLifecycleBlobs struct {
+	storage.Blobs
+	bound      time.Duration
+	boundCalls *atomic.Int32
+}
+
+func (b *boundedLifecycleBlobs) BlobReaderCloseBound() time.Duration {
+	b.boundCalls.Add(1)
+	return b.bound
+}
+
+func forwardBlobReaderCloseBound(blobs storage.Blobs) time.Duration {
+	return blobs.(storage.BlobReaderLifecycle).BlobReaderCloseBound()
+}
 
 func (c *recordingCloser) Close(ctx context.Context) error {
 	c.calls.Add(1)

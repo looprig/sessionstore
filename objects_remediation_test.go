@@ -670,6 +670,9 @@ func (b *adminRecordingBlobs) Delete(ctx context.Context, key string) error {
 	}
 	return b.Blobs.Delete(ctx, key)
 }
+func (b *adminRecordingBlobs) BlobReaderCloseBound() time.Duration {
+	return forwardBlobReaderCloseBound(b.Blobs)
+}
 
 type blockingReadCloser struct {
 	started    chan struct{}
@@ -759,4 +762,4 @@ func objectErrorCodes(err error) map[ObjectErrorCode]bool {
 	return result
 }
 
-var _ storage.Blobs = (*scriptedBlobs)(nil)
+var _ storage.BlobReaderLifecycle = (*scriptedBlobs)(nil)

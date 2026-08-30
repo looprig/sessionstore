@@ -39,8 +39,9 @@ type InvalidIdentityError struct {
 func (e *InvalidIdentityError) Error() string { return "sessionstore: invalid " + e.Field }
 func (e *InvalidIdentityError) Unwrap() error { return e.Cause }
 
-// InvalidBackendError reports a storage component that was not wired at Open.
-// Component is one of Composite, Ledger, Leaser, KV, OrderedIndex, or Blobs.
+// InvalidBackendError reports a storage component or required capability that
+// was not wired at Open. Component is one of Composite, Ledger, Leaser, KV,
+// OrderedIndex, Blobs, or BlobReaderLifecycle.
 type InvalidBackendError struct {
 	Component string
 }
