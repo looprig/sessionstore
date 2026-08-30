@@ -4,8 +4,9 @@
 *.test
 coverage.txt
 
-# Fuzz corpora regenerated locally
-testdata/fuzz/
+# Go's fuzzing cache lives in GOCACHE, not here: testdata/fuzz holds the seed
+# corpus, including crashers a fuzz run writes out, and those must be
+# committable so a reproducer is never silently discarded.
 
 # Editor/OS cruft
 .DS_Store

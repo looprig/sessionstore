@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
-.PHONY: test fmt fmt-check vet staticcheck gosec vuln secure check build
+.PHONY: test fuzz fmt fmt-check vet staticcheck gosec vuln secure check build
 
 GOFILES = GOWORK=off go run ./internal/modfiles/cmd/modfiles -root .
 
@@ -31,9 +31,22 @@ vuln:
 	GOWORK=off go mod verify
 	GOWORK=off go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
 
+# Fuzz targets are shaped correctly but only ever executed their seed corpus
+# under `go test`, so a reachable panic could sit behind a green check. Run each
+# target for a bounded time as part of check; a crasher is written to
+# testdata/fuzz and is committable.
+FUZZTIME ?= 30s
+FUZZ_TARGETS = $(shell GOWORK=off go test -list '^Fuzz' . | grep '^Fuzz')
+
+fuzz:
+	@for target in $(FUZZ_TARGETS); do \
+		echo "GOWORK=off go test -run ^$$target$$ -fuzz ^$$target$$ -fuzztime $(FUZZTIME) ."; \
+		GOWORK=off go test -run "^$$target$$" -fuzz "^$$target$$" -fuzztime $(FUZZTIME) . || exit 1; \
+	done
+
 secure: fmt-check vet staticcheck gosec vuln
 
 build:
 	GOWORK=off go build ./...
 
-check: fmt-check vet staticcheck gosec vuln test build
+check: fmt-check vet staticcheck gosec vuln test fuzz build

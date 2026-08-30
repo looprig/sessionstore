@@ -287,7 +287,11 @@ func encodeObjectGeneration(generation [16]byte) string {
 }
 
 // decodeObjectGeneration is the inverse of encodeObjectGeneration and rejects
-// any noncanonical spelling, including uppercase and a wrong length.
+// any noncanonical spelling, including uppercase and a wrong length. Unlike
+// decodeObjectDigest it needs no explicit length precondition, because
+// base32.Encoding.DecodeString allocates its own destination rather than
+// writing into a fixed array; the canonical re-encode below is what rejects a
+// wrong length here.
 func decodeObjectGeneration(value string) ([16]byte, error) {
 	decoded, err := objectGenerationEncoding.DecodeString(strings.ToUpper(value))
 	if err != nil {
@@ -307,8 +311,22 @@ func decodeObjectGeneration(value string) ([16]byte, error) {
 // decodeObjectDigest rejects a noncanonical or all-zero content digest. An
 // all-zero digest is never minted, so accepting one would name a key the store
 // cannot have written.
+//
+// The length check is a memory-safety precondition, NOT a redundant restatement
+// of the canonical round trip below, and must not be deleted as one. hex.Decode
+// writes len(src)/2 bytes into the destination and does not bound them by its
+// capacity, so any value longer than hex.EncodedLen(32) indexes past the end of
+// this fixed array and panics. The input is caller-controlled: sessionwire's
+// ObjectReference.Validate caps only the whole ObjectID at MaxIDBytes, which
+// leaves roughly 230 characters for this component, so the panic is reachable
+// from PutObject, GetObject, and deleteObject before any admission or provider
+// I/O. decodeObjectGeneration needs no such check only because
+// base32.Encoding.DecodeString allocates its own destination.
 func decodeObjectDigest(value string) ([32]byte, error) {
 	var digest [32]byte
+	if len(value) != hex.EncodedLen(len(digest)) {
+		return [32]byte{}, errNoncanonicalObjectComponent
+	}
 	if _, err := hex.Decode(digest[:], []byte(value)); err != nil {
 		return [32]byte{}, err
 	}

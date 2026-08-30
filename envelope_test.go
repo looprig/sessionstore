@@ -465,6 +465,10 @@ func TestBodyReferenceObjectMetadataConversion(t *testing.T) {
 		"", "sha256:abc", "SHA256:" + hex.EncodeToString(digest[:]),
 		"sha256:" + strings.ToUpper(hex.EncodeToString(digest[:])),
 		"sha512:" + hex.EncodeToString(digest[:]),
+		// Longer than one hex SHA-256: the length check ahead of hex.Decode is
+		// a memory-safety precondition, since hex.Decode writes len(src)/2
+		// bytes into the fixed 32-byte array behind digest[:].
+		"sha256:" + strings.Repeat("ab", 200),
 	} {
 		badMetadata := metadata
 		badMetadata.Digest = bad

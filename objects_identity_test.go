@@ -106,6 +106,16 @@ func TestParseObjectMetadataRejectsNoncanonicalForms(t *testing.T) {
 			p[3] = p[3][:62]
 			m.Reference.ObjectID = strings.Join(p, ":")
 		},
+		// A digest longer than 64 hex characters is a memory-safety case, not
+		// only a canonicality one: hex.Decode writes len(value)/2 bytes into a
+		// fixed 32-byte array. sessionwire caps the whole ObjectID at 256 bytes,
+		// which still leaves room for a digest component that would index past
+		// the end of that array.
+		"long digest": func(m *sessionwire.ObjectMetadata) {
+			p := strings.Split(m.Reference.ObjectID, ":")
+			p[3] = strings.Repeat("ab", 100)
+			m.Reference.ObjectID = strings.Join(p, ":")
+		},
 		"short generation": func(m *sessionwire.ObjectMetadata) {
 			p := strings.Split(m.Reference.ObjectID, ":")
 			p[2] = p[2][:24]

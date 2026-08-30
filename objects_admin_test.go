@@ -32,6 +32,9 @@ func TestAdministrativeListRejectsNoncanonicalPhysicalKeys(t *testing.T) {
 		"swapped components":   generation + "/" + digest,
 		"extra segment":        digest + "/" + generation + "/extra",
 		"missing generation":   digest,
+		// A key whose digest segment is longer than 64 hex characters must be
+		// refused, not decoded into the fixed 32-byte array behind it.
+		"overlong digest": strings.Repeat("ab", 100) + "/" + generation,
 	} {
 		t.Run(name, func(t *testing.T) {
 			base := memstore.New()
