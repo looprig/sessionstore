@@ -60,14 +60,6 @@ type PutObjectRequest struct {
 	Body      io.Reader
 }
 
-// ObjectReader is a verified object stream. Integrity succeeds only when Read
-// observes terminal EOF after the declared size and SHA-256 match. Close before
-// that terminal EOF returns a typed incomplete-integrity error.
-type ObjectReader interface {
-	io.Reader
-	io.Closer
-}
-
 // GetObjectRequest names a verified object and the semantic kind the caller is
 // authorized to consume.
 type GetObjectRequest struct {
@@ -198,8 +190,10 @@ func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwir
 // GetObject returns a lifecycle-held verified stream. A caller establishes
 // integrity only by reading through terminal EOF; premature Close is an error.
 // Provider readers must make concurrent Close unblock Read so Store shutdown
-// can cancel outstanding streams before closing an owned provider.
-func (s *Store) GetObject(ctx context.Context, req GetObjectRequest) (ObjectReader, error) {
+// can cancel outstanding streams before closing an owned provider. A shutdown-
+// triggered reader Close error is latched on that reader; Store.Close orders the
+// cleanup but does not aggregate an error from a reader the caller abandoned.
+func (s *Store) GetObject(ctx context.Context, req GetObjectRequest) (io.ReadCloser, error) {
 	if !req.ExpectedKind.valid() {
 		return nil, objectErr(ObjectErrorInvalid, "expected_kind", nil)
 	}
@@ -292,6 +286,9 @@ func parseObjectReference(reference sessionwire.ObjectReference) (parsedObject, 
 	var digest [32]byte
 	if _, err := hex.Decode(digest[:], []byte(parts[3])); err != nil || hex.EncodeToString(digest[:]) != parts[3] {
 		return parsedObject{}, objectErr(ObjectErrorInvalid, "digest", err)
+	}
+	if digest == ([32]byte{}) {
+		return parsedObject{}, objectErr(ObjectErrorInvalid, "digest", nil)
 	}
 	return parsedObject{kind: kind, generation: parts[2], digest: digest}, nil
 }
@@ -484,16 +481,16 @@ func (v *exactVerifier) Read(p []byte) (int, error) {
 func (v *exactVerifier) finishRead(n int, err error) (int, error) {
 	if v.ctx.Err() != nil {
 		v.failure = objectErr(ObjectErrorCanceled, "stream", v.ctx.Err())
-		if err != nil && !errors.Is(err, io.EOF) {
+		if err != nil && err != io.EOF {
 			v.failure = joinErrors(v.failure, objectErr(v.readCode, "stream", err))
 		}
 		return n, v.failure
 	}
-	if err != nil && !errors.Is(err, io.EOF) {
+	if err != nil && err != io.EOF {
 		v.failure = objectErr(v.readCode, "stream", err)
 		return n, v.failure
 	}
-	if errors.Is(err, io.EOF) {
+	if err == io.EOF {
 		if v.read != v.expected {
 			v.failure = objectErr(ObjectErrorSize, "stream", nil)
 			return n, v.failure

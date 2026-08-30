@@ -396,6 +396,13 @@ func TestPutObjectPostVerifyJoinsReadAndCloseErrors(t *testing.T) {
 	if metadata.Reference.ObjectID != "" || !errors.Is(err, readCause) || !errors.Is(err, closeCause) {
 		t.Fatalf("Put=%+v error=%v; want joined read+close", metadata, err)
 	}
+	codes := objectErrorCodes(err)
+	if !codes[ObjectErrorBackend] || codes[ObjectErrorSource] {
+		t.Fatalf("error codes=%v, want backend without source", codes)
+	}
+	if strings.Contains(err.Error(), "private read") || strings.Contains(err.Error(), "private close") {
+		t.Fatalf("error leaked provider detail: %v", err)
+	}
 }
 
 func TestAdministrativeObjectListAndDeleteAreExactlyScoped(t *testing.T) {
@@ -639,6 +646,7 @@ func TestObjectKeyLiteralGoldensDoNotAliasHistorical(t *testing.T) {
 type adminRecordingBlobs struct {
 	storage.Blobs
 	listFn                func(string) []string
+	listErr, deleteErr    error
 	listPrefix, deleteKey string
 	lists, deletes        int
 }
@@ -646,6 +654,9 @@ type adminRecordingBlobs struct {
 func (b *adminRecordingBlobs) List(ctx context.Context, prefix string) ([]string, error) {
 	b.lists++
 	b.listPrefix = prefix
+	if b.listErr != nil {
+		return nil, b.listErr
+	}
 	if b.listFn != nil {
 		return b.listFn(prefix), nil
 	}
@@ -654,6 +665,9 @@ func (b *adminRecordingBlobs) List(ctx context.Context, prefix string) ([]string
 func (b *adminRecordingBlobs) Delete(ctx context.Context, key string) error {
 	b.deletes++
 	b.deleteKey = key
+	if b.deleteErr != nil {
+		return b.deleteErr
+	}
 	return b.Blobs.Delete(ctx, key)
 }
 
