@@ -1481,6 +1481,10 @@ func (s *Store) ReconcileHostTargets(
 	if pages == 0 {
 		pages = DefaultHostTargetReconcilePages
 	}
+	// Only the upper bound has two reachable sides. The zero case is replaced
+	// by the default above, so pages is never zero here and "pages <= 0" is
+	// the same predicate as "pages < 0" — an equivalent mutation, recorded so
+	// it is not re-derived as a survivor.
 	if pages < 0 || pages > MaxHostTargetReconcilePages {
 		return HostTargetReconcileResult{}, hostTargetErr(HostTargetErrorInvalid, "max_pages", nil)
 	}

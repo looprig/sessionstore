@@ -1057,6 +1057,11 @@ func canonicalGates(open []sessionwire.GateProjection) ([]sessionwire.GateProjec
 		}
 		gates[i].Deadline = gates[i].Deadline.UTC()
 	}
+	// The inner comparison runs only where the sequences DIFFER, so "<" and
+	// "<=" are the same predicate there — an equivalent mutation, recorded so
+	// it is not re-derived as a survivor. The outer inequality is not: reading
+	// it as equality reverses the tie-break, which is what
+	// TestCanonicalGateOrderBreaksATieBySessionGateID holds.
 	slices.SortFunc(gates, func(a, b sessionwire.GateProjection) int {
 		if a.OpenedJournalSeq != b.OpenedJournalSeq {
 			if a.OpenedJournalSeq < b.OpenedJournalSeq {
@@ -1250,6 +1255,13 @@ func validateProjectionText(value reflect.Value, path string, fail func(field st
 			}
 		}
 	case reflect.Map:
+		// NO sessionwire projection type reachable from here contains a map
+		// today, so this arm is unreachable and no test drives it. It is kept
+		// rather than replaced by a refusal because the walk's whole argument
+		// is that an enumeration goes stale when core adds a member: an arm
+		// that handles a shape core does not yet use is the same argument
+		// applied to shapes rather than to names. A refusal here would turn a
+		// future additive map member into a rejected record.
 		for _, key := range value.MapKeys() {
 			member := path + "." + key.String()
 			if err := validateProjectionText(key, member, fail); err != nil {

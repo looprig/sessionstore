@@ -826,6 +826,28 @@ func TestReconcileHostTargetsHoldsOneDueBoundForTheWholeSweep(t *testing.T) {
 	}
 }
 
+// TestReconcileHostTargetsAcceptsItsPageBudgetBounds drives the budget check at
+// both of its ends.
+//
+// One over the maximum is refused elsewhere in this file, but the maximum
+// ITSELF was never presented, so relaxing the bound to >= would have refused
+// the largest budget the constant advertises and nothing would have said so. A
+// negative budget is the other end: it cannot arrive through the zero-means-
+// default path, so only a caller naming one reaches it.
+func TestReconcileHostTargetsAcceptsItsPageBudgetBounds(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t, memstore.New(), WithClock(&advancingClock{now: targetObservedAt}))
+	mustReconcile(t, store, ReconcileHostTargetsRequest{Limit: 1, MaxPages: MaxHostTargetReconcilePages})
+
+	_, err := store.ReconcileHostTargets(context.Background(), ReconcileHostTargetsRequest{
+		Limit: 1, MaxPages: -1})
+	got := assertHostTargetCode(t, err, HostTargetErrorInvalid)
+	if got.Field != "max_pages" {
+		t.Fatalf("field = %q, want max_pages", got.Field)
+	}
+}
+
 // TestReconcileHostTargetsResumesPastAnExhaustedBudget is the boundary case,
 // not the mechanism. A row this sweep cannot read stays due forever, so it
 // heads every later ascending due page; once the unreadable population reaches

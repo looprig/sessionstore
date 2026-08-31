@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -1895,5 +1896,37 @@ func TestHostRegistrationRoutesAreNotAliased(t *testing.T) {
 	if again := read(); again.Registration.Route.HostID != registryHost ||
 		again.Registration.Route.InternalEndpoint != registryEndpoint {
 		t.Fatalf("a caller's mutation reached the store: %+v", *again.Registration.Route)
+	}
+}
+
+// TestCoreValidationFieldFallsBackWithoutADereference drives the helper that
+// forwards Core's own field name, including the arm nothing else reaches.
+//
+// Every production caller hands it a failure Core produced, so the fallback was
+// exercised only by whatever Core happened to return; a failure that is not a
+// *RequestValidationError at all — a provider error, a wrapped nil — never
+// arrives there in a test. Loosening the conjunction to || reads Field off a
+// nil pointer, which is the same shape of fault noSuchSession carried: an arm
+// that looks like a weakening and is really a crash.
+func TestCoreValidationFieldFallsBackWithoutADereference(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		err  error
+		want string
+	}{
+		"core named the member":       {err: &sessionwire.RequestValidationError{Field: "internal_endpoint"}, want: "internal_endpoint"},
+		"core named no member":        {err: &sessionwire.RequestValidationError{}, want: "route"},
+		"the failure is not core's":   {err: errors.New("provider is unwell"), want: "route"},
+		"the failure is core's, deep": {err: fmt.Errorf("wrapped: %w", &sessionwire.RequestValidationError{Field: "agent_id"}), want: "agent_id"},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := coreValidationField(test.err, "route"); got != test.want {
+				t.Fatalf("coreValidationField(%v) = %q, want %q", test.err, got, test.want)
+			}
+		})
 	}
 }

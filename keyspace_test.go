@@ -680,6 +680,13 @@ func TestLegacyLayoutRejectsForeignTenantAndNoncanonicalSession(t *testing.T) {
 			assertKeyspaceCode(t, err, KeyspaceLegacySession)
 		}
 	}
+	// Every boundary of the hex grammar in one id: '0' and '9' at the ends of
+	// the digit range, 'a' and 'f' at the ends of the letter range. No other
+	// fixture in this package contains an 'f', so narrowing the upper bound to
+	// < 'f' refused nothing any test presented.
+	if _, err := store.deriveSessionScope("local", "0123456f-89ab-cdef-0123-456789abcdef"); err != nil {
+		t.Fatalf("a canonical legacy id spanning the whole hex range was refused: %v", err)
+	}
 	scope, err := store.deriveSessionScope("local", "123e4567-e89b-12d3-a456-426614174000")
 	if err != nil {
 		t.Fatal(err)
