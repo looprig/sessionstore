@@ -664,20 +664,8 @@ func requestedClaim(epoch uint64, expiresAt time.Time, now time.Time) (CommandCl
 	if err := validateCommandClaim(claim); err != nil {
 		return CommandClaim{}, err
 	}
-	if !now.Before(expiresAt) {
-		return CommandClaim{}, inboxErr(InboxErrorInvalid, "claim_expires_at", nil)
-	}
-	// Sub rather than now.Add(MaxCommandClaimTTL), and the reason is the
-	// DIRECTION each one fails in. validateCommandClaim has already bounded
-	// expiresAt to rankableTime, but nothing bounds a Clock, so the two operands
-	// can be centuries apart. Sub clamps a gap it cannot represent to about 292
-	// years, which still exceeds the ceiling, so an unrepresentable gap is
-	// REFUSED. A saturated Add would move the horizon out to the end of the
-	// representable range instead, and every expiry would compare below it, so
-	// the same case would be ADMITTED. One failure mode declines a claim it
-	// could not measure; the other silently stops enforcing the bound.
-	if expiresAt.Sub(now) > MaxCommandClaimTTL {
-		return CommandClaim{}, inboxErr(InboxErrorInvalid, "claim_expires_at", nil)
+	if err := validateBoundedExpiry(expiresAt, now, MaxCommandClaimTTL, "claim_expires_at", inboxInvalid); err != nil {
+		return CommandClaim{}, err
 	}
 	return claim, nil
 }

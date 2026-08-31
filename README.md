@@ -393,3 +393,53 @@ commit succeeded", is exactly what this store knows about a command nobody has
 picked up — and `claimed`/`applying` as `pending`. Claim liveness deliberately
 does not enter into it: a public caller cannot act on it, and it changes with a
 clock rather than with the command.
+
+## The Host registry: an expiring route over a permanent fence
+
+`PutHostRegistration` publishes where one session is currently running:
+`(host_id, host_generation, agent_id, runtime_compatibility_id, placement,
+internal_endpoint, residency, accepting)` together with the writing lease epoch,
+the Host's observation instant, and the instant the observation lapses. It is
+one `OrderedIndex` record per session, filed in the session's own namespace,
+unranked and never due, and it is read and written directly rather than listed.
+`HostRegistration.Observation` projects it into Core's
+`HostLinkRegistryObservation`, which is also the record's validator: Core owns
+what a Host route means, so this package does not restate the endpoint,
+placement and residency rules and cannot drift from the peer that applies them.
+
+The record has two halves with opposite lifetimes. The ROUTE expires, and a
+reader past `ExpiresAt` is refused it: the Host that published it may have died
+at any instant since, and nothing will tell the record. The LEASE EPOCH never
+expires — it is the high-water mark that refuses a superseded Host's write — and
+that is why an expired or released registration is retained rather than deleted.
+Dropping the row would drop the fence.
+
+So the two reads are deliberately different functions.
+`GetHostRegistration` reports `not_found`, `expired`, or `released` and carries
+no tuple in any of the three: a router cannot bind to a Host this store will not
+vouch for. Every write instead reads the RAW record, expired and released ones
+included, because a writer that believed the public reader would create a fresh
+record over a row it could not see — and creating a fresh record is exactly how
+a fencing high-water mark gets reset to whatever a superseded lease named. A
+stored record that cannot be decoded is likewise a failure and never an absence,
+for the same reason.
+
+`ClearHostRegistration` releases a session by writing a tombstone under the same
+fence, never by deleting the row. A tombstone is a registration with no route
+at all, which is one nil rather than an enumeration of cleared members, so a
+released record cannot be routed to however its timestamps read or whatever
+clock the reader is configured with. Cleanup is idempotent under one grant and
+returns the stored tombstone without writing; a LATER grant releasing the same
+session is not a repeat and rewrites the tombstone, because otherwise the fence
+would stay at the older epoch and every lease granted in between could still
+write. A session that was never registered is `not_found`: cleanup is idempotent
+with respect to its own tombstone, not with respect to nothing.
+
+Three members of this record also appear on the catalog record, and in each case
+the catalog holds Factory-authored DESIRED state or a durable status projection
+while the registry holds the Host's OBSERVED answer: desired placement against
+the admission model the session is actually running under, the last known
+residency against the routable residency that disappears with the route, and the
+desired runtime against the runtime the running Host actually loaded. The lease
+epoch appears on both because each record carries the epoch its OWN writes are
+fenced at; neither is derived from the other and they advance independently.

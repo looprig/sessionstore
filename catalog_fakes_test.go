@@ -33,8 +33,10 @@ type orderedCall struct {
 // provider unrecorded, and a regression that started listing would go unseen.
 //
 // recordingOrdered logs every OrderedIndex call and can run a side effect
-// immediately before an Update reaches the provider, which is the only place a
-// test can interleave two compare-and-swap writers deterministically.
+// immediately before a Create or an Update reaches the provider, which is the
+// only place a test can interleave two writers deterministically. Update is
+// where two compare-and-swap writers meet; Create is where a first writer meets
+// another first writer, which is a different race with a different answer.
 //
 // log is optional and is the one thing its own call list cannot provide: an
 // ORDER RELATIVE TO ANOTHER PRIMITIVE. A test asking whether the journal was
@@ -45,6 +47,7 @@ type orderedCall struct {
 type recordingOrdered struct {
 	storage.OrderedIndex
 
+	beforeCreate func()
 	beforeUpdate func()
 	log          *callLog
 
@@ -103,6 +106,9 @@ func (o *recordingOrdered) Get(ctx context.Context, id storage.OrderedID) (stora
 
 func (o *recordingOrdered) Create(ctx context.Context, id storage.OrderedID, rankingScope string, value []byte, rank storage.Rank, due storage.Due) (storage.OrderedRecord, bool, error) {
 	o.add(orderedCall{op: "create", id: id, rankingScope: rankingScope, rank: rank, due: due})
+	if o.beforeCreate != nil {
+		o.beforeCreate()
+	}
 	return o.OrderedIndex.Create(ctx, id, rankingScope, value, rank, due)
 }
 

@@ -717,9 +717,10 @@ func TestOrderedNamespacesAreDistinct(t *testing.T) {
 	t.Parallel()
 
 	namespaces := map[string]string{
-		"catalog": catalogNamespace,
-		"gates":   gateNamespace,
-		"inbox":   inboxNamespace,
+		"catalog":  catalogNamespace,
+		"gates":    gateNamespace,
+		"inbox":    inboxNamespace,
+		"registry": registryNamespace,
 	}
 	seen := map[string]string{}
 	for kind, namespace := range namespaces {

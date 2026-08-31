@@ -1016,6 +1016,59 @@ func validateOpaque(value, field string, fail func(field string, cause error) er
 	return nil
 }
 
+// validateBoundedExpiry bounds one caller-supplied expiry against the store's
+// clock. Two records already need it — a command's claim and a Host's
+// registration — and they need exactly the same two rules for the same two
+// reasons, so it is stated once and each record supplies only its own ceiling
+// and its own error vocabulary, as validateOpaque does for text.
+//
+// An expiry must lapse in the FUTURE. One born expired is indistinguishable
+// from an absent one to every guard that reads it, so accepting one lets a
+// caller write a state it can never act on.
+//
+// And it must lapse within max, because an unbounded expiry is a durable
+// liveness fault one caller can commit alone. Each ceiling documents what its
+// own record loses without it; what is common is that nothing bounds a Clock,
+// so "eventually" would otherwise mean rankableTime, which is centuries.
+//
+// Sub rather than now.Add(max), and the reason is that Sub needs no reasoning
+// about saturation at all. Nothing bounds a Clock, so the two operands can be
+// centuries apart; Sub clamps a gap it cannot represent to about 292 years,
+// which still exceeds every ceiling here, so an unrepresentable gap is REFUSED
+// by a defined rule.
+//
+// The two spellings are nonetheless EQUIVALENT here, and the argument is worth
+// writing down because both earlier attempts at it were wrong about the
+// mechanism. time.Time.Add saturates toward LATER — an instant ten seconds
+// below the representable maximum plus an hour advances by those ten seconds
+// and stops — so an Add horizon can only ever be too FAR OUT, which is the
+// direction that would wrongly admit. But the two saturations have disjoint
+// causes: Sub saturates when the GAP exceeds about 292 years, while Add
+// saturates only when NOW ITSELF is near year 292277024627. Every caller has
+// already bounded expiresAt with rankableTime, which caps it at year 2262, so
+// at any now large enough to saturate Add the FIRST check has already refused
+// the request — now is not before expiresAt. There is no instant at which the
+// two disagree, and a mutation swapping them survives, which is recorded here
+// rather than papered over.
+//
+// Sub is kept because its behaviour at the boundary is specified and clamps
+// toward refusal, so this guard does not depend on the caller's bound staying
+// where it is.
+func validateBoundedExpiry(
+	expiresAt, now time.Time,
+	max time.Duration,
+	field string,
+	fail func(field string, cause error) error,
+) error {
+	if !now.Before(expiresAt) {
+		return fail(field, nil)
+	}
+	if expiresAt.Sub(now) > max {
+		return fail(field, nil)
+	}
+	return nil
+}
+
 // validateOptionalOpaque is validateOpaque for a field whose absence is legal.
 func validateOptionalOpaque(value, field string, fail func(field string, cause error) error) error {
 	if value == "" {

@@ -455,6 +455,124 @@ func inboxRecordFailure(failure versionedRecordFailure, field string, cause erro
 	}
 }
 
+// RegistryErrorCode classifies a Host registration failure.
+//
+// It is the registry's own vocabulary rather than the catalog's, and the reason
+// is the one InboxErrorCode gives. Gates reuse CatalogError because a gate IS
+// catalog state. A registration is a separate aggregate: its own namespace, its
+// own record, its own identity, its own fencing high-water mark, and — unlike
+// every other record in this package — its own LIFETIME, because it expires
+// while nothing else here does. Its writes never read or write a session's
+// catalog record, and a caller branching on "there is no live route" should not
+// have to match the type that reports "there is no such session".
+//
+// The three ways a registration can fail to be a route are deliberately
+// separate codes, and none of them is an error in the caller:
+//
+//   - NotFound — no registration has ever been written for this session. No
+//     Host has ever held it, or none has ever reported holding it.
+//   - Expired — a registration exists and names a Host, but its expiry has
+//     passed. The Host may be alive and merely slow to heartbeat, or it may be
+//     gone; this record cannot tell the difference and neither may its reader.
+//   - Released — a registration exists and is the tombstone a graceful
+//     shutdown left behind. The Host that held the session let it go on
+//     purpose.
+//
+// A ROUTER MUST TREAT ALL THREE ALIKE: none of them is a route, and the
+// difference between them is diagnostic. They are separate rather than
+// collapsed into NotFound because of what an undifferentiated "absent" invites.
+// A future writer that reads a registration, sees "not found", and creates a
+// fresh record has just dropped the fencing high-water mark of whatever was
+// really there — which is precisely the write the epoch fence exists to refuse.
+// Nothing in this package reaches a write path through a reader that reports
+// these codes, and the codes being distinct is what makes a future one that
+// tries to look wrong rather than plausible.
+//
+// The rest name the same failures the catalog's and the inbox's codes do:
+//
+//   - Invalid — a caller mistake in the request or a stored record that no
+//     longer satisfies its own rules.
+//   - Deleted — the provider holds a TOMBSTONE for this identity. This package
+//     never deletes a registration, so it means the fencing high-water mark has
+//     been physically destroyed by something outside it; it is reported and
+//     never worked around, because the alternative is admitting a write from a
+//     lease that has already lost the session.
+//   - Identity — a stored record disagreed with the identity it was filed
+//     under or asked for. It is not a caller error and no retry fixes it.
+//   - Epoch — the caller named a lease epoch BELOW the record's committed
+//     high-water mark. That lease has provably been superseded and must not
+//     retry under the same epoch; Epoch carries the high-water mark, as
+//     CatalogErrorEpoch does.
+//   - Conflict — a compare-and-swap lost a race on the record's revision, with
+//     no statement about ownership. Re-read and retry. Revision carries what
+//     the record is at now when the store could see it.
+//   - Unknown — the mutation's outcome could not be resolved at all.
+type RegistryErrorCode string
+
+const (
+	RegistryErrorInvalid   RegistryErrorCode = "invalid"
+	RegistryErrorNotFound  RegistryErrorCode = "not_found"
+	RegistryErrorExpired   RegistryErrorCode = "expired"
+	RegistryErrorReleased  RegistryErrorCode = "released"
+	RegistryErrorDeleted   RegistryErrorCode = "deleted"
+	RegistryErrorIdentity  RegistryErrorCode = "identity"
+	RegistryErrorEpoch     RegistryErrorCode = "epoch"
+	RegistryErrorConflict  RegistryErrorCode = "conflict"
+	RegistryErrorUnknown   RegistryErrorCode = "unknown"
+	RegistryErrorBackend   RegistryErrorCode = "backend"
+	RegistryErrorMalformed RegistryErrorCode = "malformed"
+	RegistryErrorVersion   RegistryErrorCode = "version"
+	RegistryErrorTooLarge  RegistryErrorCode = "too_large"
+)
+
+// RegistryError is a typed, redacted Host registration failure. Field names the
+// offending input or stage and never carries a provider name, a key, or a
+// record payload.
+//
+// Epoch is populated only for RegistryErrorEpoch and Revision only for
+// RegistryErrorConflict, each carrying the value that is itself the answer, as
+// CatalogError and InboxError do for the same two codes.
+type RegistryError struct {
+	Code     RegistryErrorCode
+	Field    string
+	Epoch    uint64
+	Revision uint64
+	Cause    error
+}
+
+func (e *RegistryError) Error() string {
+	message := "sessionstore: registry " + string(e.Code)
+	if e.Field != "" {
+		message += " (" + e.Field + ")"
+	}
+	return message
+}
+
+func (e *RegistryError) Unwrap() error { return e.Cause }
+
+func registryErr(code RegistryErrorCode, field string, cause error) error {
+	return &RegistryError{Code: code, Field: field, Cause: cause}
+}
+
+// registryInvalid is the registry's member-validation constructor, handed to
+// the shared text validators so they report in this record's vocabulary.
+func registryInvalid(field string, cause error) error {
+	return registryErr(RegistryErrorInvalid, field, cause)
+}
+
+// registryRecordFailure maps a shared versioned-record decode failure into the
+// registry vocabulary.
+func registryRecordFailure(failure versionedRecordFailure, field string, cause error) error {
+	switch failure {
+	case versionedRecordTooLarge:
+		return registryErr(RegistryErrorTooLarge, field, cause)
+	case versionedRecordVersion:
+		return registryErr(RegistryErrorVersion, field, cause)
+	default:
+		return registryErr(RegistryErrorMalformed, field, cause)
+	}
+}
+
 // catalogInvalid is the catalog's member-validation constructor. It is the
 // counterpart of inboxInvalid: the shared validators state the RULE, and each
 // record states what a violation of it is called.
