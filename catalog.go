@@ -771,7 +771,7 @@ func encodeCatalogRecord(record CatalogRecord) ([]byte, error) {
 func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 	wire, err := decodeVersionedRecord[catalogWire](
 		value, MaxCatalogRecordBytes, CatalogRecordVersion,
-		versionedRecordFields{Record: "record", Version: "record_version"})
+		versionedRecordFields{Record: "record", Version: "record_version", Fail: catalogRecordFailure})
 	if err != nil {
 		return CatalogRecord{}, err
 	}
@@ -833,19 +833,19 @@ func decodeVersionedRecord[T any](
 ) (T, error) {
 	var wire T
 	if len(value) > maxBytes {
-		return wire, catalogErr(CatalogErrorTooLarge, fields.Record, nil)
+		return wire, fields.Fail(versionedRecordTooLarge, fields.Record, nil)
 	}
 	if len(value) == 0 {
-		return wire, catalogErr(CatalogErrorMalformed, fields.Record, nil)
+		return wire, fields.Fail(versionedRecordMalformed, fields.Record, nil)
 	}
 	var probe struct {
 		RecordVersion uint8 `json:"record_version"`
 	}
 	if err := json.Unmarshal(value, &probe); err != nil {
-		return wire, catalogErr(CatalogErrorMalformed, fields.Record, err)
+		return wire, fields.Fail(versionedRecordMalformed, fields.Record, err)
 	}
 	if probe.RecordVersion != wantVersion {
-		return wire, catalogErr(CatalogErrorVersion, fields.Version, nil)
+		return wire, fields.Fail(versionedRecordVersion, fields.Version, nil)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(value))
 	decoder.DisallowUnknownFields()
@@ -854,7 +854,7 @@ func decodeVersionedRecord[T any](
 		// have populated some members before it stopped, and handing a caller a
 		// half-decoded record beside an error is how one of them ends up used.
 		var zero T
-		return zero, catalogErr(CatalogErrorMalformed, fields.Record, err)
+		return zero, fields.Fail(versionedRecordMalformed, fields.Record, err)
 	}
 	return wire, nil
 }
@@ -867,7 +867,25 @@ func decodeVersionedRecord[T any](
 type versionedRecordFields struct {
 	Record  string
 	Version string
+
+	// Fail names what a decode failure is CALLED in the caller's record
+	// vocabulary. The shared decoder states the three rules — the bound, the
+	// well-formedness of the document, and the version gate — and each record
+	// keeps its own error type, so a caller branching on an inbox failure does
+	// not have to match the catalog's.
+	Fail func(failure versionedRecordFailure, field string, cause error) error
 }
+
+// versionedRecordFailure is the closed set of failures the shared versioned
+// decode can produce. It is an enum rather than a string so a caller's mapping
+// is exhaustive by construction and cannot be handed the wrong spelling.
+type versionedRecordFailure uint8
+
+const (
+	versionedRecordTooLarge versionedRecordFailure = iota + 1
+	versionedRecordMalformed
+	versionedRecordVersion
+)
 
 // canonicalCatalogRecord validates a record and returns its one canonical
 // spelling: UTC timestamps, gates in (opened_seq, gate_id) order, and no empty
@@ -883,13 +901,13 @@ func canonicalCatalogRecord(record CatalogRecord) (CatalogRecord, error) {
 	if err := record.AgentID.Validate(); err != nil {
 		return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "agent_id", err)
 	}
-	if err := validateOptionalOpaque(record.RuntimeCompatibilityID, "runtime_compatibility_id"); err != nil {
+	if err := validateOptionalOpaque(record.RuntimeCompatibilityID, "runtime_compatibility_id", catalogInvalid); err != nil {
 		return CatalogRecord{}, err
 	}
-	if err := validateOpaque(string(record.State), "state"); err != nil {
+	if err := validateOpaque(string(record.State), "state", catalogInvalid); err != nil {
 		return CatalogRecord{}, err
 	}
-	if err := validateOpaque(string(record.Residency), "residency"); err != nil {
+	if err := validateOpaque(string(record.Residency), "residency", catalogInvalid); err != nil {
 		return CatalogRecord{}, err
 	}
 	switch record.DesiredPlacement {
@@ -908,7 +926,7 @@ func canonicalCatalogRecord(record CatalogRecord) (CatalogRecord, error) {
 			return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "last_event_id", err)
 		}
 	}
-	if err := validateOptionalOpaque(record.DesiredIdempotencyKey, "desired_idempotency_key"); err != nil {
+	if err := validateOptionalOpaque(record.DesiredIdempotencyKey, "desired_idempotency_key", catalogInvalid); err != nil {
 		return CatalogRecord{}, err
 	}
 	if !record.Checkpoint.isZero() {
@@ -951,7 +969,7 @@ func canonicalGates(open []sessionwire.GateProjection) ([]sessionwire.GateProjec
 		if err := gates[i].Validate(); err != nil {
 			return nil, catalogErr(CatalogErrorInvalid, "open_gates", err)
 		}
-		if err := validateProjectionText(reflect.ValueOf(gates[i]), "open_gates["+strconv.Itoa(i)+"]"); err != nil {
+		if err := validateProjectionText(reflect.ValueOf(gates[i]), "open_gates["+strconv.Itoa(i)+"]", catalogInvalid); err != nil {
 			return nil, err
 		}
 		gates[i].Deadline = gates[i].Deadline.UTC()
@@ -984,19 +1002,22 @@ func canonicalGates(open []sessionwire.GateProjection) ([]sessionwire.GateProjec
 // GateProjection all accept any non-empty State, Residency, or Kind so a future
 // wire version can add one — so this package is where these fields are bounded
 // at all.
-func validateOpaque(value, field string) error {
+//
+// fail names what a violation is called in the calling record's vocabulary. The
+// RULE is stated once here; only its name belongs to the record.
+func validateOpaque(value, field string, fail func(field string, cause error) error) error {
 	if value == "" || len(value) > sessionwire.MaxIDBytes || !utf8.ValidString(value) {
-		return catalogErr(CatalogErrorInvalid, field, nil)
+		return fail(field, nil)
 	}
 	return nil
 }
 
 // validateOptionalOpaque is validateOpaque for a field whose absence is legal.
-func validateOptionalOpaque(value, field string) error {
+func validateOptionalOpaque(value, field string, fail func(field string, cause error) error) error {
 	if value == "" {
 		return nil
 	}
-	return validateOpaque(value, field)
+	return validateOpaque(value, field, fail)
 }
 
 // validateProjectionText rejects invalid UTF-8 anywhere inside a nested
@@ -1014,15 +1035,15 @@ func validateOptionalOpaque(value, field string) error {
 // The walk terminates because the projection types are non-recursive: a
 // GateProjection contains a prompt, which contains fixed-size slices of leaf
 // structs, plus captured extension bytes.
-func validateProjectionText(value reflect.Value, path string) error {
+func validateProjectionText(value reflect.Value, path string, fail func(field string, cause error) error) error {
 	switch value.Kind() {
 	case reflect.String:
 		if !utf8.ValidString(value.String()) {
-			return catalogErr(CatalogErrorInvalid, path, nil)
+			return fail(path, nil)
 		}
 	case reflect.Pointer, reflect.Interface:
 		if !value.IsNil() {
-			return validateProjectionText(value.Elem(), path)
+			return validateProjectionText(value.Elem(), path, fail)
 		}
 	case reflect.Slice, reflect.Array:
 		// A byte slice here is a json.RawMessage, and it is deliberately not
@@ -1039,17 +1060,17 @@ func validateProjectionText(value reflect.Value, path string) error {
 			return nil
 		}
 		for i := range value.Len() {
-			if err := validateProjectionText(value.Index(i), path+"["+strconv.Itoa(i)+"]"); err != nil {
+			if err := validateProjectionText(value.Index(i), path+"["+strconv.Itoa(i)+"]", fail); err != nil {
 				return err
 			}
 		}
 	case reflect.Map:
 		for _, key := range value.MapKeys() {
 			member := path + "." + key.String()
-			if err := validateProjectionText(key, member); err != nil {
+			if err := validateProjectionText(key, member, fail); err != nil {
 				return err
 			}
-			if err := validateProjectionText(value.MapIndex(key), member); err != nil {
+			if err := validateProjectionText(value.MapIndex(key), member, fail); err != nil {
 				return err
 			}
 		}
@@ -1065,7 +1086,7 @@ func validateProjectionText(value reflect.Value, path string) error {
 			if name == "" {
 				name = field.Name
 			}
-			if err := validateProjectionText(value.Field(i), path+"."+name); err != nil {
+			if err := validateProjectionText(value.Field(i), path+"."+name, fail); err != nil {
 				return err
 			}
 		}

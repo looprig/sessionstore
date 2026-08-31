@@ -205,3 +205,58 @@ deliberately leaves intents alone: it is the Host's re-projection path, not an
 incremental gate edit. A gate projected only that way is readable but has no
 deadline index, and a gate dropped that way leaves a remnant intent the due
 reader discards.
+
+## Command admission: one create, one immutable acceptance order
+
+`AdmitCommand` makes one client command durable and reports whether this call is
+the one that accepted it. It is exactly one `OrderedIndex.Create`, filed in the
+inbox namespace under `(session ordering scope, raw CommandID)`, with the apply
+deadline as the record's due state and no rank.
+
+Identity is `(TenantID, SessionID, CommandID)`. The session is part of it, so
+the same client command id in another session — or another tenant — is a
+different command, and a duplicate within one session is a retry rather than a
+new acceptance. Because `Create` is atomically idempotent by identity, the
+duplicate case needs no read of its own: a loser receives the winner's canonical
+stored record.
+
+The runtime mapping is allocated once. A caller PROPOSES a `RuntimeCommandID`
+and must then use the one the returned record carries: racing replicas
+legitimately propose different values, and only the winner's is stored, returned
+and used.
+
+A duplicate whose command CONTENT differs — kind, inline payload, or referenced
+payload object — fails closed with `InboxErrorConflict`, because silently
+returning the first command's record would tell a caller its command was
+accepted when nothing of the kind happened. Everything else is deliberately
+excluded from that comparison. The proposed runtime id is excluded because
+disagreeing about it is the expected outcome of a race. The accepted instant and
+apply deadline are excluded because a retry carries a fresh clock reading, so
+comparing them would turn every real retry into a conflict. The state, claim,
+result and rejection are excluded because by the time a retry arrives the
+command may already be applied or rejected, and that progress is not evidence
+that this retry differs.
+
+For the same reason there is no "the deadline must be in the future" check: a
+retry of an unknown outcome may arrive after the original deadline has passed
+and must still be able to learn the mapping that was durably accepted. The
+deadline is validated as an instant and nothing more.
+
+`InboxEntry.AcceptedOrder` is the provider's immutable acceptance order, and it
+is exposed here where `CatalogEntry`'s deliberately is not: consumers sort a
+session's bounded ordered page by it, and a retry must receive it unchanged as
+evidence that it is the same acceptance. It is an OPAQUE COMPARISON KEY.
+It is strictly increasing within one session's order scope, but it is not
+contiguous, not one-based, and not comparable across sessions: a provider may
+allocate it from a JetStream stream sequence or a shared SQL sequence, so a
+session's first command can be order 5000 and its second 9000. Nothing may
+derive a count, a position, or "the next" order from it.
+
+The record carries the members the command lifecycle needs — state, claim epoch
+and expiry, terminal result, and a typed `sessionwire/v1.ErrorDetail` rejection
+— but this package does not yet move a command out of `pending`. The
+`pending -> claimed -> applying -> applied | rejected` machine, the journal
+application-prefix correlation, and the deadline reconciler are later tasks. A
+command's due state is derived from the record rather than from the operation
+writing it: non-terminal commands are due at their apply deadline, terminal ones
+are not due at all and stay directly readable by their stable key.

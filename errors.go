@@ -291,3 +291,100 @@ func (e *JournalError) Unwrap() error { return e.Cause }
 func journalErr(code JournalErrorCode, field string, cause error) error {
 	return &JournalError{Code: code, Field: field, Cause: cause}
 }
+
+// InboxErrorCode classifies a durable command record failure.
+//
+// It is the inbox's own vocabulary rather than the catalog's, and the reason is
+// ownership. Gates reuse CatalogError because a gate IS catalog state: the
+// projection lives in the catalog record and the deadline intent is an index
+// into it, so a gate failure is a statement about that record. A command is a
+// separate aggregate — its own namespace, its own record, its own identity, its
+// own lifecycle — and admission never reads or writes a session's catalog
+// record. A caller branching on an inbox failure should not have to match the
+// catalog's type to learn that its command was not stored, and the command
+// lifecycle's later states need failures the catalog has no business naming.
+//
+// Conflict and Unknown are deliberately distinct. Conflict is definite and
+// caller-caused: one command id was reused for a DIFFERENT command, and the
+// stored command is untouched. Unknown means the mutation's outcome could not
+// be resolved at all, so the caller learns nothing about what is stored and
+// must retry the same identity to find out.
+//
+// Identity means a stored record disagreed with the identity it was filed
+// under or asked for. It is not a caller error and not a conflict: it means the
+// provider's answer cannot be trusted, and no retry of the caller's fixes it.
+type InboxErrorCode string
+
+const (
+	InboxErrorInvalid   InboxErrorCode = "invalid"
+	InboxErrorConflict  InboxErrorCode = "conflict"
+	InboxErrorDeleted   InboxErrorCode = "deleted"
+	InboxErrorIdentity  InboxErrorCode = "identity"
+	InboxErrorUnknown   InboxErrorCode = "unknown"
+	InboxErrorBackend   InboxErrorCode = "backend"
+	InboxErrorMalformed InboxErrorCode = "malformed"
+	InboxErrorVersion   InboxErrorCode = "version"
+	InboxErrorTooLarge  InboxErrorCode = "too_large"
+)
+
+// InboxError is a typed, redacted command failure. Field names the offending
+// input or stage and never carries a provider name, a key, or any part of the
+// command's private payload.
+type InboxError struct {
+	Code  InboxErrorCode
+	Field string
+	Cause error
+}
+
+func (e *InboxError) Error() string {
+	message := "sessionstore: inbox " + string(e.Code)
+	if e.Field != "" {
+		message += " (" + e.Field + ")"
+	}
+	return message
+}
+
+func (e *InboxError) Unwrap() error { return e.Cause }
+
+func inboxErr(code InboxErrorCode, field string, cause error) error {
+	return &InboxError{Code: code, Field: field, Cause: cause}
+}
+
+// inboxInvalid is the inbox's member-validation constructor, handed to the
+// shared text validators so they report in this record's vocabulary.
+func inboxInvalid(field string, cause error) error {
+	return inboxErr(InboxErrorInvalid, field, cause)
+}
+
+// inboxRecordFailure maps a shared versioned-record decode failure into the
+// inbox vocabulary.
+func inboxRecordFailure(failure versionedRecordFailure, field string, cause error) error {
+	switch failure {
+	case versionedRecordTooLarge:
+		return inboxErr(InboxErrorTooLarge, field, cause)
+	case versionedRecordVersion:
+		return inboxErr(InboxErrorVersion, field, cause)
+	default:
+		return inboxErr(InboxErrorMalformed, field, cause)
+	}
+}
+
+// catalogInvalid is the catalog's member-validation constructor. It is the
+// counterpart of inboxInvalid: the shared validators state the RULE, and each
+// record states what a violation of it is called.
+func catalogInvalid(field string, cause error) error {
+	return catalogErr(CatalogErrorInvalid, field, cause)
+}
+
+// catalogRecordFailure maps a shared versioned-record decode failure into the
+// catalog vocabulary.
+func catalogRecordFailure(failure versionedRecordFailure, field string, cause error) error {
+	switch failure {
+	case versionedRecordTooLarge:
+		return catalogErr(CatalogErrorTooLarge, field, cause)
+	case versionedRecordVersion:
+		return catalogErr(CatalogErrorVersion, field, cause)
+	default:
+		return catalogErr(CatalogErrorMalformed, field, cause)
+	}
+}

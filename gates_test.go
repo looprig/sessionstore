@@ -1186,6 +1186,37 @@ func TestListDueGatesRejectsAnIntentDueAtSomethingElse(t *testing.T) {
 	}
 }
 
+// TestListDueGatesRejectsAnIntentFiledNotDue closes the OTHER half of the same
+// key component. The test above moves the due INSTANT; this one leaves the
+// instant exactly right and corrupts only the due STATE, which is the half a
+// millisecond-only comparison would wave through — a not-due row carries a zero
+// UnixMillis, so weakening the whole-value compare to `.UnixMillis` accepts any
+// row whose gate deadline is genuinely the Unix epoch, and accepts THIS row for
+// every deadline.
+//
+// The distinction matters because the two states mean opposite things: a row
+// filed not-due participates in no due page at all, so a reader that accepted
+// one would be reporting a gate as expired on the strength of an index entry
+// that says it will never come due.
+func TestListDueGatesRejectsAnIntentFiledNotDue(t *testing.T) {
+	store, hostile := openHostileListStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	deadline := catalogDeadline.Add(-time.Hour)
+	mustOpenGateOn(t, store, catalogTenant, "session-1", gateWithDeadline(testGate("gate-a", 5), deadline))
+	hostile.answerDue(func(page storage.DuePage, err error) (storage.DuePage, error) {
+		for i := range page.Records {
+			// Only the state moves; the instant stays the gate's own.
+			page.Records[i].Due = storage.Due{State: storage.NotDue, UnixMillis: deadline.UnixMilli()}
+		}
+		return page, err
+	})
+
+	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
+	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[0].due" {
+		t.Fatalf("failure field = %q, want due_gates[0].due", got.Field)
+	}
+}
+
 // TestListDueGatesRefusesATombstonedRow holds the provider to the one due-view
 // promise this reader cannot re-derive from a record: that a tombstone is not
 // returned. Serving one would report a RETIRED gate as due, which is the exact
