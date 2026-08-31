@@ -664,8 +664,13 @@ That is enforced structurally rather than documented, in three ways:
   fails if any type in the record's family grows one.
 - **Nothing else in this package reads a claim.** No other operation takes one,
   checks one, or refuses without one, so there is nothing for a claim to
-  license. `TestNothingInThisPackageReadsAClaimToDecideAWrite` parses every
-  other production file and fails if one so much as names the record.
+  license. `TestNothingInThisPackageReadsAClaimToDecideAWrite` derives the set
+  of names `reconcile.go` declares, parses every other production file, and
+  fails if one USES any of them. It reads the syntax rather than the text, so a
+  doc comment naming an operation is not mistaken for a call to it — which is
+  why the derived set has to come from the declarations rather than from a list
+  of prefixes: none of the three operations begins with `ReconciliationClaim`,
+  so a prefix list missed the only names another file would actually call.
 - **Acquiring is not required to do the work.** It is advice with a deadline.
 
 The row's shape follows the Host registry's — one per session, filed in the

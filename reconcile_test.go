@@ -9,6 +9,7 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"math"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -188,6 +189,18 @@ func TestDecodeReconciliationClaimFailsClosed(t *testing.T) {
 		{"no holder", perturb(`"holder_id":"`+reconcileHolder+`"`, `"holder_id":""`), ReconcileErrorInvalid},
 		{"an expiry before the claim", perturb(
 			`"expires_at":"2026-08-31T09:00:30Z"`, `"expires_at":"2026-08-31T08:59:00Z"`), ReconcileErrorInvalid},
+		// Both instants are held to being RANKABLE — an instant whose UnixNano
+		// is defined — and each guard is the only refuser of its own case,
+		// which is why both are here rather than one standing for the pair. An
+		// expiry beyond the range is still AFTER the claim instant, so the
+		// ordering rule above lets it through; a claim instant below the range
+		// is still BEFORE the expiry, so the ordering rule lets that through
+		// too. A year 3000 claim instant, by contrast, is refused by the
+		// ordering rule and would prove nothing about this one.
+		{"an expiry beyond the representable range", perturb(
+			`"expires_at":"2026-08-31T09:00:30Z"`, `"expires_at":"5000-01-01T00:00:00Z"`), ReconcileErrorInvalid},
+		{"a claim instant below the representable range", perturb(
+			`"claimed_at":"2026-08-31T09:00:00Z"`, `"claimed_at":"0001-01-01T00:00:00Z"`), ReconcileErrorInvalid},
 		{"oversized", bytes.Repeat([]byte("x"), MaxReconciliationClaimRecordBytes+1), ReconcileErrorTooLarge},
 	}
 	for _, test := range tests {
@@ -325,15 +338,25 @@ func TestReconciliationClaimCannotSpellSessionOwnership(t *testing.T) {
 func TestNothingInThisPackageReadsAClaimToDecideAWrite(t *testing.T) {
 	t.Parallel()
 
-	// Every identifier that names this record, its state, or its physical home.
-	// A production file that USES any of them is consulting a claim.
-	claimIdentifiers := []string{
-		"ReconciliationClaim", "reconciliationClaim", "reconcileNamespace", "claimHeldAt",
-	}
+	// The identifiers are DERIVED from what reconcile.go declares, not listed
+	// here, and that is the whole difference between this guard and the one it
+	// replaced. The first version matched four hand-written PREFIXES, which is
+	// a hand-written list standing in for a cross product: none of
+	// GetReconciliationClaim, AcquireReconciliationClaim or
+	// ReleaseReconciliationClaim begins with "ReconciliationClaim", so the
+	// three OPERATIONS — the only things another file would actually call, and
+	// therefore the exact threat — slipped through, and a production file
+	// calling GetReconciliationClaim passed. Every top-level name this file
+	// declares is claim-specific, so "no other production file may use
+	// anything reconcile.go declares" is both the true invariant and one a
+	// later declaration is covered by whether or not anyone updates this test.
+	claimIdentifiers := declaredNames(t, "reconcile.go")
+
 	// Identifiers are read from the parsed syntax rather than from the file's
 	// text, so a doc comment naming an operation is not mistaken for a call to
-	// it — errors.go documents this record's vocabulary and must be free to say
-	// its name.
+	// it — errors.go documents this record's vocabulary and has the literal
+	// text "GetReconciliationClaim" in a comment, which a textual scan would
+	// fire on and this walk correctly does not.
 	used := func(filename string) map[string]bool {
 		file, err := parser.ParseFile(token.NewFileSet(), filename, nil, 0)
 		if err != nil {
@@ -341,16 +364,25 @@ func TestNothingInThisPackageReadsAClaimToDecideAWrite(t *testing.T) {
 		}
 		names := map[string]bool{}
 		ast.Inspect(file, func(node ast.Node) bool {
-			if ident, ok := node.(*ast.Ident); ok {
-				for _, identifier := range claimIdentifiers {
-					if strings.HasPrefix(ident.Name, identifier) {
-						names[identifier] = true
-					}
-				}
+			if ident, ok := node.(*ast.Ident); ok && claimIdentifiers[ident.Name] {
+				names[ident.Name] = true
 			}
 			return true
 		})
 		return names
+	}
+
+	// Anti-vacuity on the derived set itself: it must reach the three public
+	// operations, because those are what a later task wiring a claim into a
+	// write path would call, and they are what the prefix version missed.
+	for _, operation := range []string{
+		"AcquireReconciliationClaim", "GetReconciliationClaim", "ReleaseReconciliationClaim",
+		"claimHeldAt", "reconcileNamespace", "ReconciliationClaim",
+	} {
+		if !claimIdentifiers[operation] {
+			t.Fatalf("the derived set %v does not name %s; it is not reaching reconcile.go's declarations",
+				claimIdentifiers, operation)
+		}
 	}
 
 	files, err := filepath.Glob("*.go")
@@ -372,12 +404,53 @@ func TestNothingInThisPackageReadsAClaimToDecideAWrite(t *testing.T) {
 		t.Fatalf("only %d production files were inspected; the walk is not reaching them", inspected)
 	}
 
-	// Anti-vacuity: the identifiers must actually be found where they are known
-	// to be, or the sweep above would pass against a typo in this list.
+	// And the walk must find every one of them in the file that declares them,
+	// or the sweep above would pass against a walk that inspects nothing.
 	if found := used("reconcile.go"); len(found) != len(claimIdentifiers) {
-		t.Fatalf("reconcile.go uses %v of %v; the sweep above is looking for the wrong names",
-			found, claimIdentifiers)
+		t.Fatalf("reconcile.go uses %d of the %d names it declares (%v); the walk is not reaching them",
+			len(found), len(claimIdentifiers), claimIdentifiers)
 	}
+}
+
+// declaredNames returns every top-level name one source file declares: types,
+// functions, methods, constants and variables alike.
+//
+// The blank identifier is excluded because it declares nothing a caller can
+// name — this package uses it for the compile-time size relations — and
+// including it would make the set match every `_` in every other file.
+func declaredNames(t *testing.T, filename string) map[string]bool {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), filename, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", filename, err)
+	}
+	names := map[string]bool{}
+	add := func(name string) {
+		if name != "" && name != "_" {
+			names[name] = true
+		}
+	}
+	for _, declaration := range file.Decls {
+		switch declaration := declaration.(type) {
+		case *ast.FuncDecl:
+			add(declaration.Name.Name)
+		case *ast.GenDecl:
+			for _, spec := range declaration.Specs {
+				switch spec := spec.(type) {
+				case *ast.TypeSpec:
+					add(spec.Name.Name)
+				case *ast.ValueSpec:
+					for _, name := range spec.Names {
+						add(name.Name)
+					}
+				}
+			}
+		}
+	}
+	if len(names) == 0 {
+		t.Fatalf("no top-level declarations were found in %s", filename)
+	}
+	return names
 }
 
 // TestReconcileErrorCarriesNoEpoch pins the same rule on the type a caller
@@ -709,6 +782,12 @@ func TestGetReconciliationClaimReportsOnlyALiveClaim(t *testing.T) {
 // at once, from an unclaimed start, each retrying a lost compare-and-swap.
 // Exactly one may end up holding the claim, and every loser must be told so in
 // terms it can act on.
+//
+// What it pins is that OUTCOME. Which arm each replica takes is the scheduler's
+// business: whether two of them ever both read an absent row — the lost-create
+// branch — varies run to run, so nothing here may be relied on to exercise it.
+// TestALostCreateIsReportedAsAConflict places that interleave deterministically
+// instead, and is where that branch is actually held.
 func TestTwoFactoriesRaceForOneClaim(t *testing.T) {
 	store, _ := reconcileFixture(t, memstore.New())
 
@@ -950,6 +1029,12 @@ func TestReconcileClassifiesProviderFailures(t *testing.T) {
 		{name: "tombstoned", err: &storage.OrderedDeletedError{}, want: ReconcileErrorDeleted},
 		{name: "lost the revision", err: &storage.OrderedRevisionConflictError{ActualRevision: 7}, want: ReconcileErrorConflict},
 		{name: "ambiguous", err: &storage.OrderedAmbiguousError{}, want: ReconcileErrorUnknown},
+		// Revision exhaustion falls through to Backend deliberately, as it does
+		// for the catalog, the inbox and the registry. It is in the table
+		// because the three sibling tables have it: an arm that is absent by
+		// decision and an arm that is absent by oversight look identical, and
+		// only a case here tells them apart.
+		{name: "exhausted", err: &storage.OrderedRevisionExhaustedError{Revision: math.MaxUint64}, want: ReconcileErrorBackend},
 		{name: "anything else", err: errors.New("provider exploded"), want: ReconcileErrorBackend},
 	}
 	for _, test := range tests {
@@ -1138,11 +1223,118 @@ func TestReconciliationClaimWritesBindTheSessionsWitness(t *testing.T) {
 	}
 
 	// A session whose witness was never bound cannot be read however its name
-	// is derived.
-	if _, err := store.GetReconciliationClaim(context.Background(), GetReconciliationClaimRequest{
+	// is derived — and the CLASS of the refusal is the assertion, not merely
+	// that one exists. Deleting verifySessionScope from the read path leaves
+	// this call failing with reconcile not_found, which is a different claim
+	// about the world: "this session has no claim" rather than "this session
+	// has never been bound and its derived name is not to be trusted". An
+	// err != nil assertion cannot tell them apart. journal_reader_test.go
+	// makes the same distinction the same way.
+	_, err := store.GetReconciliationClaim(context.Background(), GetReconciliationClaimRequest{
 		TenantID: catalogTenant, SessionID: "session-never-created",
-	}); err == nil {
-		t.Fatal("an unbound session read a claim")
+	})
+	var keyspaceErr *KeyspaceError
+	if !errors.As(err, &keyspaceErr) || keyspaceErr.Code != KeyspaceBindingNotFound {
+		t.Fatalf("unbound read error = %T %v, want binding_not_found", err, err)
+	}
+}
+
+// TestAClaimThisReaderCannotDecodeIsNotAnAbsentClaim pins the rule
+// readReconciliationClaim's own comment states and nothing exercised: a stored
+// row this reader cannot decode is an ERROR on every path, never absence.
+//
+// The direction is what makes it worth a test. Absence licenses action — a
+// reader reports "nobody is reconciling this", a release reports "there is
+// nothing to release", and an acquisition creates — so reporting an unreadable
+// row as absent fails OPEN on the one value this record exists to supply. The
+// create path happens to be defended twice over (the provider would refuse the
+// identity and the reply would fail its own decode), which is exactly why the
+// rule cannot be left to that path to enforce.
+func TestAClaimThisReaderCannotDecodeIsNotAnAbsentClaim(t *testing.T) {
+	t.Parallel()
+
+	store, _ := reconcileFixture(t, memstore.New())
+	mustAcquireClaim(t, store, testAcquireRequest(reconcileHolder))
+	corruptStoredClaim(t, store, []byte(`{"record_version":1,`))
+
+	t.Run("read", func(t *testing.T) {
+		_, err := store.GetReconciliationClaim(context.Background(), testGetClaimRequest())
+		assertReconcileCode(t, err, ReconcileErrorMalformed)
+	})
+	t.Run("release", func(t *testing.T) {
+		_, err := store.ReleaseReconciliationClaim(context.Background(), testReleaseRequest(reconcileHolder))
+		assertReconcileCode(t, err, ReconcileErrorMalformed)
+	})
+	t.Run("acquire", func(t *testing.T) {
+		_, err := store.AcquireReconciliationClaim(context.Background(), testAcquireRequest(reconcileOtherHolder))
+		assertReconcileCode(t, err, ReconcileErrorMalformed)
+	})
+}
+
+// corruptStoredClaim replaces one session's stored claim bytes in place,
+// leaving its filing untouched, so only the decode can refuse what follows.
+func corruptStoredClaim(t *testing.T, store *Store, value []byte) {
+	t.Helper()
+	scope, err := store.deriveSessionScope(catalogTenant, catalogSession)
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	id := reconciliationClaimID(scope, catalogSession)
+	stored, err := store.backend.OrderedIndex.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if _, err := store.backend.OrderedIndex.Update(
+		context.Background(), id, stored.Revision, value, stored.Rank, stored.Due); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+}
+
+// TestALostCreateIsReportedAsAConflict drives the branch the race test reaches
+// only when the scheduler cooperates.
+//
+// The race test's Create arm is genuinely probabilistic — two replicas must
+// both read an absent row before either writes — so a mutation that reported a
+// lost create as a WIN died on most runs and survived one. That is a test whose
+// kill power depends on timing, and the fix is to place the interleave rather
+// than hope for it: the competing acquisition runs inside the losing
+// acquisition's own Create, at the one instant that makes it a lost create
+// rather than a lost compare-and-swap.
+func TestALostCreateIsReportedAsAConflict(t *testing.T) {
+	base := memstore.New()
+	recorder := &recordingOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = recorder
+	store, _ := reconcileFixture(t, base)
+
+	// Disarmed on entry rather than guarded by a sync.Once: the competing
+	// acquisition below reaches this same hook, so a Once would re-enter its
+	// own Do on this goroutine and deadlock. There is one goroutine here, which
+	// is the point of placing the interleave rather than racing for it.
+	recorder.beforeCreate = func() {
+		recorder.beforeCreate = nil
+		if _, err := store.AcquireReconciliationClaim(
+			context.Background(), testAcquireRequest(reconcileOtherHolder)); err != nil {
+			t.Errorf("the competing replica did not win: %v", err)
+		}
+	}
+
+	_, err := store.AcquireReconciliationClaim(context.Background(), testAcquireRequest(reconcileHolder))
+	got := assertReconcileCode(t, err, ReconcileErrorConflict)
+	if got.Field != "create" {
+		t.Fatalf("field = %q, want create (%v)", got.Field, err)
+	}
+	if got.Revision == 0 {
+		t.Fatal("a lost create did not report the revision the caller must re-read from")
+	}
+
+	// The winner's claim is what is stored, unmodified by the loser.
+	entry, err := store.GetReconciliationClaim(context.Background(), testGetClaimRequest())
+	if err != nil {
+		t.Fatalf("GetReconciliationClaim: %v", err)
+	}
+	if entry.Claim.HolderID != reconcileOtherHolder {
+		t.Fatalf("holder = %q, want %q; a lost create overwrote the winner",
+			entry.Claim.HolderID, reconcileOtherHolder)
 	}
 }
 
@@ -1218,6 +1410,11 @@ func FuzzReconciliationClaimCodec(f *testing.F) {
 		func(m map[string]json.RawMessage) { m["holder_id"] = json.RawMessage(`""`) },
 		func(m map[string]json.RawMessage) { m["expires_at"] = json.RawMessage(`"1970-01-01T00:00:00Z"`) },
 		func(m map[string]json.RawMessage) { m["claimed_at"] = json.RawMessage(`"3000-01-01T00:00:00Z"`) },
+		// The two rankable-instant branches, one per member. Each is the only
+		// refuser of its own shape, so seeding one would leave the fuzzer
+		// exploring from inside one of the two rejections and not the other.
+		func(m map[string]json.RawMessage) { m["expires_at"] = json.RawMessage(`"5000-01-01T00:00:00Z"`) },
+		func(m map[string]json.RawMessage) { m["claimed_at"] = json.RawMessage(`"0001-01-01T00:00:00Z"`) },
 	} {
 		copied := make(map[string]json.RawMessage, len(members))
 		for name, value := range members {
