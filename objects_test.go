@@ -13,6 +13,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -20,12 +21,18 @@ import (
 	"github.com/looprig/storage/memstore"
 )
 
+// TestObjectRoundTripEveryKind is the "every kind" claim this package rests on
+// most heavily, and it was a hand-written list of ten behind that name. It
+// failed OPEN: an eleventh declared and accepted ObjectKind left the suite
+// green with the new kind covered by nothing at all.
+//
+// The set now comes from the source, through the same walk
+// TestAllObjectKindsIsTheDeclaredSet holds to ObjectKind.valid() in both
+// directions. It is sorted because the index below picks the generation and the
+// body size, and a map walk would make those vary run to run.
 func TestObjectRoundTripEveryKind(t *testing.T) {
-	kinds := []ObjectKind{
-		ObjectKindJournalPublic, ObjectKindJournalRuntime, ObjectKindCommandPayload,
-		ObjectKindToolResult, ObjectKindWorkspaceCheckpoint, ObjectKindRuntimeCheckpoint,
-		ObjectKindArtifact, ObjectKindAttachment, ObjectKindContinuation, ObjectKindRuntimeObject,
-	}
+	kinds := allObjectKinds(t)
+	slices.Sort(kinds)
 	for i, kind := range kinds {
 		t.Run(string(kind), func(t *testing.T) {
 			backend := memstore.New()

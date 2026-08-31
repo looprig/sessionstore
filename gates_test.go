@@ -512,6 +512,25 @@ func TestOpenGateRefusesAnEventAboveTheDurableTip(t *testing.T) {
 	assertNoGateIntent(t, store, "gate-a")
 }
 
+// TestOpenGateAcceptsAnEventAtTheDurableTip drives the tip check AT the
+// threshold, which is the ordinary case: a gate is opened by an event, and that
+// event is normally the latest record in the journal. Every other fixture in
+// this file names a sequence strictly below the tip, so relaxing the bound to
+// >= would have accepted a gate naming an event that is not durable yet, and
+// nothing here would have noticed.
+func TestOpenGateAcceptsAnEventAtTheDurableTip(t *testing.T) {
+	store := openTestStore(t)
+	entry := openGateFixture(t, store)
+
+	opened := mustOpenGate(t, store, 1, testGate("gate-a", entry.Record.LastJournalSeq))
+	if len(opened.Record.OpenGates) != 1 {
+		t.Fatalf("open gates = %+v, want the gate opened at the tip", opened.Record.OpenGates)
+	}
+	if got := opened.Record.OpenGates[0].OpenedJournalSeq; got != entry.Record.LastJournalSeq {
+		t.Fatalf("opened_journal_seq = %d, want the tip %d", got, entry.Record.LastJournalSeq)
+	}
+}
+
 func TestOpenGateRefusesASequenceAlreadyClaimedByAnOpenGate(t *testing.T) {
 	store := openTestStore(t)
 	openGateFixture(t, store)

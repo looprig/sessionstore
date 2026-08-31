@@ -1506,6 +1506,81 @@ func TestCatalogRawJSONTextValidityIsCoresRule(t *testing.T) {
 	}
 }
 
+// TestStatusOfAGatelessRecordNamesNoGate drives Status() in the ORDINARY state
+// of a session: not waiting on anything. Every other assertion about Status()
+// uses a record with open gates, so the projection's one conditional was
+// entered on every call and relaxing its bound to >= indexed an empty slice.
+// The public claim is that WaitingGateID is empty rather than arbitrary, and
+// Core's contract is what would reject a gate id on a running session.
+func TestStatusOfAGatelessRecordNamesNoGate(t *testing.T) {
+	t.Parallel()
+
+	record := testCatalogRecord()
+	record.State = sessionwire.SessionStateRunning
+	record.OpenGates = nil
+
+	status, err := record.Status()
+	if err != nil {
+		t.Fatalf("Status: %v", err)
+	}
+	if status.WaitingGateID != "" {
+		t.Fatalf("waiting gate = %q, want empty on a record with no open gates", status.WaitingGateID)
+	}
+}
+
+// TestCanonicalGateOrderBreaksATieBySessionGateID pins the second half of the
+// (opened_seq, gate_id) order Status() documents.
+//
+// Two gates CAN share an opening event — one journal record may open several —
+// and until now nothing had two, so the tie-break was unpinned in both of its
+// operators. What rests on it is the claim that two readers of the same record
+// always name the same waiting gate: an unstable comparator makes
+// WaitingGateID depend on the order the gates happened to arrive in, which is
+// not a property of the record at all.
+//
+// Both input orders are driven, because a tie-break that merely SWAPS is
+// correct for exactly one of them.
+func TestCanonicalGateOrderBreaksATieBySessionGateID(t *testing.T) {
+	t.Parallel()
+
+	const shared = 5
+	first, second := testGate("gate-a", shared), testGate("gate-b", shared)
+	for name, input := range map[string][]sessionwire.GateProjection{
+		"already in order": {first, second},
+		"reversed":         {second, first},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			gates, err := canonicalGates(input)
+			if err != nil {
+				t.Fatalf("canonicalGates: %v", err)
+			}
+			if len(gates) != 2 || gates[0].GateID != "gate-a" || gates[1].GateID != "gate-b" {
+				t.Fatalf("canonical order = %v, want gate-a then gate-b", gateProjectionIDs(gates))
+			}
+			// And the projection that rests on it names the first of the two.
+			record := testCatalogRecord()
+			record.OpenGates = input
+			status, err := record.Status()
+			if err != nil {
+				t.Fatalf("Status: %v", err)
+			}
+			if status.WaitingGateID != "gate-a" {
+				t.Fatalf("waiting gate = %q, want gate-a from the canonical order", status.WaitingGateID)
+			}
+		})
+	}
+}
+
+func gateProjectionIDs(gates []sessionwire.GateProjection) []sessionwire.GateID {
+	ids := make([]sessionwire.GateID, 0, len(gates))
+	for _, gate := range gates {
+		ids = append(ids, gate.GateID)
+	}
+	return ids
+}
+
 func TestCatalogNormalizesAnEmptyGateListToAbsent(t *testing.T) {
 	store := openTestStore(t)
 	mustCreateCatalog(t, store)
