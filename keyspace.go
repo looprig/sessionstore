@@ -23,7 +23,12 @@ const layoutMarkerKey = "sessionstore/layout"
 const legacyCatalogScope = "sessions"
 
 const (
-	markerCodecVersion  byte = 1
+	// markerCodecVersion is 2 because the marker gained the control shard
+	// count. A version-1 marker is not upgraded in place and is not readable:
+	// its bytes would parse as a version-2 marker with a shard count taken from
+	// the tenant length, so a store would place records in shards nothing had
+	// ever swept. Failing closed on it is the migration this package requires.
+	markerCodecVersion  byte = 2
 	keyAlgorithmVersion byte = 1
 )
 
@@ -38,7 +43,14 @@ type keyspace struct {
 	kv           storage.KV
 	layout       keyspaceLayout
 	legacyTenant sessionwire.TenantID
-	digest       func([]byte) [32]byte
+
+	// shards is the backend's committed control shard count. It is part of the
+	// LAYOUT rather than of the configuration, because it is an input to
+	// controlShardOf and therefore an input to where every outstanding record
+	// is filed; see the layout marker.
+	shards uint32
+
+	digest func([]byte) [32]byte
 }
 
 type sessionScope struct {
@@ -53,7 +65,19 @@ type sessionScope struct {
 	// tenant-scoped ranked page is a provider query rather than a filter
 	// applied after one. It obeys the storage name grammar and, unlike
 	// CatalogKey, is not a KV key.
-	CatalogScope      string
+	CatalogScope string
+
+	// ControlShard is the service-control shard this session's OUTSTANDING
+	// records are filed in — its inbox commands and its gate deadline intents,
+	// and nothing else. It is derived here, from the same identities every
+	// other name is derived from, so a writer and a cross-tenant sweeper reach
+	// the same shard with no lookup between them.
+	//
+	// It is NOT an ordering scope and must never be used as one: the records it
+	// addresses keep SessionNamespace for that, which is what keeps two
+	// sessions that hash to one shard from sharing an identity space.
+	ControlShard uint32
+
 	BlobPrefix        string
 	JournalName       string
 	tenantWitnessKey  string
@@ -62,12 +86,12 @@ type sessionScope struct {
 	sessionWitness    []byte
 }
 
-func newKeyspace(kv storage.KV, layout keyspaceLayout, legacyTenant sessionwire.TenantID) keyspace {
-	return keyspace{kv: kv, layout: layout, legacyTenant: legacyTenant, digest: sha256.Sum256}
+func newKeyspace(kv storage.KV, layout keyspaceLayout, legacyTenant sessionwire.TenantID, shards uint32) keyspace {
+	return keyspace{kv: kv, layout: layout, legacyTenant: legacyTenant, shards: shards, digest: sha256.Sum256}
 }
 
 func (k keyspace) initialize(ctx context.Context) error {
-	want := encodeLayoutMarker(k.layout, k.legacyTenant)
+	want := encodeLayoutMarker(k.layout, k.legacyTenant, k.shards)
 	got, _, err := k.kv.Get(ctx, layoutMarkerKey)
 	if err == nil {
 		return compareLayoutMarker(got, want)
@@ -91,16 +115,46 @@ func (k keyspace) initialize(ctx context.Context) error {
 	return compareLayoutMarker(got, want)
 }
 
-func encodeLayoutMarker(layout keyspaceLayout, tenant sessionwire.TenantID) []byte {
+// encodeLayoutMarker renders the immutable description of a backend: its
+// layout, its key algorithm, its legacy tenant, and its CONTROL SHARD COUNT.
+//
+// The shard count belongs here and not in the Store's configuration because the
+// marker is compared for byte equality on every Open. That comparison is the
+// entire migration constraint: a deployment that reopened the same backend with
+// a different count would place new outstanding records in shards no sweep of
+// the old count ever visits, and would look for the existing ones where they
+// are not — a silent, unbounded loss of reconciliation with no failure anywhere
+// to report it. Making the count part of the marker turns that into a refusal
+// at Open, before any session I/O, which is what "a migration rather than a
+// runtime flag flip" means operationally.
+func encodeLayoutMarker(layout keyspaceLayout, tenant sessionwire.TenantID, shards uint32) []byte {
 	tenantBytes := []byte(tenant)
-	out := make([]byte, 9+len(tenantBytes))
+	out := make([]byte, layoutMarkerHeaderBytes+len(tenantBytes))
 	copy(out, "LRKS")
 	out[4] = markerCodecVersion
 	out[5] = byte(layout)
 	out[6] = keyAlgorithmVersion
-	binary.BigEndian.PutUint16(out[7:9], checkedUint16Length(len(tenantBytes)))
-	copy(out[9:], tenantBytes)
+	binary.BigEndian.PutUint16(out[7:9], checkedControlShardCount(shards))
+	binary.BigEndian.PutUint16(out[9:11], checkedUint16Length(len(tenantBytes)))
+	copy(out[layoutMarkerHeaderBytes:], tenantBytes)
 	return out
+}
+
+// layoutMarkerHeaderBytes is the fixed prefix every marker carries, declared
+// once so the encoder and the validator cannot drift apart about where the
+// tenant begins.
+const layoutMarkerHeaderBytes = 11
+
+// checkedControlShardCount holds a count about to become durable to the same
+// bound WithControlShards enforces on the way in. It is not a restatement of
+// that validator: this one guards the ENCODER, so a count reaching the marker
+// by any other route than the option — a future default, a migration tool —
+// cannot write a marker that validateLayoutMarker would then refuse to read.
+func checkedControlShardCount(shards uint32) uint16 {
+	if shards < MinControlShards || shards > MaxControlShards {
+		panic("sessionstore: internal control shard count invariant")
+	}
+	return uint16(shards)
 }
 
 func compareLayoutMarker(got, want []byte) error {
@@ -115,11 +169,21 @@ func compareLayoutMarker(got, want []byte) error {
 
 func validateLayoutMarker(data []byte) error {
 	malformed := func(cause error) error { return &KeyspaceError{Code: KeyspaceMarkerMalformed, Cause: cause} }
-	if len(data) < 9 || string(data[:4]) != "LRKS" || data[4] != markerCodecVersion || data[6] != keyAlgorithmVersion {
+	if len(data) < layoutMarkerHeaderBytes || string(data[:4]) != "LRKS" ||
+		data[4] != markerCodecVersion || data[6] != keyAlgorithmVersion {
 		return malformed(nil)
 	}
-	length := int(binary.BigEndian.Uint16(data[7:9]))
-	if len(data) != 9+length {
+	// The shard count is validated as a READ value rather than trusted, for the
+	// reason every stored record in this package is re-validated: a marker with
+	// a zero or oversized count would otherwise make controlShardOf panic on
+	// the first session derived from it, turning a corrupted marker into a
+	// crash instead of a refusal.
+	shards := binary.BigEndian.Uint16(data[7:9])
+	if shards < MinControlShards || shards > MaxControlShards {
+		return malformed(nil)
+	}
+	length := int(binary.BigEndian.Uint16(data[9:11]))
+	if len(data) != layoutMarkerHeaderBytes+length {
 		return malformed(nil)
 	}
 	switch keyspaceLayout(data[5]) {
@@ -128,7 +192,7 @@ func validateLayoutMarker(data []byte) error {
 			return malformed(nil)
 		}
 	case layoutLegacySingleTenantV1:
-		tenant := sessionwire.TenantID(string(data[9:]))
+		tenant := sessionwire.TenantID(string(data[layoutMarkerHeaderBytes:]))
 		if err := tenant.Validate(); err != nil {
 			return malformed(err)
 		}
@@ -201,6 +265,7 @@ func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionw
 		prefix := "sessions/" + string(session)
 		return sessionScope{
 			layout:           layoutLegacySingleTenantV1,
+			ControlShard:     s.keys.controlShardOf(tenant, session, s.keys.shards),
 			SessionNamespace: prefix,
 			LedgerName:       prefix,
 			LeaseName:        prefix,
@@ -222,6 +287,7 @@ func (s *Store) deriveSessionScope(tenant sessionwire.TenantID, session sessionw
 		LeaseName:         sessionNamespace + "/lease",
 		CatalogKey:        sessionNamespace + "/catalog",
 		CatalogScope:      owner.CatalogScope,
+		ControlShard:      s.keys.controlShardOf(tenant, session, s.keys.shards),
 		BlobPrefix:        sessionNamespace + "/blobs/",
 		JournalName:       sessionNamespace + "/journal",
 		tenantWitnessKey:  owner.tenantWitnessKey,

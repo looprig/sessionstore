@@ -536,7 +536,7 @@ func TestAdmitCommandStoresTheAuthoritativeRecord(t *testing.T) {
 		t.Fatalf("deriveSessionScope: %v", err)
 	}
 	if create.id != (storage.OrderedID{
-		Namespace:     inboxNamespace,
+		Namespace:     shardNamespace(inboxNamespace, scope.ControlShard),
 		OrderingScope: scope.SessionNamespace,
 		StableKey:     storage.StableKey(inboxCommand),
 	}) {
@@ -726,6 +726,11 @@ func TestAdmitCommandBindsTheSessionsCollisionWitnesses(t *testing.T) {
 // MATTERS: every constant this package names as the Namespace of a
 // storage.OrderedID, which is the only way a namespace is ever used. A record
 // kind added later is covered whether or not anyone updates this test.
+//
+// A namespace is also used one other way — as the namespace a due query is
+// issued FOR — and that use is checked too, at the end, against the filed set.
+// A sweep issued for a namespace nothing is filed under is not an error
+// anywhere: it returns an empty page, forever, and reads as "nothing is due".
 func TestOrderedNamespacesAreDistinct(t *testing.T) {
 	t.Parallel()
 
@@ -786,16 +791,26 @@ func TestOrderedNamespacesAreDistinct(t *testing.T) {
 				if !ok || key.Name != "Namespace" {
 					continue
 				}
-				named, ok := pair.Value.(*ast.Ident)
-				if !ok {
-					t.Fatalf("%s files an OrderedID under a namespace that is not a named constant", filename)
-				}
-				value, ok := constants[named.Name]
+				// Two spellings are legal and no others. A bare constant is
+				// an unsharded namespace. A call to shardNamespace with a
+				// constant BASE is a sharded one, and the base is what has to
+				// be distinct: shardNamespace appends a separator and a
+				// fixed-width token, so distinct bases stay distinct at every
+				// shard —  TestShardNamespacesAreDistinctOverTheWholeCrossProduct
+				// proves that half over the full cross product rather than
+				// leaving it to this comment.
+				//
+				// Anything else still fails here, which is the point: a
+				// namespace computed some other way would be invisible to this
+				// scan, and an invisible namespace is exactly how two record
+				// kinds end up sharing a provider partition.
+				named := namespaceBaseIdent(t, filename, pair.Value)
+				value, ok := constants[named]
 				if !ok {
 					t.Fatalf("%s names the namespace %s, which is not a string constant this scan found",
-						filename, named.Name)
+						filename, named)
 				}
-				namespaces[named.Name] = value
+				namespaces[named] = value
 			}
 			return true
 		})
@@ -821,6 +836,68 @@ func TestOrderedNamespacesAreDistinct(t *testing.T) {
 			t.Fatalf("%s and %s share the namespace %q", other, kind, namespace)
 		}
 		seen[namespace] = kind
+	}
+
+	// Pass three: every namespace a DUE QUERY is issued for must be one a
+	// record is actually filed under. The two sets are written in different
+	// places — a query names its own namespace expression, and nothing relates
+	// it to the filing side — so a sweep pointed at a namespace nothing is
+	// filed in fails silently and permanently.
+	//
+	// WHAT THIS DOES NOT CATCH, because a reader will otherwise assume it does:
+	// it proves membership in the filed set, not that a query names the right
+	// MEMBER of it. A gate sweep issued for the inbox's namespace would pass
+	// here and be caught only by the filing checks each reader performs on the
+	// rows it gets back.
+	queried := 0
+	for filename, file := range parsed {
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || len(call.Args) < 2 {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != "ListDue" {
+				return true
+			}
+			queried++
+			if base := namespaceBaseIdent(t, filename, call.Args[1]); namespaces[base] == "" {
+				t.Errorf("%s issues a due query for %s, which no record kind is filed under", filename, base)
+			}
+			return true
+		})
+	}
+	if queried < 3 {
+		t.Fatalf("found %d due queries; the scan is not reaching them", queried)
+	}
+}
+
+// namespaceBaseIdent returns the constant a filed OrderedID's Namespace is
+// derived from, failing the test for any spelling this package does not permit.
+//
+// It is a function of the SYNTAX rather than a list of the call sites, so a
+// record kind added later is covered whether or not anyone updates it.
+func namespaceBaseIdent(t *testing.T, filename string, value ast.Expr) string {
+	t.Helper()
+	switch named := value.(type) {
+	case *ast.Ident:
+		return named.Name
+	case *ast.CallExpr:
+		callee, ok := named.Fun.(*ast.Ident)
+		if !ok || callee.Name != "shardNamespace" {
+			t.Fatalf("%s files an OrderedID under a computed namespace that is not shardNamespace", filename)
+		}
+		if len(named.Args) == 0 {
+			t.Fatalf("%s calls shardNamespace with no base", filename)
+		}
+		base, ok := named.Args[0].(*ast.Ident)
+		if !ok {
+			t.Fatalf("%s shards a namespace whose base is not a named constant", filename)
+		}
+		return base.Name
+	default:
+		t.Fatalf("%s files an OrderedID under a namespace that is not a named constant", filename)
+		return ""
 	}
 }
 
@@ -1110,7 +1187,11 @@ func TestAdmitCommandKeepsThePayloadPrivate(t *testing.T) {
 	if len(carrying) != 1 {
 		t.Fatalf("the payload was written %d times, want exactly once: %+v", len(carrying), carrying)
 	}
-	if carrying[0].primitive != "ordered:"+inboxNamespace {
+	scope, err := store.deriveSessionScope(req.TenantID, req.SessionID)
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	if carrying[0].primitive != "ordered:"+shardNamespace(inboxNamespace, scope.ControlShard) {
 		t.Fatalf("the payload was written to %s, want the inbox record", carrying[0].primitive)
 	}
 
@@ -1118,7 +1199,7 @@ func TestAdmitCommandKeepsThePayloadPrivate(t *testing.T) {
 	// value.
 	conflicting := req
 	conflicting.Payload = []byte("other")
-	_, _, err := store.AdmitCommand(context.Background(), conflicting)
+	_, _, err = store.AdmitCommand(context.Background(), conflicting)
 	assertInboxCode(t, err, InboxErrorCommandMismatch)
 	if strings.Contains(err.Error(), string(secret)) || strings.Contains(err.Error(), "other") {
 		t.Fatalf("an inbox failure quoted a private payload: %v", err)
@@ -1144,7 +1225,8 @@ func TestAdmitCommandFilesTheApplyDeadlineAsTheRecordsDueState(t *testing.T) {
 		t.Fatalf("due = %+v, want the apply deadline", stored.Due)
 	}
 
-	page, err := base.OrderedIndex.ListDue(context.Background(), inboxNamespace, inboxDeadline.UnixMilli(), "", 10)
+	page, err := base.OrderedIndex.ListDue(
+		context.Background(), shardNamespace(inboxNamespace, scope.ControlShard), inboxDeadline.UnixMilli(), "", 10)
 	if err != nil {
 		t.Fatalf("ListDue: %v", err)
 	}

@@ -3,6 +3,7 @@ package sessionstore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"reflect"
@@ -28,7 +29,7 @@ func TestUnmarkedBackendDefaultsToTenantLayout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get(marker): %v", err)
 	}
-	want := []byte{'L', 'R', 'K', 'S', 1, byte(layoutTenantV1), 1, 0, 0}
+	want := []byte{'L', 'R', 'K', 'S', markerCodecVersion, byte(layoutTenantV1), 1, 0, DefaultControlShards, 0, 0}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("marker = %x, want %x", got, want)
 	}
@@ -50,7 +51,8 @@ func TestExplicitLegacyLayoutWritesTenantBoundMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get(marker): %v", err)
 	}
-	want := append([]byte{'L', 'R', 'K', 'S', 1, byte(layoutLegacySingleTenantV1), 1, 0, byte(len(tenant))}, []byte(tenant)...)
+	want := append([]byte{'L', 'R', 'K', 'S', markerCodecVersion, byte(layoutLegacySingleTenantV1), 1,
+		0, DefaultControlShards, 0, byte(len(tenant))}, []byte(tenant)...)
 	if !bytes.Equal(got, want) {
 		t.Fatalf("marker = %x, want %x", got, want)
 	}
@@ -174,7 +176,7 @@ func TestLayoutMarkerBackendStateMachineAndOwnership(t *testing.T) {
 			if n == 1 {
 				return notFoundGet(n)
 			}
-			return encodeLayoutMarker(layoutLegacySingleTenantV1, "tenant"), 1, nil
+			return encodeLayoutMarker(layoutLegacySingleTenantV1, "tenant", DefaultControlShards), 1, nil
 		}, put: conflictPut, wantCode: KeyspaceLayoutMismatch, wantGets: 2, wantPuts: 1},
 		{name: "conflict reread malformed", get: func(n int) ([]byte, uint64, error) {
 			if n == 1 {
@@ -481,20 +483,29 @@ func TestExistingLayoutMarkerIsImmutable(t *testing.T) {
 }
 
 func TestLayoutMarkerStrictCodec(t *testing.T) {
-	valid := []byte{'L', 'R', 'K', 'S', 1, byte(layoutTenantV1), 1, 0, 0}
+	valid := []byte{'L', 'R', 'K', 'S', markerCodecVersion, byte(layoutTenantV1), 1, 0, DefaultControlShards, 0, 0}
 	tests := map[string][]byte{
-		"short":            valid[:8],
+		"short":            valid[:len(valid)-1],
 		"magic":            append([]byte{'X'}, valid[1:]...),
 		"codec version":    append([]byte(nil), valid...),
 		"layout":           append([]byte(nil), valid...),
 		"key algorithm":    append([]byte(nil), valid...),
 		"length":           append([]byte(nil), valid...),
-		"tenant on tenant": append(append([]byte(nil), valid[:8]...), 1, 'x'),
+		"zero shards":      append([]byte(nil), valid...),
+		"oversized shards": append([]byte(nil), valid...),
+		"tenant on tenant": append(append([]byte(nil), valid[:len(valid)-1]...), 1, 'x'),
 	}
 	tests["codec version"][4]++
 	tests["layout"][5] = 99
 	tests["key algorithm"][6]++
-	tests["length"][8] = 1
+	tests["length"][10] = 1
+	// The shard count is refused as a READ value, not merely written correctly.
+	// A marker naming zero or more than MaxControlShards would otherwise reach
+	// controlShardOf's bound panic on the first session this store derived, so
+	// the difference between these two cases and no check at all is a refusal
+	// against a crash.
+	binary.BigEndian.PutUint16(tests["zero shards"][7:9], 0)
+	binary.BigEndian.PutUint16(tests["oversized shards"][7:9], MaxControlShards+1)
 	for name, marker := range tests {
 		t.Run(name, func(t *testing.T) {
 			backend := memstore.New()
@@ -509,7 +520,8 @@ func TestLayoutMarkerStrictCodec(t *testing.T) {
 
 func TestLegacyLayoutMarkerRawCorpus(t *testing.T) {
 	legacy := func(tenant []byte, declared int) []byte {
-		out := []byte{'L', 'R', 'K', 'S', 1, byte(layoutLegacySingleTenantV1), 1, byte(declared >> 8), byte(declared)}
+		out := []byte{'L', 'R', 'K', 'S', markerCodecVersion, byte(layoutLegacySingleTenantV1), 1,
+			0, DefaultControlShards, byte(declared >> 8), byte(declared)}
 		return append(out, tenant...)
 	}
 	longTenant := bytes.Repeat([]byte{'x'}, sessionwire.MaxIDBytes+1)
@@ -562,7 +574,7 @@ func TestLayoutMismatchBothDirections(t *testing.T) {
 }
 
 func TestMarkerConflictRereadsExactlyOnceAndConverges(t *testing.T) {
-	want := []byte{'L', 'R', 'K', 'S', 1, byte(layoutTenantV1), 1, 0, 0}
+	want := []byte{'L', 'R', 'K', 'S', markerCodecVersion, byte(layoutTenantV1), 1, 0, DefaultControlShards, 0, 0}
 	kv := &scriptKV{
 		getFn: func(n int) ([]byte, uint64, error) {
 			if n == 1 {
@@ -599,7 +611,7 @@ func TestLayoutMarkerCreateUsesExactKeyAndRevisionZero(t *testing.T) {
 	if len(kv.puts) != 1 || kv.puts[0].key != layoutMarkerKey || kv.puts[0].expected != 0 {
 		t.Fatalf("marker Put = %+v", kv.puts)
 	}
-	want := []byte{'L', 'R', 'K', 'S', 1, byte(layoutTenantV1), 1, 0, 0}
+	want := []byte{'L', 'R', 'K', 'S', markerCodecVersion, byte(layoutTenantV1), 1, 0, DefaultControlShards, 0, 0}
 	if !bytes.Equal(kv.puts[0].value, want) {
 		t.Fatalf("marker value = %x, want %x", kv.puts[0].value, want)
 	}

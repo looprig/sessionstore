@@ -51,6 +51,7 @@ type config struct {
 	ioAdapter       *ioProviderAdapter
 	layout          keyspaceLayout
 	legacyTenant    sessionwire.TenantID
+	shards          uint32
 }
 
 func defaultConfig() config {
@@ -60,6 +61,37 @@ func defaultConfig() config {
 		logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 		shutdownTimeout: DefaultShutdownTimeout,
 		layout:          layoutTenantV1,
+		shards:          DefaultControlShards,
+	}
+}
+
+// WithControlShards names the number of service-control shards outstanding work
+// is spread across.
+//
+// IT IS NOT A RUNTIME SETTING, and the option is where that has to be said,
+// because the name reads like one. The count is an input to controlShardOf, so
+// it decides the namespace every inbox command and every gate deadline intent
+// is FILED IN. Open persists it in the backend's layout marker and refuses a
+// later Open of the same backend that names a different one; changing it for a
+// backend that already holds records is an offline migration that must move
+// them, not a redeploy with a new flag.
+//
+// A larger count spreads a sweep across more replicas and makes any one shard's
+// due page shorter. It is not free: a sweep visits every shard, so the count is
+// a floor on the provider queries one pass costs even when nothing is due.
+func WithControlShards(shards int) Option {
+	return func(cfg *config) error {
+		if shards < MinControlShards || shards > MaxControlShards {
+			cause := &InvalidLimitError{
+				Field: "ControlShards",
+				Value: int64(shards),
+				Min:   MinControlShards,
+				Max:   MaxControlShards,
+			}
+			return &InvalidOptionError{Field: "ControlShards", Cause: cause}
+		}
+		cfg.shards = uint32(shards)
+		return nil
 	}
 }
 

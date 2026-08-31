@@ -83,7 +83,7 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 			return nil, err
 		}
 	}
-	keys := newKeyspace(backend.KV, cfg.layout, cfg.legacyTenant)
+	keys := newKeyspace(backend.KV, cfg.layout, cfg.legacyTenant, cfg.shards)
 	if err := keys.initialize(ctx); err != nil {
 		return nil, err
 	}

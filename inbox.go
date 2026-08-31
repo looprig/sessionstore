@@ -383,7 +383,7 @@ func (r InboxRecord) sameCommandAs(other InboxRecord) bool {
 // stores the original for the verification inboxEntryFor performs.
 func inboxID(scope sessionScope, command sessionwire.CommandID) storage.OrderedID {
 	return storage.OrderedID{
-		Namespace:     inboxNamespace,
+		Namespace:     shardNamespace(inboxNamespace, scope.ControlShard),
 		OrderingScope: scope.SessionNamespace,
 		StableKey:     storage.StableKey(command),
 	}

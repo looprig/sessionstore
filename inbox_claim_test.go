@@ -808,8 +808,13 @@ func TestTerminalTransitionsLeaveTheCommandNotDueAndDirectlyGettable(t *testing.
 				t.Fatalf("the stored revision %d is not the one the transition returned %d", stored.Revision, terminal.Revision)
 			}
 
+			scope, err := store.deriveSessionScope(terminal.Record.TenantID, terminal.Record.SessionID)
+			if err != nil {
+				t.Fatalf("deriveSessionScope: %v", err)
+			}
 			page, err := store.backend.OrderedIndex.ListDue(
-				context.Background(), inboxNamespace, inboxAfterDue.Add(24*time.Hour).UnixMilli(), "", 10)
+				context.Background(), shardNamespace(inboxNamespace, scope.ControlShard),
+				inboxAfterDue.Add(24*time.Hour).UnixMilli(), "", 10)
 			if err != nil {
 				t.Fatalf("ListDue: %v", err)
 			}

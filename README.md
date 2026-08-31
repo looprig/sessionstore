@@ -222,21 +222,35 @@ drops the ones that match nothing. It is a bounded read that takes no action —
 what a Host does about an expired gate is gate continuation, which this package
 does not yet implement.
 
-Its missing continuation is a liveness hazard rather than an ergonomic gap, and
-a caller has to know it. A remnant intent is dropped from the page but never
-retired: `OpenGate` writes the intent before the projection, so an intent with
-no matching open gate cannot be told apart from a gate being opened right now,
-and a reader that retired what it drops would race a live open. Because the due
-view is deadline-ordered and this call has no resume position, `Limit` remnants
-at the head of the order mask every live gate behind them indefinitely — and a
-Host that re-projects wholesale produces one remnant per gate it drops, so a few
-hundred ordinary re-projections can silently switch expiry off deployment-wide.
+`ListDueGates` reads ONE control shard and takes a continuation; see the shard
+section below. A remnant intent — one whose gate the session's durable record no
+longer projects — is REPORTED rather than dropped, in `DueGatePage.Remnants`,
+with the revision a retirement names. It is not retired by the reader, and it
+cannot be: `OpenGate` writes the intent before the projection, so an intent with
+no matching open gate is indistinguishable, in its bytes, from a gate being
+opened right now.
 
-`DueGatePage` therefore reports `Examined` and the effective `Limit` beside its
-gates: `Examined == Limit` with no gates is head-of-line blocking rather than an
-empty answer, and it is the only signal available until a continuation exists. A
-later task adds that continuation and, with it, whatever retires remnants
-safely; until then no caller may treat this as a sweep.
+Without a resume position that would be permanent head-of-line blocking. The due
+view is deadline-ordered, a remnant's deadline is in the past and never changes,
+and a Host that re-projects wholesale produces one remnant per gate it drops —
+so `Limit` remnants at the head of the order would mask every live gate behind
+them indefinitely, and a few hundred ordinary re-projections could silently
+switch expiry off. `NextCursor` is the fix, and a page budget would not have
+been: bounding a pass's cost does nothing about the row that is blocking it. The
+continuation steps PAST a row that reported nothing, so a caller that pages a
+shard to exhaustion sees every due row in it.
+
+A gate that is genuinely open and past its deadline is different: it stays in
+the view and is reported on every fresh pass, because it is current due work
+that nothing has dealt with. It does not block, because the continuation moves
+past it within a pass.
+
+`DueGatePage` still reports `Examined`, `Unreadable` and the effective `Limit`.
+They answer a different question from the continuation: whether a full page
+reported nothing, and whether rows were skipped because they could not be read
+at all. An unreadable row is SKIPPED and counted rather than failing the page —
+failing on one would switch gate expiry off for every tenant in the shard until
+someone repaired the row by hand.
 
 Retiring an intent is a tombstone rather than an erasure: the record stays
 readable for audit, its identity can never be reused to reopen the same gate,
@@ -691,6 +705,75 @@ repeated release is a success that writes nothing, because a caller cannot tell
 a lost reply from a failure. A claim that is not the caller's is refused with
 `held` while it is live and `lapsed` once it is not: the first says wait, the
 second says nobody is working and there is nothing of yours to release.
+
+## Fixed control shards: bounded, cross-tenant reconciliation
+
+Reconciliation asks "what work is due anywhere?", which is a question about
+wall-clock time rather than about a tenant. `OrderedIndex.ListDue` answers
+exactly that and is NAMESPACE-WIDE — it takes no scope — so the unit a sweep can
+address is a namespace, and a control shard is therefore a namespace suffix.
+Outstanding records — inbox commands and gate deadline intents — are filed in
+`<base>/<four hex digits>`, chosen by a stable domain-separated hash of
+`(TenantID, SessionID)`. Their ORDERING SCOPE is unchanged: still the session's
+physical namespace, so two sessions that hash into one shard cannot collide, and
+every named read and write still works from the session's own scope with no
+lookup.
+
+The count is FIXED AND PERSISTED, in the backend's layout marker beside the
+layout and the key algorithm. `WithControlShards` names it at `Open`, the marker
+is compared for byte equality on every later `Open`, and a mismatch is refused
+with `KeyspaceLayoutMismatch` before any session I/O. That refusal IS the
+migration constraint: the count is an input to the placement hash, so a
+deployment that reopened a populated backend with a different one would file new
+records in shards no sweep of the old count visits and look for existing ones
+where they are not — a silent, unbounded loss of reconciliation with nothing to
+report it. Changing the count for a populated backend is an offline migration
+that moves the records.
+
+`ListDueCommands(shard, before, limit, cursor)` and the sharded `ListDueGates`
+are the queries. Their cost is the page: rows come from one namespace's due
+view, so a terminal command (`inboxDue` files it `not_due`) is not in the view
+at all, a historical session contributes nothing, and the tenant count does not
+appear. Nothing on either path reads the catalog to FIND work or enumerates a
+session's inbox. A sweeper visits every shard round-robin and pages each to
+exhaustion; the store deliberately does not loop for it, because one call
+sweeping every shard would put the whole deployment's reconciliation behind one
+request's latency.
+
+Both are cross-tenant and must never be reachable by a tenant principal. THERE
+IS NO CAPABILITY GATE IN THIS PACKAGE — SessionStore takes identities as data
+and authorizes nothing — so what "service-only" buys here is a prose guarantee
+plus a structural hint: a sweep request names no tenant and no session, so there
+is no tenant identity for a handler to forward and nothing to build one from.
+That is weaker than an enforcement and is written plainly rather than implied.
+
+`RetireGateDeadlineIntent` removes a remnant, and it cannot carry even that hint
+— it must name the session whose intent it retires. What protects it is
+revalidation. It re-reads the session's durable record at its own clock reading
+and refuses any gate still projected open; it CASes onto the revision the page
+reported; and it refuses an intent younger than `MinGateIntentRemnantAge`.
+
+That last rule is the one worth reading twice. Inside the window between
+`OpenGate`'s two writes, "crashed open" and "in-flight open" are the same stored
+bytes, and nothing derivable from them distinguishes the two: the deadline is
+caller-supplied and may already be past, and the opening sequence is at or below
+the tip in both cases. Elapsed time is the only discriminator, which is why the
+intent carries `RecordedAt`, stamped once by the store that opened the gate.
+Retiring inside that window would tombstone a live gate's deadline under an
+identity that can never be reused. The comparison spans two processes' clocks
+and is skew-relative; five minutes is chosen far above any plausible interval
+between two writes of one operation, and shrinking it without a real shared
+clock is how it becomes unsafe.
+
+What each absent answer licenses on that path is enumerated in the operation's
+doc comment, because this is a path where absence removes work. In short: an
+absent intent row is refused (`not_found`) because "already retired" has a
+durable spelling and it is a tombstone; a tombstone succeeds and writes nothing;
+and a session with no durable existence — absent record, tombstoned record, or
+unbound witness, exactly `noSuchSession`'s set — PERMITS the retirement, because
+a session that does not durably exist cannot durably project an open gate. Every
+other failure reading the session stops the operation, and a witness bound to a
+DIFFERENT identity is a hash collision and is refused.
 
 ## Object pointers: two high-water marks that a clear retains
 

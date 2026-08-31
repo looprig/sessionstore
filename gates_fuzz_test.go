@@ -38,12 +38,14 @@ func FuzzGateIntentCodec(f *testing.F) {
 		OpenedEventID:    "event-gate-a",
 		OpenedJournalSeq: 5,
 		Deadline:         catalogDeadline,
+		RecordedAt:       catalogActiveAt,
 	}
 	f.Add(seed(valid))
 
 	extreme := valid
 	extreme.OpenedJournalSeq = ^uint64(0)
 	extreme.Deadline = maxRankableTime
+	extreme.RecordedAt = maxRankableTime
 	f.Add(seed(extreme))
 
 	// One seed per fail-closed branch, derived from a real encoding, so the
@@ -58,6 +60,7 @@ func FuzzGateIntentCodec(f *testing.F) {
 		func(m map[string]json.RawMessage) { m["surprise"] = json.RawMessage("1") },
 		func(m map[string]json.RawMessage) { m["gate_id"] = json.RawMessage(`""`) },
 		func(m map[string]json.RawMessage) { m["opened_journal_seq"] = json.RawMessage("0") },
+		func(m map[string]json.RawMessage) { m["recorded_at"] = json.RawMessage(`"0000-01-01T00:00:00Z"`) },
 		func(m map[string]json.RawMessage) { m["deadline"] = json.RawMessage(`"3000-01-01T00:00:00Z"`) },
 	} {
 		copied := make(map[string]json.RawMessage, len(members))

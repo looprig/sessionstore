@@ -213,6 +213,7 @@ const (
 	CatalogErrorIdentity  CatalogErrorCode = "identity"
 	CatalogErrorEpoch     CatalogErrorCode = "epoch"
 	CatalogErrorSequence  CatalogErrorCode = "sequence"
+	CatalogErrorTooSoon   CatalogErrorCode = "too_soon"
 	CatalogErrorConflict  CatalogErrorCode = "conflict"
 	CatalogErrorUnknown   CatalogErrorCode = "unknown"
 	CatalogErrorBackend   CatalogErrorCode = "backend"
@@ -391,6 +392,7 @@ type InboxErrorCode string
 
 const (
 	InboxErrorInvalid         InboxErrorCode = "invalid"
+	InboxErrorCursor          InboxErrorCode = "cursor"
 	InboxErrorCommandMismatch InboxErrorCode = "command_mismatch"
 	InboxErrorNotFound        InboxErrorCode = "not_found"
 	InboxErrorDeleted         InboxErrorCode = "deleted"

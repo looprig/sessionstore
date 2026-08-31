@@ -92,13 +92,39 @@ func mustReadGates(t *testing.T, store *Store) sessionwire.GatePage {
 	return page
 }
 
+// mustListDueGates sweeps EVERY control shard round-robin, following each
+// shard's own continuation to exhaustion, and merges the result. That is what a
+// Factory replica does, and doing it here rather than reading one shard is what
+// keeps these tests independent of which shard a fixture's identities happen to
+// hash into.
+//
+// The merged page has no NextCursor by construction: every shard was paged to
+// exhaustion, so there is no position left to resume from.
 func mustListDueGates(t *testing.T, store *Store, before time.Time) DueGatePage {
 	t.Helper()
-	page, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: before, Limit: 50})
-	if err != nil {
-		t.Fatalf("ListDueGates: %v", err)
+	var merged DueGatePage
+	for shard := range store.ControlShards() {
+		req := ListDueGatesRequest{Shard: shard, DueAtOrBefore: before, Limit: 50}
+		for pages := 0; ; pages++ {
+			if pages > 64 {
+				t.Fatalf("shard %d did not exhaust", shard)
+			}
+			page, err := store.ListDueGates(context.Background(), req)
+			if err != nil {
+				t.Fatalf("ListDueGates(shard %d): %v", shard, err)
+			}
+			merged.Gates = append(merged.Gates, page.Gates...)
+			merged.Remnants = append(merged.Remnants, page.Remnants...)
+			merged.Examined += page.Examined
+			merged.Unreadable += page.Unreadable
+			merged.Limit = page.Limit
+			if page.NextCursor == "" {
+				break
+			}
+			req = ListDueGatesRequest{Shard: shard, Cursor: page.NextCursor, Limit: 50}
+		}
 	}
-	return page
+	return merged
 }
 
 func gateIDs(page sessionwire.GatePage) []string {
@@ -130,7 +156,16 @@ func testGateIntent() gateIntent {
 		OpenedEventID:    "event-gate-a",
 		OpenedJournalSeq: 5,
 		Deadline:         catalogDeadline,
+		RecordedAt:       catalogActiveAt,
 	}
+}
+
+// isShardOf reports whether a namespace is one of base's control shards. A test
+// that names a record's partition has to spell it the way the shard grammar
+// does, and asserting the BASE rather than one shard is what keeps such a test
+// independent of which shard a fixture's identities happen to hash into.
+func isShardOf(namespace, base string) bool {
+	return strings.HasPrefix(namespace, base+"/") && len(namespace) == len(base)+5
 }
 
 func mustEncodeGateIntent(t *testing.T, intent gateIntent) []byte {
@@ -348,7 +383,7 @@ func TestOpenGateWritesIntentBeforeProjection(t *testing.T) {
 	intentAt, projectionAt := -1, -1
 	for i, call := range ordered.snapshot()[before:] {
 		switch {
-		case call.op == "create" && call.id.Namespace == gateNamespace && intentAt < 0:
+		case call.op == "create" && isShardOf(call.id.Namespace, gateNamespace) && intentAt < 0:
 			intentAt = i
 		case call.op == "update" && call.id.Namespace == catalogNamespace && projectionAt < 0:
 			projectionAt = i
@@ -387,7 +422,7 @@ func TestResolveGateRetiresIntentAfterProjection(t *testing.T) {
 	retireAt, projectionAt := -1, -1
 	for i, call := range ordered.snapshot()[before:] {
 		switch {
-		case call.id.Namespace == gateNamespace && (call.op == "delete" || call.op == "update") && retireAt < 0:
+		case isShardOf(call.id.Namespace, gateNamespace) && (call.op == "delete" || call.op == "update") && retireAt < 0:
 			retireAt = i
 		case call.op == "update" && call.id.Namespace == catalogNamespace && projectionAt < 0:
 			projectionAt = i
@@ -910,6 +945,7 @@ func TestListDueGatesReportsOnlyGatesTheProjectionStillOpens(t *testing.T) {
 	orphan := gateIntent{
 		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-orphan",
 		OpenedEventID: "event-gate-orphan", OpenedJournalSeq: 9, Deadline: bound.Add(-time.Hour),
+		RecordedAt: catalogActiveAt,
 	}
 	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-orphan", mustEncodeGateIntent(t, orphan), orphan.Deadline)
 	// An intent whose session has no catalog record at all.
@@ -938,7 +974,7 @@ func TestListDueGatesReportsOnlyGatesTheProjectionStillOpens(t *testing.T) {
 }
 
 func TestListDueGatesHonoursItsLimit(t *testing.T) {
-	store := openTestStore(t)
+	store := openOneShardStore(t)
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	for i := range 3 {
 		mustOpenGateOn(t, store, catalogTenant, "session-1",
@@ -966,7 +1002,7 @@ func TestListDueGatesHonoursItsLimit(t *testing.T) {
 }
 
 func TestListDueGatesReportsWhenAPageWasConsumedByRemnants(t *testing.T) {
-	store := openTestStore(t)
+	store := openOneShardStore(t)
 	bound := catalogDeadline
 	mustPrepareSession(t, store, catalogTenant, "session-a", 100)
 	// Three gates opened and then dropped by an ordinary wholesale
@@ -1015,7 +1051,7 @@ func TestListDueGatesReportsWhenAPageWasConsumedByRemnants(t *testing.T) {
 }
 
 func TestListDueGatesRejectsAnInvalidRequest(t *testing.T) {
-	store := openTestStore(t)
+	store := openOneShardStore(t)
 	for _, tt := range []struct {
 		name string
 		req  ListDueGatesRequest
@@ -1040,7 +1076,7 @@ func TestListDueGatesRejectsAnInvalidRequest(t *testing.T) {
 // exist; a provider that is merely failing supports no such claim, and a page
 // that returned empty here would report "nothing is due" during an outage.
 func TestListDueGatesDoesNotReadAProviderFailureAsAnAbsentSession(t *testing.T) {
-	store, hostile := openHostileListStore(t)
+	store, hostile := openHostileOneShardStore(t)
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	mustOpenGateOn(t, store, catalogTenant, "session-1",
 		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(-time.Hour)))
@@ -1081,6 +1117,7 @@ func TestListDueGatesDoesNotAnswerOneTenantWithAnother(t *testing.T) {
 	orphan := gateIntent{
 		TenantID: catalogOtherTenant, SessionID: shared, GateID: due.GateID,
 		OpenedEventID: due.OpenedEventID, OpenedJournalSeq: due.OpenedJournalSeq, Deadline: due.Deadline,
+		RecordedAt: catalogActiveAt,
 	}
 	putRawGateIntent(t, store, catalogOtherTenant, shared, due.GateID, mustEncodeGateIntent(t, orphan), orphan.Deadline)
 
@@ -1099,11 +1136,12 @@ func TestListDueGatesDoesNotAnswerOneTenantWithAnother(t *testing.T) {
 // stored intent to the identity the provider filed it under rather than
 // trusting either one alone.
 func TestListDueGatesRejectsAnIntentThatNamesAnotherGate(t *testing.T) {
-	store := openTestStore(t)
+	store := openOneShardStore(t)
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	impostor := gateIntent{
 		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-b",
 		OpenedEventID: "event-gate-b", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
+		RecordedAt: catalogActiveAt,
 	}
 	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-a", mustEncodeGateIntent(t, impostor), impostor.Deadline)
 
@@ -1114,12 +1152,13 @@ func TestListDueGatesRejectsAnIntentThatNamesAnotherGate(t *testing.T) {
 // of that identity: the record's bytes name a session, and the ordering scope
 // it was filed under must be that session's.
 func TestListDueGatesRejectsAnIntentFiledUnderAnotherSession(t *testing.T) {
-	store := openTestStore(t)
+	store := openOneShardStore(t)
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
 	misfiled := gateIntent{
 		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-a",
 		OpenedEventID: "event-gate-a", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
+		RecordedAt: catalogActiveAt,
 	}
 	// Filed under session-2's order scope while claiming session-1.
 	putRawGateIntent(t, store, catalogTenant, "session-2", "gate-a", mustEncodeGateIntent(t, misfiled), misfiled.Deadline)
@@ -1132,7 +1171,7 @@ func TestListDueGatesRejectsAnIntentFiledUnderAnotherSession(t *testing.T) {
 // one can only arrive by a provider filing the record wrongly in the first
 // place — the same reachability class as a misfiled ordering scope.
 func TestListDueGatesRejectsAnIntentRankedIntoAnotherSession(t *testing.T) {
-	store := openTestStore(t)
+	store := openOneShardStore(t)
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
 	other, err := store.deriveSessionScope(catalogTenant, "session-2")
@@ -1142,6 +1181,7 @@ func TestListDueGatesRejectsAnIntentRankedIntoAnotherSession(t *testing.T) {
 	intent := gateIntent{
 		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-a",
 		OpenedEventID: "event-gate-a", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
+		RecordedAt: catalogActiveAt,
 	}
 	scope, err := store.deriveSessionScope(catalogTenant, "session-1")
 	if err != nil {
@@ -1163,7 +1203,7 @@ func TestListDueGatesRejectsAnIntentRankedIntoAnotherSession(t *testing.T) {
 // gate as expired because its INDEX said so while the record's own bytes named
 // a deadline a day away.
 func TestListDueGatesRejectsAnIntentDueAtSomethingElse(t *testing.T) {
-	store := openTestStore(t)
+	store := openOneShardStore(t)
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	mustOpenGateOn(t, store, catalogTenant, "session-1",
 		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(24*time.Hour)))
@@ -1185,7 +1225,7 @@ func TestListDueGatesRejectsAnIntentDueAtSomethingElse(t *testing.T) {
 // one would be reporting a gate as expired on the strength of an index entry
 // that says it will never come due.
 func TestListDueGatesRejectsAnIntentFiledNotDue(t *testing.T) {
-	store, hostile := openHostileListStore(t)
+	store, hostile := openHostileOneShardStore(t)
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	deadline := catalogDeadline.Add(-time.Hour)
 	mustOpenGateOn(t, store, catalogTenant, "session-1", gateWithDeadline(testGate("gate-a", 5), deadline))
@@ -1205,7 +1245,7 @@ func TestListDueGatesRejectsAnIntentFiledNotDue(t *testing.T) {
 // returned. Serving one would report a RETIRED gate as due, which is the exact
 // outcome resolving a gate exists to prevent.
 func TestListDueGatesRefusesATombstonedRow(t *testing.T) {
-	store, hostile := openHostileListStore(t)
+	store, hostile := openHostileOneShardStore(t)
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	mustOpenGateOn(t, store, catalogTenant, "session-1",
 		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(-time.Hour)))
@@ -1224,7 +1264,7 @@ func TestListDueGatesRefusesATombstonedRow(t *testing.T) {
 // intent arriving behind a well-filed one for the same session is exactly the
 // row a per-session check would wave through.
 func TestListDueGatesChecksEveryRowsFiling(t *testing.T) {
-	store := openTestStore(t)
+	store := openOneShardStore(t)
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
 	// Sorted first by an earlier deadline, so it resolves session-1 into the
@@ -1234,6 +1274,7 @@ func TestListDueGatesChecksEveryRowsFiling(t *testing.T) {
 	misfiled := gateIntent{
 		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-b",
 		OpenedEventID: "event-gate-b", OpenedJournalSeq: 6, Deadline: catalogDeadline.Add(-time.Hour),
+		RecordedAt: catalogActiveAt,
 	}
 	putRawGateIntent(t, store, catalogTenant, "session-2", "gate-b", mustEncodeGateIntent(t, misfiled), misfiled.Deadline)
 
@@ -1253,12 +1294,13 @@ func TestListDueGatesRejectsAMisfiledRowWithoutReadingTheSession(t *testing.T) {
 	base := memstore.New()
 	ordered := &recordingOrdered{OrderedIndex: base.OrderedIndex}
 	base.OrderedIndex = ordered
-	store := openStore(t, base)
+	store := openStore(t, base, WithControlShards(1))
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
 	misfiled := gateIntent{
 		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-a",
 		OpenedEventID: "event-gate-a", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
+		RecordedAt: catalogActiveAt,
 	}
 	putRawGateIntent(t, store, catalogTenant, "session-2", "gate-a", mustEncodeGateIntent(t, misfiled), misfiled.Deadline)
 
@@ -1272,7 +1314,7 @@ func TestListDueGatesRejectsAMisfiledRowWithoutReadingTheSession(t *testing.T) {
 }
 
 func TestListDueGatesStepsOverACorruptIntent(t *testing.T) {
-	store := openTestStore(t)
+	store := openOneShardStore(t)
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-a", []byte("{not json"), catalogDeadline.Add(-time.Hour))
 
@@ -1289,7 +1331,8 @@ func TestGateFailuresAreRedacted(t *testing.T) {
 	base := memstore.New()
 	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
 	base.OrderedIndex = hostile
-	store := openStore(t, base)
+	// One shard, so the due page below names the shard the fixture is in.
+	store := openStore(t, base, WithControlShards(1))
 	openGateFixture(t, store)
 	// A due gate exists before the provider is armed, so the due page really
 	// reaches a session read and fails there rather than returning empty.
@@ -1347,6 +1390,7 @@ func TestGateFailuresAreRedacted(t *testing.T) {
 func TestGateIntentRoundTripsToACanonicalForm(t *testing.T) {
 	intent := testGateIntent()
 	intent.Deadline = catalogDeadline.In(time.FixedZone("elsewhere", 3600))
+	intent.RecordedAt = catalogActiveAt.In(time.FixedZone("elsewhere", -7200))
 	encoded := mustEncodeGateIntent(t, intent)
 	decoded, err := decodeGateIntent(encoded)
 	if err != nil {
@@ -1354,6 +1398,9 @@ func TestGateIntentRoundTripsToACanonicalForm(t *testing.T) {
 	}
 	if decoded.Deadline.Location() != time.UTC {
 		t.Fatalf("deadline was not canonicalized to UTC: %v", decoded.Deadline)
+	}
+	if decoded.RecordedAt.Location() != time.UTC {
+		t.Fatalf("recorded instant was not canonicalized to UTC: %v", decoded.RecordedAt)
 	}
 	if !decoded.Deadline.Equal(intent.Deadline) {
 		t.Fatalf("deadline instant changed: %v -> %v", intent.Deadline, decoded.Deadline)
@@ -1400,6 +1447,13 @@ func TestGateIntentDecodeFailsClosed(t *testing.T) {
 		{"zero opening sequence", mutate(func(m map[string]json.RawMessage) { m["opened_journal_seq"] = json.RawMessage("0") }), CatalogErrorInvalid},
 		{"zero deadline", mutate(func(m map[string]json.RawMessage) { m["deadline"] = json.RawMessage(`"0001-01-01T00:00:00Z"`) }), CatalogErrorInvalid},
 		{"unrepresentable deadline", mutate(func(m map[string]json.RawMessage) { m["deadline"] = json.RawMessage(`"3000-01-01T00:00:00Z"`) }), CatalogErrorInvalid},
+		// The recorded instant is bounded like every other instant this package
+		// stores. Unbounded, an intent carrying a year Go's encoder cannot
+		// spell would be refused at Marshal with an untyped failure instead of
+		// here — and the retirement window is arithmetic on this value, so an
+		// unrepresentable one would also be an age no clock reading can reach.
+		{"zero recorded instant", mutate(func(m map[string]json.RawMessage) { m["recorded_at"] = json.RawMessage(`"0001-01-01T00:00:00Z"`) }), CatalogErrorInvalid},
+		{"unrepresentable recorded instant", mutate(func(m map[string]json.RawMessage) { m["recorded_at"] = json.RawMessage(`"3000-01-01T00:00:00Z"`) }), CatalogErrorInvalid},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if _, err := decodeGateIntent(tt.value); err == nil {
@@ -1431,7 +1485,7 @@ func TestGateIntentSizeCeilingCoversEveryMember(t *testing.T) {
 	// The measurement recorded in maxGateIntentEncodedBytes' comment. It is
 	// asserted exactly so that a change to the record forces the comment to be
 	// re-measured rather than being absorbed by headroom until it is not.
-	const measured = 6322
+	const measured = 6374
 
 	wire := reflect.New(reflect.TypeOf(gateIntentWire{})).Elem()
 	// Control bytes are valid in a sessionwire id and encoding/json spells them
@@ -1675,6 +1729,7 @@ func TestGateIntentFilingIsHeldToTheRecord(t *testing.T) {
 	otherGate := mustEncodeGateIntent(t, gateIntent{
 		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-b",
 		OpenedEventID: "event-gate-b", OpenedJournalSeq: 5, Deadline: deadline,
+		RecordedAt: catalogActiveAt,
 	})
 
 	// The whole row check a due page performs, in the order it performs it.
@@ -1802,6 +1857,28 @@ func TestGateIntentFilingIsHeldToTheRecord(t *testing.T) {
 // stopped surfacing per-row reasons; what the list path can still prove — and
 // what these tests exist for — is that the check is WIRED IN and that the row
 // does not take the deployment-wide deadline view down with it.
+// openOneShardStore opens a store with a single control shard.
+//
+// It is for the tests that call ListDueGates DIRECTLY, which name one shard and
+// therefore need every fixture to be in it. Sharding is a property of where a
+// record is filed, not of what a due page means, so collapsing it to one shard
+// removes a variable these tests are not about; the round-robin across shards
+// is driven by mustListDueGates and by the shard tests.
+func openOneShardStore(t *testing.T) *Store {
+	t.Helper()
+	return openStore(t, memstore.New(), WithControlShards(1))
+}
+
+// openHostileOneShardStore is openHostileListStore's single-shard counterpart,
+// for the same reason openOneShardStore exists.
+func openHostileOneShardStore(t *testing.T) (*Store, *hostileOrdered) {
+	t.Helper()
+	base := memstore.New()
+	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = hostile
+	return openStore(t, base, WithControlShards(1)), hostile
+}
+
 func assertDueGatesStepOver(t *testing.T, store *Store, unreadable int) DueGatePage {
 	t.Helper()
 	due, err := store.ListDueGates(context.Background(), ListDueGatesRequest{

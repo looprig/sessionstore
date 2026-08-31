@@ -284,7 +284,12 @@ func (o *hostileOrdered) Get(ctx context.Context, id storage.OrderedID) (storage
 	o.mu.Lock()
 	getErr, namespace, rewrite := o.getErr, o.getNamespace, o.rewrite
 	o.mu.Unlock()
-	if getErr != nil && (namespace == "" || namespace == id.Namespace) {
+	// A namespace matches its own control shards too. A caller names the
+	// namespace FAMILY a record kind occupies — "the gate intents" — and a
+	// sharded kind spells that family as a base plus one shard segment, so
+	// matching the base exactly would arm this fake against a namespace no
+	// record is ever filed in and disarm it silently.
+	if getErr != nil && (namespace == "" || namespace == id.Namespace || isShardOf(id.Namespace, namespace)) {
 		return storage.OrderedRecord{}, getErr
 	}
 	record, err := o.OrderedIndex.Get(ctx, id)
