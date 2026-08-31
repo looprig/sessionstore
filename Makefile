@@ -52,43 +52,61 @@ FUZZTIME ?= 30s
 FUZZ_TARGETS = $(shell GOWORK=off go test -list '^Fuzz' . | grep '^Fuzz')
 FUZZLOGS ?= .fuzzlogs
 
-# Classifying a fuzz failure: REPLAY, not message text.
+# Classifying a fuzz failure: what the ARTIFACT does, and what nobody can know.
 #
-# A failing target has three shapes and only one of them is a finding, so a
-# failure ends by saying which shape it was and where the full text is. The
-# output is streamed AND kept because that text is the whole diagnosis and it is
-# exactly what a scrolled or piped run loses — which cost one investigation.
+# A failure ends by saying which shape it was and where the full text is. The
+# output is streamed AND kept because that text is part of the diagnosis and it
+# is exactly what a scrolled or piped run loses — which cost one investigation.
 #
-# The discriminator is the ARTIFACT REPLAYING, and getting there took two wrong
-# answers worth recording so they are not re-derived:
+# Three answers were tried here and the first two were wrong in the same way, so
+# they are recorded rather than left to be re-derived:
 #
 #   - "Only an input-attributed failure writes under testdata/fuzz" is FALSE. A
-#     run interrupted while MINIMIZING writes a file too, and that file replays
-#     clean. So presence of an artifact does not make a finding.
-#   - "The message text separates them" is also FALSE, and dangerously so. A
-#     target that dies of a runtime fatal error — `concurrent map writes`, a
-#     stack overflow — kills its worker, so it prints the same "hung or
-#     terminated unexpectedly" a killed worker prints, AND writes a real
-#     reproducer. Classifying on text sends an operator away from a genuine
-#     crash. No ordering of text patterns can fix that, because nothing in the
-#     text distinguishes the two cases.
+#     run interrupted while MINIMIZING writes a file too. Presence of an
+#     artifact does not make a finding.
+#   - "The message text separates them" is FALSE and dangerous. A target that
+#     dies of a runtime fatal error — concurrent map writes, a stack overflow —
+#     kills its worker, so it prints the same "hung or terminated unexpectedly"
+#     a killed worker prints, AND writes a real reproducer. No ordering of text
+#     patterns fixes that: nothing in the text distinguishes the two.
+#   - "An artifact that replays clean was left by an interrupted run" is ALSO
+#     FALSE, and it is the converse of a true observation, which is why it looks
+#     safe. What is true is that an interrupted run leaves an artifact that
+#     replays clean. The converse fails for every finding that is not
+#     reproducible from ONE input in a FRESH process: accumulation, resource
+#     exhaustion, cold start, first-write, ordering between inputs. Those are
+#     ordinary classes. Acting on the converse deleted a real reproducer and
+#     exited zero.
 #
-# What does distinguish them is what the artifact DOES: replay it, and let its
-# exit status decide. A failing replay is the reproducer, whatever message the
-# run printed. A clean replay means the file is debris, and the debris is
-# REMOVED rather than reported: this run created it, it proves nothing, and Go
-# reads testdata/fuzz as the seed corpus, so leaving it converts an interrupted
-# run into a permanent warmup failure on every run afterwards. Message text is
-# consulted only when no artifact was written at all, where it separates a dead
-# worker from a committed seed corpus entry that no longer passes.
+# So the classifier asserts only what it can establish. A REPLAY THAT FAILS is a
+# finding, whatever the run printed — and the replay runs -count=5, because a
+# repetition-dependent failure is cheap to convert into a definite finding and
+# expensive to misfile. A REPLAY THAT PASSES establishes that the input alone in
+# a fresh process is not enough, and NOTHING MORE: it is reported as
+# UNREPRODUCIBLE, a name that is true of an interrupted run and of a
+# multi-input finding alike, and it FAILS THE BUILD.
 #
-# ENVIRONMENTAL failures are RETRIED ONCE, and only they. The class is now
-# provable rather than guessed — the artifact replayed clean, or no artifact
-# exists and the message says the coordinator lost a worker — and by definition
-# it is not attributable to this package. `make check` is the gate every task in
-# this program runs, so a stage that fails once in a few dozen runs for reasons
-# outside the package is a tax on every future task. A failure that recurs on
-# the retry is reported and fails the build; both logs are kept.
+# The artifact is QUARANTINED, never deleted. Moving it out of testdata/fuzz
+# solves the corpus poisoning completely — an unreproducible entry left there
+# fails every later warmup from inside the corpus instead of from the fuzzer —
+# while keeping the one thing that cannot be reconstructed. .fuzzlogs is
+# gitignored, so a quarantined input is out of the corpus without being out of
+# reach. There is no case in which deleting beats moving.
+#
+# A replay that exits zero having matched NO SUBTEST is not a clean replay, it
+# is no replay at all — an empty -run filter exits zero — so the replay runs -v
+# and a PASS line for the exact subtest is required before its success is
+# believed. Every artifact the run wrote is examined, not the first: a second
+# one left behind poisons the corpus just as well.
+#
+# ONE branch retries, and the split is exactly "premise proven" against "premise
+# assumed". A failure that wrote NO artifact and printed a worker-death message
+# is a case where nothing was attributed to an input — an input-attributed
+# failure always writes an artifact, runtime fatal errors included — so a class
+# that by construction has no input cannot be a masked flaky target. That one is
+# retried once, because `make check` gates every task in this program and Go's
+# coordinator shutdown race is not this package's to fix. Every branch that has
+# an artifact fails the build.
 fuzz:
 	@$(PIPEFAIL) \
 	targets="$(FUZZ_TARGETS)"; \
@@ -108,34 +126,47 @@ fuzz:
 			if GOWORK=off go test -run "^$$target$$" -fuzz "^$$target$$" -fuzztime $(FUZZTIME) . 2>&1 | tee "$$log"; then \
 				rm -f "$$marker"; break; \
 			fi; \
-			artifact="$$(find testdata/fuzz/$$target -type f -newer "$$marker" 2>/dev/null | head -1)"; \
+			artifacts="$$(mktemp)"; \
+			find "testdata/fuzz/$$target" -type f -newer "$$marker" >"$$artifacts" 2>/dev/null || true; \
 			rm -f "$$marker"; \
 			echo "--- $$target failed; full output in $$log"; \
-			class=finding; \
-			if [ -n "$$artifact" ]; then \
-				if GOWORK=off go test -run "^$$target$$/$$(basename "$$artifact")$$" . >"$$log.replay" 2>&1; then \
-					class=environmental; \
-					echo "--- ENVIRONMENTAL: $$artifact was written but REPLAYS CLEAN, so the run was"; \
-					echo "--- interrupted rather than finding anything. Removing it: this run created it,"; \
-					echo "--- it proves nothing, and left in place it joins the seed corpus and fails"; \
-					echo "--- every later run from inside the corpus instead of from the fuzzer."; \
-					rm -f "$$artifact"; \
-					rmdir "$$(dirname "$$artifact")" 2>/dev/null || true; \
-				else \
-					echo "--- REPRODUCER: $$artifact REPLAYS AS A FAILURE (replay output in $$log.replay)."; \
+			examined=0; class=finding; \
+			while IFS= read -r artifact; do \
+				[ -n "$$artifact" ] || continue; \
+				examined=1; \
+				name="$$(basename "$$artifact")"; \
+				replay="$(FUZZLOGS)/$$target.$$name.replay.log"; \
+				if ! GOWORK=off go test -run "^$$target$$/^$$name$$" -count=5 -v . >"$$replay" 2>&1; then \
+					echo "--- REPRODUCER: $$artifact REPLAYS AS A FAILURE (replay in $$replay)."; \
 					echo "--- this is a finding whatever the run printed. Commit it and fix the target."; \
+				elif ! grep -q -- "--- PASS: $$target/$$name" "$$replay"; then \
+					echo "--- UNCLASSIFIED: replaying $$artifact matched no subtest, so its exit status"; \
+					echo "--- says nothing about the input. Left in place; read $$replay and $$log."; \
+				else \
+					quarantine="$(FUZZLOGS)/$$target.$$name.unreplayable"; \
+					mv "$$artifact" "$$quarantine"; \
+					rmdir "$$(dirname "$$artifact")" 2>/dev/null || true; \
+					echo "--- UNREPRODUCIBLE: the run failed and wrote $$name, which does not replay from"; \
+					echo "--- that input alone in a fresh process. That is either an interrupted run or a"; \
+					echo "--- finding needing more than one input: accumulation, cold start, a race."; \
+					echo "--- Quarantined to $$quarantine (kept, and out of the seed corpus); read $$log."; \
 				fi; \
-			elif grep -qE 'unexpected signal|hung or terminated unexpectedly|communicating with fuzzing process|waiting for fuzzing process|context deadline exceeded' "$$log"; then \
-				class=environmental; \
-				echo "--- ENVIRONMENTAL: the coordinator lost a worker and no input was attributed."; \
-			elif grep -q 'failure while testing seed corpus entry' "$$log"; then \
-				echo "--- SEED CORPUS: an entry already committed under testdata/fuzz fails, so no new"; \
-				echo "--- reproducer is written. The offending entry is named in $$log."; \
-			else \
-				echo "--- UNCLASSIFIED: no artifact and no known message; read $$log in full."; \
+			done <"$$artifacts"; \
+			rm -f "$$artifacts"; \
+			if [ "$$examined" = 0 ]; then \
+				if grep -qE 'unexpected signal|hung or terminated unexpectedly|communicating with fuzzing process|waiting for fuzzing process|context deadline exceeded' "$$log"; then \
+					class=environmental; \
+					echo "--- ENVIRONMENTAL: the coordinator lost a worker and no input was attributed."; \
+				elif grep -q 'failure while testing seed corpus entry' "$$log"; then \
+					echo "--- SEED CORPUS: an entry already committed under testdata/fuzz fails, so no new"; \
+					echo "--- reproducer is written. The offending entry is named in $$log."; \
+				else \
+					echo "--- UNCLASSIFIED: no artifact and no known message; read $$log in full."; \
+				fi; \
 			fi; \
 			if [ "$$class" = environmental ] && [ "$$attempt" -lt 2 ]; then \
-				echo "--- retrying $$target once: an environmental failure is not this package's."; \
+				echo "--- retrying $$target once: nothing was attributed to an input, so this failure"; \
+				echo "--- is not this package's. A recurrence fails the build and both logs are kept."; \
 				attempt=$$((attempt + 1)); \
 				continue; \
 			fi; \

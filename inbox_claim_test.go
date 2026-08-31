@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1804,5 +1805,71 @@ func TestClaimTTLIsBoundedAbove(t *testing.T) {
 			}
 			assertInboxUnchanged(t, store, admitted)
 		})
+	}
+}
+
+// declaredInboxStates enumerates the InboxState constants from inbox.go's
+// source, so the state machine's product is closed over what the PACKAGE
+// declares rather than over what this file remembered to register.
+//
+// It is the states half of the discipline declaredStoreOperations applies to
+// the operations, and it closes the last hop: without it a sixth InboxState
+// constant reaches the record's validator and the durable machine while
+// inboxStates — a hand-maintained map — says nothing, and the cross product
+// stays green over five states because five is all it was ever shown.
+func declaredInboxStates(t *testing.T) map[string]bool {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), "inbox.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse inbox.go: %v", err)
+	}
+	states := map[string]bool{}
+	for _, declaration := range file.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || general.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range general.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			// The type is named on the spec, so a constant block that also
+			// declares something else cannot smuggle a non-state in.
+			if name, ok := value.Type.(*ast.Ident); !ok || name.Name != "InboxState" {
+				continue
+			}
+			for _, literal := range value.Values {
+				text, ok := literal.(*ast.BasicLit)
+				if !ok || text.Kind != token.STRING {
+					continue
+				}
+				unquoted, err := strconv.Unquote(text.Value)
+				if err != nil {
+					t.Fatalf("unquote %s: %v", text.Value, err)
+				}
+				states[unquoted] = true
+			}
+		}
+	}
+	if len(states) == 0 {
+		t.Fatal("no InboxState constants were found in inbox.go; the enumerator is not reaching the declarations")
+	}
+	return states
+}
+
+func TestCommandStateMachineCoversEveryDeclaredState(t *testing.T) {
+	t.Parallel()
+
+	declared := declaredInboxStates(t)
+	for state := range declared {
+		if inboxStates[state] == nil {
+			t.Errorf("inbox.go declares the state %q and the machine's tests cannot build a record in it", state)
+		}
+	}
+	for state := range inboxStates {
+		if !declared[state] {
+			t.Errorf("the tests build a record in state %q, which inbox.go no longer declares", state)
+		}
 	}
 }
