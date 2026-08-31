@@ -57,38 +57,76 @@ func FuzzSweepCursorCodec(f *testing.F) {
 	}
 	f.Add(string(gate))
 
+	// Both kinds are driven, and each is required to refuse the other's tokens
+	// and every other shard's. Driving only the commands decoder would leave
+	// the gates kind measuring nothing, which is the asymmetry this package
+	// has already been bitten by once.
+	kinds := []struct {
+		name   string
+		decode func(uint32, sessionwire.Cursor) (int64, storage.DueCursor, error)
+		encode func(uint32, int64, storage.DueCursor) (sessionwire.Cursor, error)
+	}{
+		{"due_commands", store.decodeDueCommandCursor, store.encodeDueCommandCursor},
+		{"due_gates", store.decodeDueGateCursor, store.encodeDueGateCursor},
+	}
+
 	f.Fuzz(func(t *testing.T, token string) {
+		for _, kind := range kinds {
+			fuzzOneSweepCursorKind(t, kind.name, kind.decode, kind.encode, token)
+		}
+		// And no token is ever accepted by BOTH kinds. The two share the
+		// envelope grammar and differ only in their magic and their scope
+		// domain, so this is the assertion that keeps them separate rather
+		// than merely differently spelled.
 		for shard := range uint32(4) {
-			bound, after, err := store.decodeDueCommandCursor(shard, sessionwire.Cursor(token))
+			_, _, commands := store.decodeDueCommandCursor(shard, sessionwire.Cursor(token))
+			_, _, gates := store.decodeDueGateCursor(shard, sessionwire.Cursor(token))
+			if commands == nil && gates == nil {
+				t.Fatalf("shard %d accepted %q as both a due-commands and a due-gates continuation", shard, token)
+			}
+		}
+	})
+}
+
+// fuzzOneSweepCursorKind holds one cursor kind to the two properties a sweep
+// continuation owes its caller: it must not panic on arbitrary bytes, and what
+// it ACCEPTS must be exactly what this store issued for exactly that shard.
+func fuzzOneSweepCursorKind(
+	t *testing.T,
+	name string,
+	decode func(uint32, sessionwire.Cursor) (int64, storage.DueCursor, error),
+	encode func(uint32, int64, storage.DueCursor) (sessionwire.Cursor, error),
+	token string,
+) {
+	t.Helper()
+	{
+		for shard := range uint32(4) {
+			bound, after, err := decode(shard, sessionwire.Cursor(token))
 			if err != nil {
 				continue
 			}
 			// Accepted. It must be exactly what this store would issue for this
 			// shard from what it just decoded — which is what makes acceptance
 			// a statement about origin rather than about shape.
-			reissued, err := store.encodeDueCommandCursor(shard, bound, after)
+			reissued, err := encode(shard, bound, after)
 			if err != nil {
-				t.Fatalf("a token this decoder accepted cannot be reissued: %v", err)
+				t.Fatalf("%s: a token this decoder accepted cannot be reissued: %v", name, err)
 			}
 			if string(reissued) != token {
-				t.Fatalf("accepted a noncanonical token %q; this store would issue %q", token, reissued)
+				t.Fatalf("%s: accepted a noncanonical token %q; this store would issue %q", name, token, reissued)
 			}
 			if len(after) == 0 {
-				t.Fatalf("accepted a continuation with no provider position: %q", token)
+				t.Fatalf("%s: accepted a continuation with no provider position: %q", name, token)
 			}
 			// And it must be accepted for THIS shard alone.
 			for other := range uint32(4) {
 				if other == shard {
 					continue
 				}
-				if _, _, err := store.decodeDueCommandCursor(other, sessionwire.Cursor(token)); err == nil {
-					t.Fatalf("a shard %d continuation was accepted for shard %d", shard, other)
+				if _, _, err := decode(other, sessionwire.Cursor(token)); err == nil {
+					t.Fatalf("%s: a shard %d continuation was accepted for shard %d", name, shard, other)
 				}
 			}
-			// And never as the other kind.
-			if _, _, err := store.decodeDueGateCursor(shard, sessionwire.Cursor(token)); err == nil {
-				t.Fatalf("a due-commands continuation was accepted as a due-gates one: %q", token)
-			}
 		}
-	})
+	}
 }

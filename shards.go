@@ -210,12 +210,17 @@ const (
 // SHARD it was issued for, and to nothing else.
 //
 // The shard is in the scope rather than in the payload because it is an
-// identity the token is FOR, not a value the sweep carries forward. A token
-// accepted for the wrong shard would resume one shard's sweep at another's
-// position, and since a due position is a (due_at, stable_key, ordering_scope)
-// tuple that means silently skipping every row of the target shard that sorts
-// before it — a gap no later pass would ever revisit, because the sweep would
-// have moved on.
+// identity the token is FOR, not a value the sweep carries forward.
+//
+// IT IS DEFENCE IN DEPTH, NOT THE ONLY BARRIER, and an earlier version of this
+// comment claimed more than the contract supports. It said a mis-sharded token
+// would SILENTLY skip rows. It would not: storage's DueCursor contract binds a
+// provider token to the exact namespace and bound that issued it, and a shard
+// IS a namespace here, so ListDue refuses one for another shard with a typed
+// invalid-cursor error. What this binding adds is that the refusal happens
+// HERE, before a provider round trip, and reaches the caller labelled as its
+// own cursor rather than as a failure of the query it was presented to — which
+// are different facts and, for a sweeper, different responses.
 //
 // A sweep names no tenant and no session, so there is nothing else to bind it
 // to; inventing an identity would suggest a scoping this operation does not

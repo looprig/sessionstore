@@ -47,6 +47,48 @@ import (
 // The opposite state — a gate publicly open with no durable record of its
 // deadline — is never produced by these two operations.
 //
+// # The ordering that was NOT chosen, compared like with like
+//
+// The alternative is unarmed intent, then projection, then ARM the intent — the
+// due state written last rather than first. It is worth stating properly
+// because the obvious argument against it is wrong.
+//
+// Under the inverted ordering, an intent that is DUE and has no matching open
+// gate is provably a remnant: the arm happens only after the projection
+// committed, so a due intent means the projection existed and was later
+// removed. An in-flight open's intent is not due at all and never appears in a
+// sweep. The repair for its own crash window — projection committed, arm lost —
+// is "arm the unarmed intent whose gate the record projects as open", which is
+// idempotent, needs no clock, does not depend on skew, and cannot produce a
+// public gate with a tombstoned deadline: a retirement racing an open that is
+// about to arm makes that open fail LOUDLY on the tombstone rather than
+// silently succeed. That is a genuinely better safety story than a time window,
+// and the earlier version of this comment did not say so because it compared
+// this ordering PLUS a retirement sweep against that ordering with NO repair
+// sweep at all.
+//
+// The real costs of inverting are these, and they are the reason the accepted
+// ordering stands:
+//
+//   - A SECOND HOT-PATH WRITE on every open, not just on a retry. The arm is an
+//     extra compare-and-swap per gate opened, where the re-stamp this file does
+//     instead is paid only when an intent already exists.
+//   - A SECOND REPAIR SWEEP, and one that cannot be driven from the due view.
+//     An unarmed intent is by construction NOT DUE, so nothing lists it; the
+//     arm repair would have to be driven from the catalog side — walk sessions
+//     with open gates and check each gate has an armed intent — which is the
+//     per-tenant scan the whole shard design exists to avoid.
+//   - A WIDER LOSS WINDOW WHILE UNREPAIRED. Between the projection write and
+//     the arm, the gate is publicly open with no deadline in any due view. The
+//     accepted ordering's equivalent window has the opposite polarity: the gate
+//     is not yet public, so nothing is waiting on a deadline that is missing.
+//
+// The accepted ordering therefore keeps the cheaper hot path and the safer
+// crash polarity, and pays for it with a clock-dependent retirement window that
+// is documented at MinGateIntentRemnantAge rather than hidden. A future task
+// that needs clock-free retirement should revisit this with the second bullet
+// in hand: it is the one that decides the question.
+//
 // UpdateCatalogHostState still replaces OpenGates wholesale and deliberately
 // does not touch intents: it is the Host's re-projection path, not an
 // incremental gate edit. A gate projected only that way is readable but has no
@@ -300,7 +342,7 @@ func (s *Store) OpenGate(ctx context.Context, req OpenGateRequest) (CatalogEntry
 	// a caller-supplied one could be placed far enough in the past to make its
 	// own in-flight open immediately retireable, which is precisely the window
 	// RecordedAt exists to hold open.
-	intent, err := encodeGateIntent(gateIntent{
+	intent := gateIntent{
 		TenantID:         req.TenantID,
 		SessionID:        req.SessionID,
 		GateID:           gate.GateID,
@@ -308,7 +350,10 @@ func (s *Store) OpenGate(ctx context.Context, req OpenGateRequest) (CatalogEntry
 		OpenedJournalSeq: gate.OpenedJournalSeq,
 		Deadline:         gate.Deadline,
 		RecordedAt:       s.clock.Now(),
-	})
+	}
+	// The encoder returns the CANONICAL intent beside its bytes and that is the
+	// one carried forward, as every other encoder in this package requires.
+	value, intent, err := encodeGateIntent(intent)
 	if err != nil {
 		return CatalogEntry{}, err
 	}
@@ -356,7 +401,7 @@ func (s *Store) OpenGate(ctx context.Context, req OpenGateRequest) (CatalogEntry
 			// already exists when this branch is entered, and this is what
 			// repairs it. commitGateIntent is idempotent by identity and still
 			// refuses an identity held by a different or a resolved gate.
-			if err := s.commitGateIntent(opCtx, scope, gate, intent); err != nil {
+			if err := s.commitGateIntent(opCtx, scope, gate, intent, value); err != nil {
 				return CatalogEntry{}, err
 			}
 			return current, nil
@@ -377,7 +422,7 @@ func (s *Store) OpenGate(ctx context.Context, req OpenGateRequest) (CatalogEntry
 		return CatalogEntry{}, catalogErr(CatalogErrorTooLarge, "open_gates", nil)
 	}
 
-	if err := s.commitGateIntent(opCtx, scope, gate, intent); err != nil {
+	if err := s.commitGateIntent(opCtx, scope, gate, intent, value); err != nil {
 		return CatalogEntry{}, err
 	}
 	next := current.Record
@@ -687,8 +732,9 @@ const (
 
 // dueGateCursorScope binds a continuation to this cursor KIND and to the SHARD
 // it was issued for, and to nothing else; see dueCommandCursorScope for why the
-// shard is in the scope rather than in the payload, and cursor.go for why the
-// scope is a binding tag and not a MAC.
+// shard is in the scope rather than in the payload, for why that binding is
+// defence in depth over the provider's own namespace check rather than the only
+// barrier, and cursor.go for why the scope is a binding tag and not a MAC.
 func (s *Store) dueGateCursorScope(shard uint32) [cursorScopeBytes]byte {
 	return s.keys.digest(digestFrame(
 		"looprig/sessionstore/duegate/cursor/v1", binary.BigEndian.AppendUint32(nil, shard)))
@@ -816,18 +862,49 @@ func noSuchSession(err error) bool {
 	return errors.As(err, &keyspace) && keyspace.Code == KeyspaceBindingNotFound
 }
 
-// commitGateIntent makes one gate's deadline durable. Create is idempotent by
-// identity, so a retry of an interrupted open finds its own intent; what it
-// must not do is silently adopt a DIFFERENT gate's intent under the same
-// identity, or reopen a gate that has already been resolved.
+// commitGateIntent makes one gate's deadline durable, and RE-STAMPS an
+// existing one with this attempt's instant.
+//
+// Create is idempotent by identity, so a retry of an interrupted open finds its
+// own intent; what it must not do is silently adopt a DIFFERENT gate's intent
+// under the same identity, or reopen a gate that has already been resolved.
+//
+// THE RE-STAMP IS A SAFETY REQUIREMENT, NOT AN OPTIMIZATION, and it is the
+// whole reason this function takes a compare-and-swap path at all.
+// MinGateIntentRemnantAge holds a window open across the gap between this write
+// and the projection write that follows it, and the window is measured from
+// RecordedAt. If a retry inherited the FIRST attempt's instant, the ordinary
+// restart path — crash between the two writes, supervisor restarts the Host,
+// retry arrives minutes later — would begin with the window already elapsed,
+// and a sweep landing in the retry's own gap could tombstone the deadline of a
+// gate about to become publicly open. No clock skew and no stalled process is
+// needed for that; the age simply describes the wrong attempt.
+//
+// Every attempt is a new in-flight open, so every attempt restarts the window.
+// That does make the window a rate limit on retries — an intent cannot be
+// retired while opens keep arriving for it — and that is the correct trade:
+// opens arriving for a gate mean the gate is being opened, which is exactly
+// when the deadline must not be removed. TestAnOpenGateRetryDoesNotInheritThe
+// FirstAttemptsRemnantWindow drives the scenario rather than leaving this
+// paragraph to stand for it.
+//
+// A LOST COMPARE-AND-SWAP IS RETURNED, not absorbed. The only writers of this
+// row are this function and the two retirement paths, and both of those DELETE
+// — so a revision conflict here means another attempt re-stamped, and its
+// instant is as fresh as the one this attempt would have written. Returning the
+// conflict anyway is the conservative direction and costs a retry on a path
+// that is already the rare one; concluding freshness from a revision this
+// caller never read would be reasoning about a record it has not seen.
 func (s *Store) commitGateIntent(
 	ctx context.Context,
 	scope sessionScope,
 	gate sessionwire.GateProjection,
+	intent gateIntent,
 	value []byte,
 ) error {
+	id := gateIntentID(scope, gate.GateID)
 	stored, created, err := s.backend.OrderedIndex.Create(
-		ctx, gateIntentID(scope, gate.GateID), scope.SessionNamespace, value, storage.Rank{}, gateDue(gate.Deadline))
+		ctx, id, scope.SessionNamespace, value, storage.Rank{}, gateDue(gate.Deadline))
 	if err != nil {
 		return classifyCatalogOrderedError(err, "gate_intent")
 	}
@@ -843,6 +920,22 @@ func (s *Store) commitGateIntent(
 	}
 	if !existing.matches(gate) {
 		return catalogErr(CatalogErrorConflict, "gate_intent", nil)
+	}
+	// The stored instant is already this attempt's when a caller repeats
+	// within one clock reading. Skipping the write there is not a shortcut
+	// past a check — the record is byte-identical to what the write would
+	// store, because canonicalization is a fixed point and every other member
+	// has just been compared through matches.
+	if existing.RecordedAt.Equal(intent.RecordedAt) {
+		return nil
+	}
+	// The rank and due state are the ones this file files on every path, so
+	// the re-stamp moves the recorded instant and nothing else. A due state
+	// derived from anything but the record is what inboxDue's contract warns
+	// against, and gateDue is that single derivation.
+	if _, err := s.backend.OrderedIndex.Update(
+		ctx, id, stored.Revision, value, storage.Rank{}, gateDue(gate.Deadline)); err != nil {
+		return classifyCatalogOrderedError(err, "gate_intent")
 	}
 	return nil
 }
@@ -933,10 +1026,10 @@ type gateIntent struct {
 	OpenedJournalSeq uint64
 	Deadline         time.Time
 
-	// RecordedAt is the STORE'S OWN clock reading at the moment this intent
-	// first became durable. It is not part of the gate and matches nothing in
-	// the projection; it exists for exactly one consumer, and it is the only
-	// thing that can serve that consumer.
+	// RecordedAt is the STORE'S OWN clock reading at the moment the CURRENT
+	// open attempt made this intent durable. It is not part of the gate and
+	// matches nothing in the projection; it exists for exactly one consumer,
+	// and it is the only thing that can serve that consumer.
 	//
 	// WHY THE RECORD HAS TO CARRY IT. OpenGate makes the intent durable BEFORE
 	// it commits the open projection, deliberately, so that no gate is ever
@@ -955,11 +1048,15 @@ type gateIntent struct {
 	// a start, which is this member. See MinGateIntentRemnantAge for the window
 	// and for what a skewed clock costs.
 	//
-	// It is stamped ONCE, when the intent is created. commitGateIntent is
-	// idempotent by identity and compares with matches, which ignores this
-	// member, so a repeat of an interrupted open finds the ORIGINAL instant
-	// rather than restarting the window — which is what makes the window an age
-	// rather than a rate limit on retries.
+	// IT IS STAMPED BY EVERY ATTEMPT, not once. matches deliberately ignores
+	// it, so an intent stays the same intent across a retry — but the retry
+	// re-stamps it under a compare-and-swap, because the window has to describe
+	// the attempt that is in flight NOW. Inheriting the first attempt's instant
+	// is a live defect, not a theoretical one: it needs no clock skew and no
+	// stalled process, only the ordinary restart path. See commitGateIntent,
+	// which performs the re-stamp and argues the trade, and
+	// TestAnOpenGateRetryDoesNotInheritTheFirstAttemptsRemnantWindow, which
+	// drove the failure before the re-stamp existed.
 	RecordedAt time.Time
 }
 
@@ -983,10 +1080,27 @@ type gateIntentWire struct {
 }
 
 // encodeGateIntent validates and encodes one deadline intent.
-func encodeGateIntent(intent gateIntent) ([]byte, error) {
+//
+// It returns the CANONICAL intent beside the bytes, as encodeReconciliationClaim
+// and the inbox's encoder do, so a caller carries the value the stored bytes are
+// in rather than the one it built.
+//
+// WHAT THAT IS AND IS NOT BUYING HERE, stated plainly because the honest answer
+// is "not much yet". This record's canonicalization only moves two instants to
+// UTC, and commitGateIntent's one use of the returned value compares an instant
+// with time.Equal, which ignores location — so no outcome today depends on it.
+// It is the package's carry-forward CONTRACT, kept because a normalization
+// added to canonicalGateIntent later would otherwise compare one spelling and
+// store another, which is the defect inboxDue's contract describes.
+//
+// It replaced a real redundancy: OpenGate used to encode and then call
+// canonicalGateIntent a second time on the same value, which for the reason
+// above could not change anything. A mutation deleting that second call
+// survived, which is what said so.
+func encodeGateIntent(intent gateIntent) ([]byte, gateIntent, error) {
 	intent, err := canonicalGateIntent(intent)
 	if err != nil {
-		return nil, err
+		return nil, gateIntent{}, err
 	}
 	encoded, err := json.Marshal(gateIntentWire{
 		RecordVersion:    GateIntentRecordVersion,
@@ -999,9 +1113,9 @@ func encodeGateIntent(intent gateIntent) ([]byte, error) {
 		RecordedAt:       intent.RecordedAt,
 	})
 	if err != nil {
-		return nil, catalogErr(CatalogErrorInvalid, "gate_intent", err)
+		return nil, gateIntent{}, catalogErr(CatalogErrorInvalid, "gate_intent", err)
 	}
-	return encoded, nil
+	return encoded, intent, nil
 }
 
 // decodeGateIntent strictly decodes one stored deadline intent and re-validates

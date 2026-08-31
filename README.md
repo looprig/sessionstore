@@ -758,12 +758,39 @@ That last rule is the one worth reading twice. Inside the window between
 bytes, and nothing derivable from them distinguishes the two: the deadline is
 caller-supplied and may already be past, and the opening sequence is at or below
 the tip in both cases. Elapsed time is the only discriminator, which is why the
-intent carries `RecordedAt`, stamped once by the store that opened the gate.
-Retiring inside that window would tombstone a live gate's deadline under an
-identity that can never be reused. The comparison spans two processes' clocks
-and is skew-relative; five minutes is chosen far above any plausible interval
-between two writes of one operation, and shrinking it without a real shared
-clock is how it becomes unsafe.
+intent carries `RecordedAt`, stamped by the store. Retiring inside that window
+would tombstone a live gate's deadline under an identity that can never be
+reused. The comparison spans two processes' clocks and is skew-relative; five
+minutes is chosen far above any plausible interval between two writes of one
+operation, and shrinking it without a real shared clock is how it becomes
+unsafe.
+
+**Every attempt re-stamps, and that is a safety requirement rather than
+bookkeeping.** The first version stamped once, at creation, so a retry inherited
+the first attempt's instant — and the ordinary restart path (crash between the
+two writes, supervisor restarts the Host, retry arrives minutes later) began
+with the window already elapsed. A sweep landing in the retry's own gap could
+then tombstone the deadline of a gate about to become public, with no clock skew
+and no stalled process involved. `commitGateIntent` therefore re-stamps under a
+compare-and-swap when it finds a matching live row. It does make the window a
+rate limit on retries, and that is the right trade: opens arriving for a gate
+mean the gate is being opened, which is exactly when its deadline must not be
+removed. The other interleaving — a retirement landing *before* the retry's
+intent write — is covered by a different mechanism: the retry meets a tombstone
+and fails closed.
+
+**The ordering that was not chosen.** The alternative is unarmed intent, then
+projection, then arm. It is genuinely safer in one respect: a due intent with no
+matching open gate is then provably a remnant, so retirement needs no clock at
+all, and a retirement racing an open that is about to arm makes that open fail
+loudly rather than silently succeed. It was rejected on cost, not on safety: it
+adds a second compare-and-swap to every open rather than only to a retry, and
+its repair sweep — "arm the unarmed intent whose gate is projected open" —
+cannot be driven from the due view, because an unarmed intent is by construction
+not due. That repair would have to walk sessions, which is the per-tenant scan
+the shard design exists to remove. The accepted ordering also has the safer
+crash polarity: its unrepaired window leaves a gate that is *not yet public*,
+where the inverted one leaves a public gate with no deadline in any due view.
 
 What each absent answer licenses on that path is enumerated in the operation's
 doc comment, because this is a path where absence removes work. In short: an

@@ -569,6 +569,25 @@ func classifyInboxOrderedError(err error, field string) error {
 	if errors.As(err, &conflict) {
 		return &InboxError{Code: InboxErrorConflict, Field: field, Revision: conflict.ActualRevision, Cause: err}
 	}
+	// A cursor failure reaches this classifier from ONE caller,
+	// ListDueCommands, and it is a caller mistake rather than a store fault, so
+	// it must not be reported as a backend failure.
+	//
+	// It is reachable even though every provider token this package sends came
+	// out of its own encoder. The cursor envelope's scope field is an unkeyed
+	// TAG over public inputs, as cursor.go states, so a caller can construct a
+	// well-formed envelope for a shard it knows and put arbitrary bytes in the
+	// payload; the envelope accepts it and the provider is the one that
+	// refuses. Reporting that as InboxErrorBackend would tell a sweeper its
+	// store was failing when its token was forged.
+	//
+	// A limit error still has no arm, for the reason the catalog's classifier
+	// gives: every limit this package sends is normalized by pageLimit against
+	// the same ceiling the provider enforces.
+	var cursor *storage.InvalidOrderedCursorError
+	if errors.As(err, &cursor) {
+		return inboxErr(InboxErrorCursor, field, err)
+	}
 	var ambiguous *storage.OrderedAmbiguousError
 	if errors.As(err, &ambiguous) {
 		return inboxErr(InboxErrorUnknown, field, err)

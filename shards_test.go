@@ -484,7 +484,7 @@ func seedRemnantOfACrashBeforeGateOpened(t *testing.T, store *Store, gate sessio
 	if err != nil {
 		t.Fatalf("deriveSessionScope: %v", err)
 	}
-	value, err := encodeGateIntent(gateIntent{
+	value, _, err := encodeGateIntent(gateIntent{
 		TenantID: catalogTenant, SessionID: catalogSession, GateID: gate,
 		OpenedEventID: "event-" + sessionwire.EventID(gate), OpenedJournalSeq: 5,
 		Deadline: catalogDeadline, RecordedAt: store.clock.Now(),
@@ -883,6 +883,19 @@ func TestShardOperationsRefuseAMalformedRequestBeforeTheProvider(t *testing.T) {
 			},
 		},
 		{
+			name:      "due gates stating the bound twice",
+			operation: "ListDueGates",
+			call: func(store *Store) error {
+				_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
+					Shard: 0, DueAtOrBefore: catalogDeadline, Cursor: "not-a-cursor", Limit: 10})
+				return err
+			},
+			assert: func(t *testing.T, err error) {
+				t.Helper()
+				assertCatalogField(t, err, CatalogErrorInvalid, "due_at_or_before")
+			},
+		},
+		{
 			name:      "retire without a gate",
 			operation: "RetireGateDeadlineIntent",
 			call: func(store *Store) error {
@@ -1274,5 +1287,619 @@ func TestConcurrentRetirementsOfOneRemnantTombstoneItOnce(t *testing.T) {
 	}
 	if stored := storedGateIntent(t, store, "gate-crashed"); !stored.Deleted {
 		t.Fatal("the remnant was not tombstoned")
+	}
+}
+
+// --- the open-retry window (F1) -------------------------------------------
+
+// updatingCatalog reports whether the Update the recorder is about to perform
+// is the catalog record's. The recorder logs a call BEFORE it runs the hook, so
+// the most recent update is the one in flight; the alternative is widening a
+// fake that eight other tests share.
+func updatingCatalog(ordered *recordingOrdered) bool {
+	call, ok := ordered.lastOf("update")
+	return ok && call.id.Namespace == catalogNamespace
+}
+
+// interruptOpenAfterItsIntent runs one OpenGate that commits its deadline
+// intent and then loses its projection write, which is the exact state a crash
+// between the two leaves. The interruption is produced by a COMPETING catalog
+// write landing between them, so the open's compare-and-swap loses: no fake
+// error is injected and every byte in the store was written by a real
+// operation.
+func interruptOpenAfterItsIntent(
+	t *testing.T,
+	store *Store,
+	ordered *recordingOrdered,
+	gate sessionwire.GateProjection,
+	tip uint64,
+) {
+	t.Helper()
+	// A plain flag, not sync.Once: the competing write below is itself an
+	// Update, so it re-enters this hook, and sync.Once DEADLOCKS on re-entry
+	// rather than skipping. Everything here runs on one goroutine.
+	competed := false
+	ordered.beforeUpdate = func() {
+		if !competed && updatingCatalog(ordered) {
+			competed = true
+			if _, err := store.UpdateCatalogHostState(context.Background(), UpdateCatalogHostStateRequest{
+				TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1,
+				State: sessionwire.SessionStateRunning, Residency: sessionwire.SessionResidencyResident,
+				LastActiveAt: catalogActiveAt, LastJournalSeq: tip, LastEventID: "event-tip",
+			}); err != nil {
+				t.Errorf("competing write: %v", err)
+			}
+		}
+	}
+	_, err := store.OpenGate(context.Background(), OpenGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: gate,
+	})
+	ordered.beforeUpdate = nil
+	if err == nil {
+		t.Fatal("the fixture did not interrupt the open; it has nothing to prove")
+	}
+	if page := mustReadGates(t, store); len(page.Gates) != 0 {
+		t.Fatalf("the interrupted open still projected a gate: %v", gateIDs(page))
+	}
+	if stored := storedGateIntent(t, store, gate.GateID); stored.Deleted {
+		t.Fatal("the interrupted open left no durable intent; it has nothing to prove")
+	}
+}
+
+// TestAnOpenGateRetryDoesNotInheritTheFirstAttemptsRemnantWindow is the hazard
+// MinGateIntentRemnantAge exists to close, in the form that needs neither clock
+// skew nor a stalled process.
+//
+// The window is measured from RecordedAt, and RecordedAt used to be stamped
+// exactly once, at the first attempt. So the ORDINARY restart path — a Host
+// that crashes between OpenGate's two writes and retries after its supervisor
+// brings it back — began its retry with the window ALREADY OPEN. A sweep
+// landing inside the retry's own intent-to-projection gap could then retire a
+// deadline whose gate was about to become publicly open, which is precisely the
+// state this file's header promises no path produces, under an identity that
+// can never be reused.
+//
+// The retry's own age is what has to govern, because the retry IS a new
+// in-flight open. Nothing about the first attempt's age says anything about how
+// long this one will take.
+func TestAnOpenGateRetryDoesNotInheritTheFirstAttemptsRemnantWindow(t *testing.T) {
+	base := memstore.New()
+	ordered := &recordingOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = ordered
+	clock := newMovableClock(catalogActiveAt)
+	store := openStore(t, base, WithControlShards(1), WithClock(clock))
+	mustPrepareSession(t, store, catalogTenant, catalogSession, 10)
+
+	gate := gateWithDeadline(testGate("gate-a", 5), catalogDeadline)
+	interruptOpenAfterItsIntent(t, store, ordered, gate, 10)
+
+	// The Host restarts and retries well after the window would have elapsed.
+	// Ten minutes is not an unusual restart; it is an ordinary one.
+	clock.set(catalogActiveAt.Add(2 * MinGateIntentRemnantAge))
+
+	// A sweep lands inside the retry's own gap: after its intent write, before
+	// its projection write. This is the interleaving that is NOT protected by
+	// commitGateIntent failing closed on a tombstone — that one is the sweep
+	// landing FIRST, which makes the retry refuse.
+	// The hook fires on the CATALOG write specifically. That is the whole
+	// point of the interleaving: the sweep has to land after the retry's
+	// intent write and before its projection write. Firing on the intent write
+	// instead would reproduce the OTHER interleaving, the one that was already
+	// safe because commitGateIntent fails closed on a tombstone.
+	swept := false
+	var retire error
+	ordered.beforeUpdate = func() {
+		if !swept && updatingCatalog(ordered) {
+			swept = true
+			revision := storedGateIntent(t, store, gate.GateID).Revision
+			retire = store.RetireGateDeadlineIntent(
+				context.Background(), retireRequest(gate.GateID, revision))
+		}
+	}
+	_, openErr := store.OpenGate(context.Background(), OpenGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: gate,
+	})
+	ordered.beforeUpdate = nil
+
+	// The INVARIANT is asserted before the mechanism, so a failure reports the
+	// state the system reached rather than the check that noticed.
+	if openErr != nil {
+		t.Fatalf("the retry failed: %v", openErr)
+	}
+	open := mustReadGates(t, store)
+	tombstoned := storedGateIntent(t, store, gate.GateID).Deleted
+	if len(open.Gates) != 0 && tombstoned {
+		t.Fatalf("gate publicly open = %v with its deadline intent tombstoned (retire returned %v)",
+			gateIDs(open), retire)
+	}
+	if len(open.Gates) != 1 || tombstoned {
+		t.Fatalf("retry left open=%v tombstoned=%v, want the gate open with a live intent",
+			gateIDs(open), tombstoned)
+	}
+	// And the mechanism: the refusal is the retry's OWN age, reported as the
+	// code a sweeper acts on — retry later, rather than re-read.
+	assertCatalogField(t, retire, CatalogErrorTooSoon, "recorded_at")
+}
+
+// TestAnOpenGateRetryFailsClosedOnARetirementThatLandedFirst is the other
+// interleaving of the same race, and it is safe for a different reason.
+//
+// When the sweep retires before the retry's intent write, the retry meets a
+// tombstone: Create returns the tombstoned record, commitGateIntent refuses,
+// and the projection is never written. So the two orderings are covered by two
+// different mechanisms — the re-stamp handles a retirement that arrives after,
+// the tombstone handles one that arrives before — and neither can produce a
+// publicly open gate with no live deadline.
+func TestAnOpenGateRetryFailsClosedOnARetirementThatLandedFirst(t *testing.T) {
+	base := memstore.New()
+	ordered := &recordingOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = ordered
+	clock := newMovableClock(catalogActiveAt)
+	store := openStore(t, base, WithControlShards(1), WithClock(clock))
+	mustPrepareSession(t, store, catalogTenant, catalogSession, 10)
+
+	gate := gateWithDeadline(testGate("gate-a", 5), catalogDeadline)
+	interruptOpenAfterItsIntent(t, store, ordered, gate, 10)
+	clock.set(catalogActiveAt.Add(2 * MinGateIntentRemnantAge))
+
+	// The sweep gets there first, on the first attempt's stale stamp, which is
+	// legitimate: nothing has re-stamped, so this really is an abandoned row.
+	revision := storedGateIntent(t, store, gate.GateID).Revision
+	if err := store.RetireGateDeadlineIntent(
+		context.Background(), retireRequest(gate.GateID, revision)); err != nil {
+		t.Fatalf("RetireGateDeadlineIntent: %v", err)
+	}
+
+	_, err := store.OpenGate(context.Background(), OpenGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: gate,
+	})
+	assertCatalogField(t, err, CatalogErrorDeleted, "gate_intent")
+	if page := mustReadGates(t, store); len(page.Gates) != 0 {
+		t.Fatalf("a refused open still projected a gate: %v", gateIDs(page))
+	}
+}
+
+// --- the cost claim, measured (F2) ----------------------------------------
+
+// sweepCost is what one full round-robin sweep of every shard cost at the
+// provider, broken down by the only distinction that matters here: the due
+// queries the sweep is allowed to make, and everything else, which it is not.
+type sweepCost struct {
+	listDue  int
+	other    int
+	reported int
+	examined int
+}
+
+// sweepEveryShard runs the sweep a Factory replica runs — every shard, each
+// paged to exhaustion — and measures it at the provider.
+func sweepEveryShard(t *testing.T, store *Store, ordered *recordingOrdered, limit int) sweepCost {
+	t.Helper()
+	ordered.reset()
+	var cost sweepCost
+	for shard := range store.ControlShards() {
+		req := ListDueCommandsRequest{Shard: shard, DueAtOrBefore: inboxDeadline, Limit: limit}
+		for pages := 0; ; pages++ {
+			if pages > 64 {
+				t.Fatalf("shard %d did not exhaust", shard)
+			}
+			page, err := store.ListDueCommands(context.Background(), req)
+			if err != nil {
+				t.Fatalf("ListDueCommands(shard %d): %v", shard, err)
+			}
+			cost.reported += len(page.Commands)
+			cost.examined += page.Examined
+			if page.NextCursor == "" {
+				break
+			}
+			req = ListDueCommandsRequest{Shard: shard, Cursor: page.NextCursor, Limit: limit}
+		}
+	}
+	for _, call := range ordered.snapshot() {
+		if call.op == "list_due" {
+			cost.listDue++
+			continue
+		}
+		cost.other++
+	}
+	return cost
+}
+
+// seedShardFixture builds a deployment: `tenants` tenants, each with one
+// session carrying `terminal` commands driven to a terminal state, plus
+// `due` tenants whose session also carries one command still outstanding.
+//
+// The terminal commands are the history the cost claim is about. They are
+// driven through the real transitions rather than written by hand, because
+// what makes them invisible to a sweep is inboxDue filing a terminal record
+// NOT DUE — and a hand-written row would be asserting that rule rather than
+// exercising it.
+func seedShardFixture(t *testing.T, store *Store, tenants, terminal, due int) {
+	t.Helper()
+	for tenant := range tenants {
+		tenantID := sessionwire.TenantID(fmt.Sprintf("tenant-%02d", tenant))
+		session := sessionwire.SessionID("session-a")
+		for i := range terminal {
+			req := testAdmitRequest()
+			req.TenantID, req.SessionID = tenantID, session
+			req.CommandID = sessionwire.CommandID(fmt.Sprintf("history-%d", i))
+			entry, _, err := store.AdmitCommand(context.Background(), req)
+			if err != nil {
+				t.Fatalf("AdmitCommand: %v", err)
+			}
+			applying := mustBeginApplying(t, store, mustClaim(t, store, entry, 1), 1)
+			if _, err := store.CompleteCommand(
+				context.Background(), testCompleteRequest(applying, 1)); err != nil {
+				t.Fatalf("CompleteCommand: %v", err)
+			}
+		}
+		if tenant < due {
+			req := testAdmitRequest()
+			req.TenantID, req.SessionID = tenantID, session
+			req.CommandID = "outstanding"
+			if _, _, err := store.AdmitCommand(context.Background(), req); err != nil {
+				t.Fatalf("AdmitCommand: %v", err)
+			}
+		}
+	}
+}
+
+// TestListDueCommandsCostFollowsShardsAndDueRowsOnly is step 4's cost claim
+// MEASURED rather than asserted.
+//
+// The claim is that one full sweep costs the fixed shard count plus the current
+// due records, and nothing else — not the tenant count, not the terminal
+// commands, not the history. A test that seeds two commands and reads two back
+// demonstrates none of that: a reader that performed a gratuitous Get per row,
+// or one whose cost grew with the deployment, would pass it. So this one builds
+// two deployments that differ by an order of magnitude in tenants and history
+// while carrying the SAME due work, measures both at the provider, and requires
+// the two numbers to be equal.
+func TestListDueCommandsCostFollowsShardsAndDueRowsOnly(t *testing.T) {
+	t.Parallel()
+
+	const shards, outstanding = 4, 3
+	build := func(t *testing.T, tenants, terminal int) (*Store, *recordingOrdered) {
+		t.Helper()
+		base := memstore.New()
+		ordered := &recordingOrdered{OrderedIndex: base.OrderedIndex}
+		base.OrderedIndex = ordered
+		store := openStore(t, base, WithControlShards(shards), WithClock(newMovableClock(inboxAcceptedAt)))
+		seedShardFixture(t, store, tenants, terminal, outstanding)
+		return store, ordered
+	}
+
+	smallStore, smallOrdered := build(t, 3, 1)
+	largeStore, largeOrdered := build(t, 30, 5)
+
+	small := sweepEveryShard(t, smallStore, smallOrdered, 50)
+	large := sweepEveryShard(t, largeStore, largeOrdered, 50)
+
+	// ANTI-VACUITY FIRST: two sweeps that both found nothing would also cost
+	// the same. The due work has to have been reported, and it has to be all of
+	// it.
+	if small.reported != outstanding || large.reported != outstanding {
+		t.Fatalf("reported %d and %d due commands, want %d in both", small.reported, large.reported, outstanding)
+	}
+	// And the terminal rows must not even have been LOOKED at. Examined counts
+	// the rows the provider returned, so equality with the due work is the
+	// statement that a terminal command never entered a page — which is the
+	// half of the claim that lives in inboxDue rather than in this reader.
+	if small.examined != outstanding || large.examined != outstanding {
+		t.Fatalf("examined %d and %d rows, want only the %d due ones", small.examined, large.examined, outstanding)
+	}
+	if largeStore.ControlShards() != shards {
+		t.Fatalf("ControlShards() = %d, want %d", largeStore.ControlShards(), shards)
+	}
+
+	// THE COST. One due query per shard, because every shard exhausts in one
+	// page at this limit, and NOTHING ELSE — no per-row Get, no catalog read,
+	// no walk of a session's inbox.
+	if small.listDue != shards || large.listDue != shards {
+		t.Errorf("due queries = %d and %d, want one per shard (%d)", small.listDue, large.listDue, shards)
+	}
+	if small.other != 0 || large.other != 0 {
+		t.Errorf("the sweep made %d and %d provider calls that are not due queries; it must make none",
+			small.other, large.other)
+	}
+	// The deployment grew tenfold in tenants and fivefold in history between
+	// the two, and the measurement did not move.
+	if small != large {
+		t.Fatalf("cost moved with the deployment: %+v -> %+v", small, large)
+	}
+}
+
+// TestListDueCommandsCostGrowsOnlyWithDueRows is the other half: the cost that
+// IS allowed to move is the one proportional to current due work, and it moves
+// by pages rather than by rows.
+func TestListDueCommandsCostGrowsOnlyWithDueRows(t *testing.T) {
+	t.Parallel()
+
+	base := memstore.New()
+	ordered := &recordingOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = ordered
+	store := openStore(t, base, WithControlShards(1), WithClock(newMovableClock(inboxAcceptedAt)))
+	seedShardFixture(t, store, 9, 2, 9)
+
+	// One shard, nine due rows, three to a page: three pages, and the third is
+	// the one that reports the view exhausted.
+	cost := sweepEveryShard(t, store, ordered, 3)
+	if cost.reported != 9 {
+		t.Fatalf("reported %d due commands, want 9", cost.reported)
+	}
+	if cost.listDue != 3 {
+		t.Errorf("due queries = %d, want ceil(9/3) = 3", cost.listDue)
+	}
+	if cost.other != 0 {
+		t.Errorf("the sweep made %d provider calls that are not due queries", cost.other)
+	}
+}
+
+// --- gates-side twins of rules the commands side already covered ----------
+
+// TestADueGatesCursorCannotBeReplayedIntoAnotherShard is the gates twin of
+// TestADueCommandsCursorCannotBeReplayedIntoAnotherShard, and the asymmetry it
+// closes was structural: the rules written in the new file were covered on both
+// sides, the ones retrofitted into gates.go on one.
+//
+// The FIELD is the assertion, not merely the code. The provider is a backstop
+// here — storage's DueCursor contract binds a token to the exact namespace and
+// bound that issued it, and a shard IS a namespace, so a mis-sharded token
+// would be refused by ListDue too and surface as a cursor failure labelled
+// "due_gates". This store refuses it BEFORE the provider sees it, labelled
+// "cursor", and that difference is what distinguishes a binding that works from
+// one that has been removed.
+func TestADueGatesCursorCannotBeReplayedIntoAnotherShard(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t, memstore.New(), WithControlShards(4))
+	for i := range 8 {
+		session := sessionwire.SessionID(fmt.Sprintf("session-%d", i))
+		mustPrepareSession(t, store, catalogTenant, session, 100)
+		mustOpenGateOn(t, store, catalogTenant, session,
+			gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(-time.Hour)))
+	}
+
+	var issued sessionwire.Cursor
+	issuedShard := -1
+	for shard := range 4 {
+		page, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
+			Shard: shard, DueAtOrBefore: catalogDeadline, Limit: 1,
+		})
+		if err != nil {
+			t.Fatalf("ListDueGates: %v", err)
+		}
+		if page.NextCursor != "" {
+			issued, issuedShard = page.NextCursor, shard
+			break
+		}
+	}
+	if issuedShard < 0 {
+		t.Fatal("no shard issued a continuation; the fixture proves nothing")
+	}
+	for shard := range 4 {
+		if shard == issuedShard {
+			continue
+		}
+		_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{Shard: shard, Cursor: issued, Limit: 1})
+		assertCatalogField(t, err, CatalogErrorCursor, "cursor")
+	}
+	if _, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
+		Shard: issuedShard, Cursor: issued, Limit: 1,
+	}); err != nil {
+		t.Fatalf("the shard that issued the cursor refused it: %v", err)
+	}
+}
+
+// TestOpenGateStampsTheIntentFromTheStoresOwnClock pins the single input the
+// whole MinGateIntentRemnantAge argument rests on.
+//
+// If the stamp came from anywhere else — the caller, the gate's deadline, a
+// constant — every in-flight open would be retireable the moment its intent
+// landed, and the window would be a comment rather than a mechanism. The
+// assertion is EQUALITY with the store's clock reading, not "recent" or
+// "nonzero": an epoch stamp is nonzero.
+func TestOpenGateStampsTheIntentFromTheStoresOwnClock(t *testing.T) {
+	t.Parallel()
+
+	clock := newMovableClock(catalogActiveAt)
+	store := openStore(t, memstore.New(), WithControlShards(1), WithClock(clock))
+	mustPrepareSession(t, store, catalogTenant, catalogSession, 10)
+
+	opened := catalogActiveAt.Add(17 * time.Minute)
+	clock.set(opened)
+	gate := gateWithDeadline(testGate("gate-a", 5), catalogDeadline)
+	mustOpenGate(t, store, 1, gate)
+
+	stored := storedGateIntent(t, store, gate.GateID)
+	intent, err := gateIntentFor(stored)
+	if err != nil {
+		t.Fatalf("gateIntentFor: %v", err)
+	}
+	if !intent.RecordedAt.Equal(opened) {
+		t.Fatalf("recorded instant = %v, want the store's clock reading %v", intent.RecordedAt, opened)
+	}
+	// And the deadline is a DIFFERENT instant, so a stamp that had been taken
+	// from the gate would fail this rather than coincide with it.
+	if intent.RecordedAt.Equal(gate.Deadline) {
+		t.Fatal("the fixture's clock reading equals the deadline; it cannot tell the two sources apart")
+	}
+}
+
+// TestRetireGateDeadlineIntentRetiresIntentsOfATombstonedSession reaches
+// noSuchSession's third leg.
+//
+// The other retire test covers an absent record and an unbound witness by never
+// preparing the session at all, which is one state reached two ways rather than
+// two states. A session that EXISTED and was then tombstoned is the leg neither
+// of them touches, and it is the one that decides whether a reaper that removed
+// a session leaves its deadline intents un-retireable forever.
+func TestRetireGateDeadlineIntentRetiresIntentsOfATombstonedSession(t *testing.T) {
+	t.Parallel()
+
+	store, clock := retireFixture(t)
+	revision := seedRemnantOfACrashBeforeGateOpened(t, store, "gate-orphan")
+
+	scope, err := store.deriveSessionScope(catalogTenant, catalogSession)
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	record, err := store.backend.OrderedIndex.Get(context.Background(), catalogID(scope, catalogSession))
+	if err != nil {
+		t.Fatalf("Get(catalog): %v", err)
+	}
+	if _, err := store.backend.OrderedIndex.Delete(
+		context.Background(), catalogID(scope, catalogSession), record.Revision); err != nil {
+		t.Fatalf("Delete(catalog): %v", err)
+	}
+	clock.set(catalogActiveAt.Add(MinGateIntentRemnantAge))
+
+	if err := store.RetireGateDeadlineIntent(
+		context.Background(), retireRequest("gate-orphan", revision)); err != nil {
+		t.Fatalf("RetireGateDeadlineIntent: %v", err)
+	}
+	if stored := storedGateIntent(t, store, "gate-orphan"); !stored.Deleted {
+		t.Fatal("a tombstoned session's remnant was not retired")
+	}
+}
+
+// TestAVersionOneLayoutMarkerIsRefused pins the operationally relevant codec
+// break, which the strict-codec table does not: that one mutates the version
+// byte upward, to a version nothing ever wrote.
+//
+// A version-1 marker is the one a previous release of this package really
+// produced, and its bytes are not merely unknown — they are ACTIVELY
+// MISREADABLE as version 2. The shard count occupies the two bytes a v1 marker
+// used for the tenant length, so a reader that accepted one would take its
+// shard count from a length field and file every outstanding record in shards
+// nothing sweeps. Failing closed is the migration.
+//
+// THE REFUSAL IS OVER-DETERMINED, and that is recorded rather than implied,
+// because it changes what this test proves. Widening the version check to admit
+// version 1 does NOT make these markers readable: a v1 tenant marker is nine
+// bytes and fails the header length, and a v1 legacy marker's tenant-length
+// field has to double as both a valid shard count and the new length field,
+// which no ordinary tenant name satisfies. So this test pins the OUTCOME — a
+// marker a previous release wrote is refused — and the version byte's own
+// barrier is pinned separately by TestLayoutMarkerStrictCodec's version case.
+func TestAVersionOneLayoutMarkerIsRefused(t *testing.T) {
+	t.Parallel()
+
+	// The exact bytes the version-1 encoder produced, for both layouts.
+	v1 := func(layout keyspaceLayout, tenant string) []byte {
+		out := []byte{'L', 'R', 'K', 'S', 1, byte(layout), keyAlgorithmVersion,
+			byte(len(tenant) >> 8), byte(len(tenant))}
+		return append(out, tenant...)
+	}
+	for name, marker := range map[string][]byte{
+		"tenant layout": v1(layoutTenantV1, ""),
+		"legacy layout": v1(layoutLegacySingleTenantV1, "tenant"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			backend := memstore.New()
+			if _, err := backend.KV.Put(context.Background(), layoutMarkerKey, 0, marker); err != nil {
+				t.Fatalf("Put(marker): %v", err)
+			}
+			_, err := Open(context.Background(), backend, WithLegacySingleTenant("tenant"))
+			assertKeyspaceCode(t, err, KeyspaceMarkerMalformed)
+		})
+	}
+}
+
+// TestAForgedDueCommandsCursorIsACursorFailureNotABackendOne pins the arm
+// classifyInboxOrderedError gained for this path.
+//
+// It is reachable because the envelope's scope is a TAG and not a MAC: anyone
+// who knows a shard number can build a well-formed envelope for it and put
+// arbitrary bytes where the provider's own position belongs. The envelope
+// accepts that token and the PROVIDER refuses it, and the refusal has to reach
+// the caller as what it is. Reporting it as a backend failure would tell a
+// sweeper its store was down when its token was forged — and a sweeper's
+// response to those two is opposite: stop and page an operator, or drop the
+// cursor and restart the shard.
+func TestAForgedDueCommandsCursorIsACursorFailureNotABackendOne(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t, memstore.New(), WithControlShards(2), WithClock(newMovableClock(inboxAcceptedAt)))
+	admitInto(t, store, "session-1", "command-1")
+
+	// Built by this store's own encoder, so no cursor literal is constructed
+	// and the envelope is genuinely well formed; only the provider's own
+	// position inside it is not one the provider ever issued.
+	forged, err := store.encodeDueCommandCursor(0, inboxDeadline.UnixMilli(), "not-a-provider-position")
+	if err != nil {
+		t.Fatalf("encodeDueCommandCursor: %v", err)
+	}
+	_, err = store.ListDueCommands(context.Background(), ListDueCommandsRequest{
+		Shard: 0, Cursor: forged, Limit: 10,
+	})
+	if got := assertInboxCode(t, err, InboxErrorCursor); got.Field != "due_commands" {
+		t.Fatalf("field = %q, want due_commands: the refusal came from the provider, not the envelope", got.Field)
+	}
+}
+
+// TestAnOpenGateRetryReportsALostRestampRatherThanAbsorbingIt pins the claim
+// commitGateIntent makes about its compare-and-swap, which nothing was driving.
+//
+// Two replicas retrying the same interrupted open both take the re-stamp path.
+// One wins; the other's expected revision is stale. Absorbing that would mean
+// concluding the row is freshly stamped from a revision this caller never read
+// — true today, because the only other writers of the row DELETE, but true by
+// an argument about the rest of the file rather than by anything this function
+// checks. Reporting it costs a retry on a path that is already the rare one.
+func TestAnOpenGateRetryReportsALostRestampRatherThanAbsorbingIt(t *testing.T) {
+	base := memstore.New()
+	ordered := &recordingOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = ordered
+	clock := newMovableClock(catalogActiveAt)
+	store := openStore(t, base, WithControlShards(1), WithClock(clock))
+	mustPrepareSession(t, store, catalogTenant, catalogSession, 10)
+
+	gate := gateWithDeadline(testGate("gate-a", 5), catalogDeadline)
+	interruptOpenAfterItsIntent(t, store, ordered, gate, 10)
+	clock.set(catalogActiveAt.Add(time.Minute))
+
+	// The competing replica lands its whole retry — re-stamp and projection —
+	// between this one's read of the intent row and its own re-stamp.
+	raced := false
+	ordered.beforeUpdate = func() {
+		if raced || updatingCatalog(ordered) {
+			return
+		}
+		raced = true
+		clock.set(catalogActiveAt.Add(2 * time.Minute))
+		if _, err := store.OpenGate(context.Background(), OpenGateRequest{
+			TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: gate,
+		}); err != nil {
+			t.Errorf("the competing retry failed: %v", err)
+		}
+	}
+	_, err := store.OpenGate(context.Background(), OpenGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: gate,
+	})
+	ordered.beforeUpdate = nil
+	if !raced {
+		t.Fatal("the fixture never reached the re-stamp; it has nothing to prove")
+	}
+
+	assertCatalogField(t, err, CatalogErrorConflict, "gate_intent")
+	// The winner's work stands: the gate is open with a live, freshly stamped
+	// intent, so the loser's retry is a retry and not a repair.
+	if page := mustReadGates(t, store); len(page.Gates) != 1 {
+		t.Fatalf("the winning retry did not leave the gate open: %v", gateIDs(page))
+	}
+	stored := storedGateIntent(t, store, gate.GateID)
+	if stored.Deleted {
+		t.Fatal("the race tombstoned the intent")
+	}
+	intent, err := gateIntentFor(stored)
+	if err != nil {
+		t.Fatalf("gateIntentFor: %v", err)
+	}
+	if !intent.RecordedAt.Equal(catalogActiveAt.Add(2 * time.Minute)) {
+		t.Fatalf("recorded instant = %v, want the winner's %v",
+			intent.RecordedAt, catalogActiveAt.Add(2*time.Minute))
 	}
 }

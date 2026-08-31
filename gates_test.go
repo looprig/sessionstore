@@ -170,7 +170,7 @@ func isShardOf(namespace, base string) bool {
 
 func mustEncodeGateIntent(t *testing.T, intent gateIntent) []byte {
 	t.Helper()
-	value, err := encodeGateIntent(intent)
+	value, _, err := encodeGateIntent(intent)
 	if err != nil {
 		t.Fatalf("encodeGateIntent: %v", err)
 	}
@@ -1558,7 +1558,7 @@ func TestGateIntentDecodeFailsClosed(t *testing.T) {
 func TestGateIntentEncodeRefusesAnInvalidIntent(t *testing.T) {
 	invalid := testGateIntent()
 	invalid.OpenedJournalSeq = 0
-	if _, err := encodeGateIntent(invalid); err == nil {
+	if _, _, err := encodeGateIntent(invalid); err == nil {
 		t.Fatal("an intent naming no opening event encoded")
 	} else {
 		assertCatalogCode(t, err, CatalogErrorInvalid)

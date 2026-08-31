@@ -25,7 +25,7 @@ import (
 // found.
 func FuzzGateIntentCodec(f *testing.F) {
 	seed := func(intent gateIntent) []byte {
-		encoded, err := encodeGateIntent(intent)
+		encoded, _, err := encodeGateIntent(intent)
 		if err != nil {
 			f.Fatalf("seed does not encode: %v", err)
 		}
@@ -82,7 +82,7 @@ func FuzzGateIntentCodec(f *testing.F) {
 		if err != nil {
 			return
 		}
-		encoded, err := encodeGateIntent(intent)
+		encoded, _, err := encodeGateIntent(intent)
 		if err != nil {
 			t.Fatalf("accepted an intent that does not re-encode: %v", err)
 		}
@@ -99,7 +99,7 @@ func FuzzGateIntentCodec(f *testing.F) {
 		if err != nil {
 			t.Fatalf("canonical form does not decode: %v", err)
 		}
-		reencoded, err := encodeGateIntent(again)
+		reencoded, _, err := encodeGateIntent(again)
 		if err != nil {
 			t.Fatalf("canonical form does not re-encode: %v", err)
 		}
