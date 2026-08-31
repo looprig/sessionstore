@@ -1016,6 +1016,55 @@ func validateOpaque(value, field string, fail func(field string, cause error) er
 	return nil
 }
 
+// checkFiledScope holds the three provider-supplied components of a stored
+// record's filing that every session-scoped record kind files identically: the
+// ordering scope, the ranking scope, and the due state.
+//
+// Three records need exactly this, for exactly the same reasons, and had three
+// byte-identical copies of it differing only in the error constructor. What
+// each copy was free to do was drift — to drop the ranking scope, or to compare
+// the due state's milliseconds instead of the whole value — on the one path
+// that only runs when a provider is already misbehaving and where a weakened
+// check therefore looks exactly like a passing one.
+//
+// The two scopes are the SESSION's physical namespace, which is derived from
+// the identities the record's own bytes name, so this is a comparison against
+// the record rather than against the query the reader issued. Neither can
+// change after Create, so a disagreement means the record was filed wrongly to
+// begin with — and a wrong ordering scope means any per-session order the
+// provider allocated came from another session's sequence.
+//
+// due is passed in rather than derived here because each record derives its own
+// from its own members — inboxDue folds a claim horizon in, gateDue reads a
+// deadline, hostRegistrationDue is constant — and it is compared as a WHOLE
+// VALUE so the due STATE is covered as well as the instant. A record filed
+// not-due that should be due participates in no deadline page and is never
+// reconciled, and a millisecond-only comparison accepts exactly that.
+//
+// What is NOT here is each caller's business and stays in each caller's own
+// enumeration: whether a tombstone is a lifecycle state or a fail-closed
+// condition, what the stable key is held to, whether a rank or an order has a
+// consumer worth guarding. Those differ between the records; these three do
+// not. fail names what a violation is CALLED in the calling record's
+// vocabulary, as it does for validateOpaque — the RULE is stated once here.
+func checkFiledScope(
+	stored storage.OrderedRecord,
+	scope string,
+	due storage.Due,
+	fail func(field string, cause error) error,
+) error {
+	if stored.ID.OrderingScope != scope {
+		return fail("ordering_scope", nil)
+	}
+	if stored.RankingScope != scope {
+		return fail("ranking_scope", nil)
+	}
+	if stored.Due != due {
+		return fail("due", nil)
+	}
+	return nil
+}
+
 // validateBoundedExpiry bounds one caller-supplied expiry against the store's
 // clock. Two records already need it — a command's claim and a Host's
 // registration — and they need exactly the same two rules for the same two

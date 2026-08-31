@@ -590,6 +590,19 @@ func TestHostRegistrationRefusesAnInvalidMember(t *testing.T) {
 			mutate: func(r *HostRegistration) { r.Route = nil },
 			field:  "expires_at",
 		},
+		{
+			// The other side of the same equality, and the one the doc used to
+			// license by saying a tombstone's expiry must merely not fall
+			// AFTER its observation. It is refused because a tombstone records
+			// one instant rather than measuring an interval, so two spellings
+			// of that instant would be two canonical forms of one state.
+			name: "a tombstone expiring before it was written",
+			mutate: func(r *HostRegistration) {
+				r.Route = nil
+				r.ExpiresAt = r.ObservedAt.Add(-time.Second)
+			},
+			field: "expires_at",
+		},
 	}
 
 	for _, test := range tests {
@@ -1148,14 +1161,14 @@ func TestHostRegistrationFilingIsHeldToTheRecord(t *testing.T) {
 			mutate:  func(r *storage.OrderedRecord) { r.ID.StableKey = storage.StableKey(registryOtherSession) },
 			want:    RegistryErrorIdentity,
 			field:   "session_id",
-			covered: "ID",
+			covered: "ID.StableKey",
 		},
 		{
 			name:    "filed in another session's ordering scope",
 			mutate:  func(r *storage.OrderedRecord) { r.ID.OrderingScope += "/elsewhere" },
 			want:    RegistryErrorIdentity,
 			field:   "ordering_scope",
-			covered: "ID",
+			covered: "ID.OrderingScope",
 		},
 		{
 			name:    "ranked in another session's scope",
@@ -1165,8 +1178,14 @@ func TestHostRegistrationFilingIsHeldToTheRecord(t *testing.T) {
 			covered: "RankingScope",
 		},
 		{
+			// Due-at with a ZERO millisecond deliberately, which is a due state
+			// a provider may legitimately hold and the one case a comparison of
+			// milliseconds alone would accept: it differs from what this record
+			// files only in the due STATE. The nonzero spelling this case used
+			// to carry was caught by the millisecond too, so it could not tell
+			// a whole-value comparison from a partial one.
 			name:    "filed into a deadline page nothing sweeps",
-			mutate:  func(r *storage.OrderedRecord) { r.Due = storage.Due{State: storage.DueAt, UnixMillis: 1} },
+			mutate:  func(r *storage.OrderedRecord) { r.Due = storage.Due{State: storage.DueAt} },
 			want:    RegistryErrorIdentity,
 			field:   "due",
 			covered: "Due",
@@ -1206,21 +1225,51 @@ func TestHostRegistrationFilingIsHeldToTheRecord(t *testing.T) {
 	// hostRegistrationEntryFor. A member Storage adds later belongs to one of
 	// the two groups and this fails until someone decides which.
 	excluded := map[string]string{
-		"Revision": "provider state with no counterpart in the record",
-		"Order":    "not exposed, never listed, and no counterpart in the record",
+		"Revision":     "provider state with no counterpart in the record",
+		"Order":        "not exposed, never listed, and no counterpart in the record",
+		"ID.Namespace": "a package constant with no counterpart in the record",
 	}
 	perturbed := map[string]bool{}
 	for _, test := range tests {
 		perturbed[test.covered] = true
 	}
-	recordType := reflect.TypeOf(storage.OrderedRecord{})
-	for i := range recordType.NumField() {
-		name := recordType.Field(i).Name
-		if perturbed[name] == (excluded[name] != "") {
+	// The walk descends into OrderedID and stops everywhere else, and the rule
+	// is not arbitrary: it descends exactly where the filing checks address
+	// SUB-MEMBERS individually. The three parts of an OrderedID are checked
+	// separately and one of them is deliberately unchecked, so a member added
+	// to OrderedID would otherwise hide behind its parent being "covered" —
+	// which is the same shape of gap a hand-written list has, reintroduced one
+	// level down. Due and Rank are compared as whole values, so a member added
+	// to either is covered by the existing comparison and they are leaves here.
+	for _, member := range orderedRecordMembers(t) {
+		if perturbed[member] == (excluded[member] != "") {
 			t.Errorf("storage.OrderedRecord.%s is %s; it must be exactly one of perturbed here or excluded with a reason",
-				name, map[bool]string{true: "both perturbed and excluded", false: "neither perturbed nor excluded"}[perturbed[name]])
+				member, map[bool]string{true: "both perturbed and excluded", false: "neither perturbed nor excluded"}[perturbed[member]])
 		}
 	}
+}
+
+// orderedRecordMembers returns the members of storage.OrderedRecord the filing
+// checks are answerable for, descending into the identity whose parts are
+// checked one by one and treating every other member as a leaf.
+func orderedRecordMembers(t *testing.T) []string {
+	t.Helper()
+	var members []string
+	recordType := reflect.TypeOf(storage.OrderedRecord{})
+	for i := range recordType.NumField() {
+		field := recordType.Field(i)
+		if field.Type != reflect.TypeOf(storage.OrderedID{}) {
+			members = append(members, field.Name)
+			continue
+		}
+		for j := range field.Type.NumField() {
+			members = append(members, field.Name+"."+field.Type.Field(j).Name)
+		}
+	}
+	if len(members) == 0 {
+		t.Fatal("no members were found; the cross product is not reaching the record")
+	}
+	return members
 }
 
 // TestPutHostRegistrationChecksTheProvidersReply reaches the filing checks
@@ -1734,5 +1783,118 @@ func TestHostRegistrationCanonicalizesItsInstantsToUTC(t *testing.T) {
 	}
 	if !bytes.Equal(encoded, utc) {
 		t.Fatalf("one instant spelled two ways produced two records:\n%s\n%s", encoded, utc)
+	}
+}
+
+// TestUnroutableRegistrationsDiscloseTheFence closes the one gap a caller
+// cannot work around: the lease epoch is this record's most consequential
+// permanent state and there is no read path to it, so the only way to learn the
+// high-water mark would be to attempt a write with a too-low epoch and read the
+// refusal — probing by failing.
+//
+// It matters most exactly where the record says least. The reaper contract on
+// HostRegistration tells a future sweep to decide a session is finished from
+// these two codes, and a value that reads as ABSENT is what licenses the
+// destructive act; a caller told only "expired" is structurally denied the fact
+// it would need to check its own decision against. The fence is not a secret —
+// it is the diagnostic these codes are for.
+func TestUnroutableRegistrationsDiscloseTheFence(t *testing.T) {
+	t.Parallel()
+
+	read := func(t *testing.T, store *Store) error {
+		t.Helper()
+		_, err := store.GetHostRegistration(context.Background(), GetHostRegistrationRequest{
+			TenantID: catalogTenant, SessionID: catalogSession,
+		})
+		return err
+	}
+
+	t.Run("expired", func(t *testing.T) {
+		t.Parallel()
+		store, clock := registryFixture(t, memstore.New())
+		mustPutRegistration(t, store, testPutRegistrationRequest(registryEpoch))
+		clock.set(registryLapsedAt)
+		got := assertRegistryCode(t, read(t, store), RegistryErrorExpired)
+		if got.Epoch != registryEpoch {
+			t.Fatalf("expired reported epoch %d, want the retained high-water %d", got.Epoch, registryEpoch)
+		}
+	})
+
+	t.Run("released", func(t *testing.T) {
+		t.Parallel()
+		store, _ := registryFixture(t, memstore.New())
+		mustPutRegistration(t, store, testPutRegistrationRequest(registryEpoch))
+		if _, err := store.ClearHostRegistration(context.Background(), testClearRegistrationRequest(registryNextEpoch)); err != nil {
+			t.Fatalf("ClearHostRegistration: %v", err)
+		}
+		got := assertRegistryCode(t, read(t, store), RegistryErrorReleased)
+		if got.Epoch != registryNextEpoch {
+			t.Fatalf("released reported epoch %d, want the retained high-water %d", got.Epoch, registryNextEpoch)
+		}
+	})
+
+	t.Run("absent, which has no fence to disclose", func(t *testing.T) {
+		t.Parallel()
+		store, _ := registryFixture(t, memstore.New())
+		if _, _, err := store.CreateCatalogEntry(context.Background(), testCreateRequest()); err != nil {
+			t.Fatalf("CreateCatalogEntry: %v", err)
+		}
+		got := assertRegistryCode(t, read(t, store), RegistryErrorNotFound)
+		if got.Epoch != 0 {
+			t.Fatalf("a session with no registration reported epoch %d", got.Epoch)
+		}
+	})
+}
+
+// TestHostRegistrationRoutesAreNotAliased pins the one member a caller can hold
+// a handle to: Route is a pointer, and two reads must not hand back one shared
+// route that mutating either corrupts for the other. That holds today only
+// because every path encodes and re-decodes, and nothing else would notice a
+// future decode cache — which is exactly what a mutation handing every decode
+// one shared route confirms, since it fails here and nowhere else.
+//
+// The first assertion, that the returned route does not alias the CALLER's
+// request, is deliberately kept and deliberately cannot fail: a request is
+// passed by value, so the address of any member of it inside this package is
+// the address of the callee's own copy. It records the intent for a reader who
+// might later change the signature to take a pointer, at which point it starts
+// being able to fail. It is not evidence of anything today, and is marked so
+// rather than counted.
+func TestHostRegistrationRoutesAreNotAliased(t *testing.T) {
+	t.Parallel()
+
+	store, _ := registryFixture(t, memstore.New())
+	req := testPutRegistrationRequest(registryEpoch)
+	entry, err := store.PutHostRegistration(context.Background(), req)
+	if err != nil {
+		t.Fatalf("PutHostRegistration: %v", err)
+	}
+	if entry.Registration.Route == &req.Route {
+		t.Fatal("the returned route aliases the caller's request")
+	}
+	_ = req // held past the comparison above so it is not the copy that moved.
+
+	read := func() HostRegistrationEntry {
+		t.Helper()
+		got, err := store.GetHostRegistration(context.Background(), GetHostRegistrationRequest{
+			TenantID: catalogTenant, SessionID: catalogSession,
+		})
+		if err != nil {
+			t.Fatalf("GetHostRegistration: %v", err)
+		}
+		return got
+	}
+	first, second := read(), read()
+	if first.Registration.Route == second.Registration.Route {
+		t.Fatal("two reads share one route; mutating either corrupts the other")
+	}
+
+	// The consequence, not just the pointer identity: what a caller does to its
+	// own copy cannot reach the store or another reader.
+	first.Registration.Route.HostID = "host-tampered"
+	req.Route.InternalEndpoint = "wss://tampered.internal/hostlink"
+	if again := read(); again.Registration.Route.HostID != registryHost ||
+		again.Registration.Route.InternalEndpoint != registryEndpoint {
+		t.Fatalf("a caller's mutation reached the store: %+v", *again.Registration.Route)
 	}
 }

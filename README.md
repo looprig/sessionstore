@@ -414,10 +414,31 @@ expires — it is the high-water mark that refuses a superseded Host's write —
 that is why an expired or released registration is retained rather than deleted.
 Dropping the row would drop the fence.
 
+**These rows are permanent.** One per session that has ever been registered,
+kept forever, with no expiry sweep and no deletion path anywhere in this
+package. That is affordable rather than a debt: a registration is never listed,
+never ranked, never due, and never read except by name, so a session that ran
+once and stopped costs a few hundred stored bytes and nothing at all to every
+reader. It is also not optional — the row IS the session's fence, so the
+retention is what makes the epoch mean anything.
+
+The consequence for anyone adding retention later, stated on `HostRegistration`
+as a carry-forward contract and repeated here because this is the document a
+sweep's author reads first: **the only safe reaper is one that removes a
+session's whole scope at once** — this record, its catalog record, its journal,
+its commands, and its collision witnesses. Deleting this row alone destroys the
+fence while leaving the session registrable, which is the exact state the
+retention exists to prevent, and a sweep that walks record kinds independently
+and reclaims the cheapest first will reach this one first. There is no partial
+version of this that is safe.
+
 So the two reads are deliberately different functions.
 `GetHostRegistration` reports `not_found`, `expired`, or `released` and carries
 no tuple in any of the three: a router cannot bind to a Host this store will not
-vouch for. Every write instead reads the RAW record, expired and released ones
+vouch for. `expired` and `released` do carry the retained lease epoch on the
+error, because those two codes are the whole public account of a session with no
+route — they are what a retention decision is made from, and the fence is the
+one durable fact left to check that decision against. Every write instead reads the RAW record, expired and released ones
 included, because a writer that believed the public reader would create a fresh
 record over a row it could not see — and creating a fresh record is exactly how
 a fencing high-water mark gets reset to whatever a superseded lease named. A

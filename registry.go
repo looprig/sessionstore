@@ -159,9 +159,16 @@ type HostRegistration struct {
 }
 
 // released reports whether this registration is the tombstone a cleanup leaves
-// behind. It is stated once because three different rules ask it: the record's
-// own canonical form, the routing decision a reader makes, and the wire
-// projection, which cannot exist without a route.
+// behind.
+//
+// It is a method rather than an inline nil test at each site because "no route"
+// is a STATE of this record and every rule that branches on that state must ask
+// the same question — the canonical form, the routing decision, the wire
+// projection, and, least obviously, the repeat check that makes cleanup
+// idempotent. Those are not enumerated here on purpose: a comment claiming to
+// list its own call sites is a comment that silently stops being true, and this
+// one had already missed the cleanup path, which an entire paragraph of
+// ClearHostRegistration is about.
 func (r HostRegistration) released() bool { return r.Route == nil }
 
 // HostRegistrationEntry is a registration together with the revision a later
@@ -354,14 +361,38 @@ func decodeHostRegistration(value []byte) (HostRegistration, error) {
 //     covers the whole route plus the lease epoch and the requirement that the
 //     expiry falls strictly after the observation.
 //   - A RELEASED tombstone is validated here, and the one thing it has to say
-//     is that its expiry does not fall after its observation. A tombstone that
-//     was not already expired at the instant it was written would be a record
-//     that reads as absent by structure but as live by time, and the two
-//     answers would disagree for as long as its expiry lasted.
+//     is that its expiry EQUALS its observation — not merely that it does not
+//     fall after it. Two rules ride on the equality, and only one of them is
+//     about time. A tombstone that had not expired when it was written would
+//     read as absent by structure and as live by time, and the two answers
+//     would disagree for as long as its expiry lasted; that much a "not after"
+//     rule would also give. What it would NOT give is the canonical form this
+//     function's first paragraph promises: a tombstone records one instant
+//     rather than measuring an interval, so an expiry a second before the
+//     observation is a second spelling of one state, and one state with two
+//     spellings is exactly what makes a record's stored bytes depend on which
+//     writer produced them. Relaxing Equal to After is the mutation this
+//     comment must not invite, and the case pinning the strictly-earlier
+//     direction lives beside the strictly-later one.
 //
 // The timestamp bounds are this package's own on both paths: Core has no view
 // on whether an instant is representable, and a year Go's JSON encoder cannot
 // spell would be refused at Marshal with an untyped failure rather than here.
+//
+// One consequence of delegating to Core is worth stating because it is not
+// local to this function: the delegation happens on the DECODE path as well as
+// the encode path, so Core's rules apply to registrations that are ALREADY
+// STORED. A future core release that tightens any route rule — a narrower
+// endpoint grammar, a residency removed from the routable set — makes every
+// stored live registration that violates the new rule undecodable, and since
+// all three operations read through this function and nothing deletes these
+// records, those sessions are permanently wedged with no migration path. It is
+// the right trade today: core v0.7.0's route rules are pure functions of the
+// record with no wall-clock or environment dependence, so a record that decoded
+// once decodes forever under a fixed core version. But it makes a core version
+// bump a DURABLE-DATA compatibility event for this record and for no other one
+// in this package, which is a thing to check at the bump rather than discover
+// after it.
 func canonicalHostRegistration(record HostRegistration) (HostRegistration, error) {
 	if err := record.TenantID.Validate(); err != nil {
 		return HostRegistration{}, registryErr(RegistryErrorInvalid, "tenant_id", err)
@@ -675,11 +706,18 @@ func (s *Store) readHostRegistration(
 // The interval is half-open — a route holds up to but not including its expiry
 // — which is the convention every deadline in this package uses.
 func routableAt(record HostRegistration, now time.Time) error {
+	// Both refusals carry the record's committed epoch, for the reason
+	// RegistryError documents: these are the two codes that say a session has
+	// no route, they are what a reaper acts on, and the fence is the only
+	// durable fact left to check that decision against. Nothing else in this
+	// package discloses it, so withholding it here would leave probing by
+	// failed write as a caller's only way to read the record's most
+	// consequential permanent state.
 	if record.released() {
-		return registryErr(RegistryErrorReleased, "route", nil)
+		return &RegistryError{Code: RegistryErrorReleased, Field: "route", Epoch: record.LeaseEpoch}
 	}
 	if !now.Before(record.ExpiresAt) {
-		return registryErr(RegistryErrorExpired, "expires_at", nil)
+		return &RegistryError{Code: RegistryErrorExpired, Field: "expires_at", Epoch: record.LeaseEpoch}
 	}
 	return nil
 }
@@ -837,19 +875,16 @@ func hostRegistrationDue(HostRegistration) storage.Due { return storage.Due{} }
 //     original for exactly this comparison. It is not a restatement of the
 //     check above: that one asks whether the BYTES are the session asked for,
 //     this one asks whether the provider FILED them where it said it did.
-//   - OrderingScope and RankingScope — the session's physical namespace,
-//     derived from the tenant and session the bytes name. Neither can change
-//     after Create, so a disagreement means the record was filed wrongly to
-//     begin with.
-//   - Due and Rank — compared as WHOLE VALUES against what this file files.
-//     Both are checked, which is one more than the inbox checks, and the reason
-//     is that this record's views are fully determined here: it is written
-//     unranked and not-due on every path, so "the provider's view state is
-//     exactly what this package filed" is a complete statement rather than a
-//     partial one. A rank or a due state appearing on one of these rows means
-//     either a provider inventing view state or a later writer filing a horizon
-//     into a page nothing sweeps, and hostRegistrationDue says why the second
-//     one is the dangerous one.
+//   - OrderingScope, RankingScope and Due — the triad every session-scoped
+//     record files identically, checked through checkFiledScope, which states
+//     the rule and why each of the three is worth stating.
+//   - Rank — compared as a WHOLE VALUE against what this file files, which is
+//     one more than the inbox checks. This record's views are fully determined
+//     here: it is written unranked and not-due on every path, so "the
+//     provider's view state is exactly what this package filed" is a complete
+//     statement rather than a partial one. A rank appearing on one of these
+//     rows means a provider inventing view state, and hostRegistrationDue says
+//     why a due state appearing on one is the more dangerous of the two.
 //   - Namespace is excluded for the reason inboxEntryFor gives: it is a package
 //     constant with no counterpart in any record, so comparing against it could
 //     only restate that this file's constant equals itself. What keeps the
@@ -879,14 +914,8 @@ func hostRegistrationEntryFor(
 	if storage.StableKey(record.SessionID) != stored.ID.StableKey {
 		return HostRegistrationEntry{}, registryErr(RegistryErrorIdentity, "session_id", nil)
 	}
-	if stored.ID.OrderingScope != scope.SessionNamespace {
-		return HostRegistrationEntry{}, registryErr(RegistryErrorIdentity, "ordering_scope", nil)
-	}
-	if stored.RankingScope != scope.SessionNamespace {
-		return HostRegistrationEntry{}, registryErr(RegistryErrorIdentity, "ranking_scope", nil)
-	}
-	if stored.Due != hostRegistrationDue(record) {
-		return HostRegistrationEntry{}, registryErr(RegistryErrorIdentity, "due", nil)
+	if err := checkFiledScope(stored, scope.SessionNamespace, hostRegistrationDue(record), registryIdentity); err != nil {
+		return HostRegistrationEntry{}, err
 	}
 	if stored.Rank != (storage.Rank{}) {
 		return HostRegistrationEntry{}, registryErr(RegistryErrorIdentity, "rank", nil)

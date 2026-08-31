@@ -562,14 +562,12 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) (DueG
 //   - StableKey — the gate id. Checked, in gateIntentFor, where the value is
 //     decoded; a provider that hashes the key stores the original for exactly
 //     this comparison.
-//   - OrderingScope and RankingScope — the session's physical namespace, which
-//     is derived from the tenant and session the bytes name. Checked here.
-//     Neither can be changed after Create, so a disagreement means the record
-//     was filed wrongly to begin with.
-//   - Due — the gate's absolute deadline. Checked here, and the reason this
-//     function exists at all: a due page selects rows BY this field, so a
-//     reader that trusted it would report a gate as expired because the index
-//     said so while the record's own deadline was still a day away.
+//   - OrderingScope, RankingScope and Due — the triad every session-scoped
+//     record files identically, checked through checkFiledScope, which states
+//     the rule and why each of the three is worth stating. The due state is the
+//     reason this function exists at all: a due page selects rows BY that
+//     field, so a reader that trusted it would report a gate as expired because
+//     the index said so while the record's own deadline was still a day away.
 //   - Deleted is not record-derived, but it needs no counterpart: ListDue
 //     returns current nondeleted records by contract, and a violation of that
 //     one means reporting a RETIRED gate as due, so it is asserted directly.
@@ -582,20 +580,7 @@ func verifyGateIntentFiling(stored storage.OrderedRecord, intent gateIntent, sco
 	if stored.Deleted {
 		return catalogErr(CatalogErrorDeleted, "gate_intent", nil)
 	}
-	if stored.ID.OrderingScope != scope.SessionNamespace {
-		return catalogErr(CatalogErrorIdentity, "ordering_scope", nil)
-	}
-	if stored.RankingScope != scope.SessionNamespace {
-		return catalogErr(CatalogErrorIdentity, "ranking_scope", nil)
-	}
-	// Compared as a whole value through the one conversion every writer uses,
-	// so the due STATE is covered as well as the instant: a not-due record
-	// carries a zero UnixMillis, which a bare millisecond comparison would
-	// accept for a gate whose deadline really is the epoch.
-	if stored.Due != gateDue(intent.Deadline) {
-		return catalogErr(CatalogErrorIdentity, "due", nil)
-	}
-	return nil
+	return checkFiledScope(stored, scope.SessionNamespace, gateDue(intent.Deadline), catalogIdentity)
 }
 
 // dueSessionKey is the identity a due page caches a catalog record under. It is

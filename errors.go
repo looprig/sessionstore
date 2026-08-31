@@ -529,9 +529,20 @@ const (
 // offending input or stage and never carries a provider name, a key, or a
 // record payload.
 //
-// Epoch is populated only for RegistryErrorEpoch and Revision only for
-// RegistryErrorConflict, each carrying the value that is itself the answer, as
-// CatalogError and InboxError do for the same two codes.
+// Revision is populated only for RegistryErrorConflict, carrying the value that
+// is itself the answer, as CatalogError and InboxError do for that code.
+//
+// Epoch is populated more widely than the catalog's and the inbox's, and the
+// extra two codes are the point rather than an inconsistency. For
+// RegistryErrorEpoch it is the high-water mark that refused the write, as it is
+// there. For RegistryErrorExpired and RegistryErrorReleased it is the fence the
+// retained record still carries — because those two codes are the whole public
+// account of a session that has no route, they are what a retention sweep acts
+// on, and this package offers no other way to observe a registration's epoch.
+// Without it a caller's only route to the record's most consequential permanent
+// state would be to attempt a write it expects to fail and read the refusal.
+// RegistryErrorNotFound carries no epoch: there is no record and so no fence,
+// and a zero there means exactly that.
 type RegistryError struct {
 	Code     RegistryErrorCode
 	Field    string
@@ -555,7 +566,10 @@ func registryErr(code RegistryErrorCode, field string, cause error) error {
 }
 
 // registryInvalid is the registry's member-validation constructor, handed to
-// the shared text validators so they report in this record's vocabulary.
+// the shared validators so they report in this record's vocabulary. Its one
+// caller today is validateBoundedExpiry, which validates an INSTANT rather than
+// text — the shape is the package's general one for a shared rule with a
+// per-record name, not the text validators' alone.
 func registryInvalid(field string, cause error) error {
 	return registryErr(RegistryErrorInvalid, field, cause)
 }
@@ -571,6 +585,25 @@ func registryRecordFailure(failure versionedRecordFailure, field string, cause e
 	default:
 		return registryErr(RegistryErrorMalformed, field, cause)
 	}
+}
+
+// The three identity constructors below are what let checkFiledScope be shared.
+// They are separate from the Invalid constructors above them because the two
+// say different things: an Invalid names a value that is wrong, while an
+// Identity names a stored record that disagrees with the identity it was filed
+// under or asked for — not a caller error, not a conflict, and not fixable by
+// retrying. A filing check that reported Invalid would tell a caller to correct
+// a request that was never at fault.
+func catalogIdentity(field string, cause error) error {
+	return catalogErr(CatalogErrorIdentity, field, cause)
+}
+
+func inboxIdentity(field string, cause error) error {
+	return inboxErr(InboxErrorIdentity, field, cause)
+}
+
+func registryIdentity(field string, cause error) error {
+	return registryErr(RegistryErrorIdentity, field, cause)
 }
 
 // catalogInvalid is the catalog's member-validation constructor. It is the

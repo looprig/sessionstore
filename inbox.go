@@ -477,15 +477,11 @@ func inboxDue(record InboxRecord) storage.Due {
 //     original for exactly this comparison. It is not a restatement of the
 //     check above: that one asks whether the BYTES are the command asked for,
 //     this one asks whether the provider FILED them where it said it did.
-//   - OrderingScope and RankingScope — the session's physical namespace,
-//     derived from the tenant and session the bytes name. Neither can change
-//     after Create, so a disagreement means the record was filed wrongly to
-//     begin with, and a wrong ordering scope means the acceptance order came
-//     from another session's sequence.
-//   - Due — the record's derived due state, compared as a WHOLE VALUE so the
-//     due STATE is covered as well as the instant. A pending command filed
-//     not-due participates in no deadline page and would never be reconciled,
-//     and a millisecond-only comparison would accept exactly that.
+//   - OrderingScope, RankingScope and Due — the triad every session-scoped
+//     record files identically, checked through checkFiledScope, which states
+//     the rule and why each of the three is worth stating. For this record the
+//     ordering scope carries one consequence the others do not: a wrong one
+//     means the acceptance order came from another session's sequence.
 //   - Order — checked for being nonzero, which is all a single record can be
 //     held to: the acceptance order is allocated by the provider, so the bytes
 //     carry no counterpart to compare it against, and monotonicity is a
@@ -525,14 +521,8 @@ func inboxEntryFor(
 	if storage.StableKey(record.CommandID) != stored.ID.StableKey {
 		return InboxEntry{}, inboxErr(InboxErrorIdentity, "command_id", nil)
 	}
-	if stored.ID.OrderingScope != scope.SessionNamespace {
-		return InboxEntry{}, inboxErr(InboxErrorIdentity, "ordering_scope", nil)
-	}
-	if stored.RankingScope != scope.SessionNamespace {
-		return InboxEntry{}, inboxErr(InboxErrorIdentity, "ranking_scope", nil)
-	}
-	if stored.Due != inboxDue(record) {
-		return InboxEntry{}, inboxErr(InboxErrorIdentity, "due", nil)
+	if err := checkFiledScope(stored, scope.SessionNamespace, inboxDue(record), inboxIdentity); err != nil {
+		return InboxEntry{}, err
 	}
 	if stored.Order == 0 {
 		return InboxEntry{}, inboxErr(InboxErrorIdentity, "order", nil)
