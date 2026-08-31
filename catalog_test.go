@@ -74,6 +74,8 @@ func testCatalogRecord() CatalogRecord {
 		OpenGates:             []sessionwire.GateProjection{testGate("gate-b", 7), testGate("gate-a", 5)},
 		LeaseEpoch:            3,
 		DesiredIdempotencyKey: "place-1",
+		DesiredGeneration:     4,
+		DesiredWorkload:       testDesiredWorkload(),
 	}
 }
 
@@ -211,7 +213,8 @@ func TestCatalogRecordRoundTripsThroughSessionwireProjections(t *testing.T) {
 		!decoded.Checkpoint.CapturedAt.Equal(record.Checkpoint.CapturedAt) {
 		t.Fatalf("checkpoint summary did not survive: %+v", decoded.Checkpoint)
 	}
-	if decoded.LeaseEpoch != record.LeaseEpoch || decoded.DesiredIdempotencyKey != record.DesiredIdempotencyKey {
+	if decoded.LeaseEpoch != record.LeaseEpoch || decoded.DesiredIdempotencyKey != record.DesiredIdempotencyKey ||
+		decoded.DesiredGeneration != record.DesiredGeneration {
 		t.Fatalf("ownership fields did not survive: %+v", decoded)
 	}
 	if len(decoded.OpenGates) != 2 {
@@ -1403,7 +1406,7 @@ func TestCatalogTextValidationCoversEveryStringField(t *testing.T) {
 	// the enumerator walks into — narrow this test's coverage without failing
 	// it. Bump this number when the record legitimately gains or loses a text
 	// member, and check that the member is validated when you do.
-	const wantTextSites = 26
+	const wantTextSites = 27
 	if count != wantTextSites {
 		t.Fatalf("the enumerator found %d text sites, want exactly %d; bump me when the record gains or loses a text member", count, wantTextSites)
 	}

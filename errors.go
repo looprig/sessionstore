@@ -1,6 +1,9 @@
 package sessionstore
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // KeyspaceErrorCode is a stable machine-readable keyspace failure class.
 type KeyspaceErrorCode string
@@ -699,6 +702,115 @@ func hostTargetRecordFailure(failure versionedRecordFailure, field string, cause
 		return hostTargetErr(HostTargetErrorVersion, field, cause)
 	default:
 		return hostTargetErr(HostTargetErrorMalformed, field, cause)
+	}
+}
+
+// ReconcileErrorCode classifies a reconciliation claim failure.
+//
+// It is its own vocabulary rather than the registry's or the catalog's, and for
+// the reason HostTargetErrorCode is: a caller must not be able to write one
+// handler for both. A RegistryError is the public account of who OWNS a
+// session; a ReconcileError is the public account of who is currently doing
+// scaling work for one. Sharing a type would let a caller branch on "held"
+// without knowing which of those two questions it had asked, and the whole
+// discipline of this record is that a claim is not ownership.
+//
+// The codes that need their reasons stated:
+//
+//   - Held — another holder's claim is LIVE. It is not a failure in the caller
+//     and says nothing about any session's lease; it means the work is already
+//     being done, so do it later or not at all. ExpiresAt carries the horizon.
+//   - Lapsed — no live claim is present. GetReconciliationClaim reports it
+//     against expires_at, meaning the stored claim has run out; a release
+//     reports it against holder_id, meaning the claim on this session is not
+//     the caller's and has run out, so there is nothing of the caller's to
+//     release. Both say the same thing about the world and differ in which of
+//     the caller's assumptions was wrong, which is why the field distinguishes
+//     them rather than a fourth code.
+//   - NotFound — no claim record exists at all. Distinct from Lapsed because a
+//     session nobody has ever reconciled and one whose reconciler crashed are
+//     different operational facts, and identical to a caller that only wants to
+//     know whether it may proceed.
+//
+// Conflict means a lost revision compare-and-swap and nothing else — re-read
+// and retry — which is the meaning it has for every other record kind here.
+//
+// There is deliberately no epoch code and no epoch member. A caller cannot
+// obtain a lease epoch from this vocabulary because there is no lease epoch in
+// this record to obtain.
+type ReconcileErrorCode string
+
+const (
+	ReconcileErrorInvalid   ReconcileErrorCode = "invalid"
+	ReconcileErrorNotFound  ReconcileErrorCode = "not_found"
+	ReconcileErrorHeld      ReconcileErrorCode = "held"
+	ReconcileErrorLapsed    ReconcileErrorCode = "lapsed"
+	ReconcileErrorDeleted   ReconcileErrorCode = "deleted"
+	ReconcileErrorIdentity  ReconcileErrorCode = "identity"
+	ReconcileErrorConflict  ReconcileErrorCode = "conflict"
+	ReconcileErrorUnknown   ReconcileErrorCode = "unknown"
+	ReconcileErrorBackend   ReconcileErrorCode = "backend"
+	ReconcileErrorMalformed ReconcileErrorCode = "malformed"
+	ReconcileErrorVersion   ReconcileErrorCode = "version"
+	ReconcileErrorTooLarge  ReconcileErrorCode = "too_large"
+)
+
+// ReconcileError is a typed, redacted reconciliation claim failure. Field names
+// the offending input or stage and never carries a provider name, a key, or a
+// record payload.
+//
+// Revision is populated only for ReconcileErrorConflict, carrying the value
+// that is itself the answer, as the other record kinds do for that code.
+//
+// ExpiresAt is populated only for ReconcileErrorHeld, and it is the whole
+// reason the code is useful: a replica told only "someone else has it" can do
+// nothing but poll, while one told when the claim lapses can wait exactly that
+// long. It deliberately does NOT disclose the holder — knowing which replica is
+// working is not a fact any decision here turns on.
+type ReconcileError struct {
+	Code      ReconcileErrorCode
+	Field     string
+	ExpiresAt time.Time
+	Revision  uint64
+	Cause     error
+}
+
+func (e *ReconcileError) Error() string {
+	message := "sessionstore: reconcile " + string(e.Code)
+	if e.Field != "" {
+		message += " (" + e.Field + ")"
+	}
+	return message
+}
+
+func (e *ReconcileError) Unwrap() error { return e.Cause }
+
+func reconcileErr(code ReconcileErrorCode, field string, cause error) error {
+	return &ReconcileError{Code: code, Field: field, Cause: cause}
+}
+
+// reconcileInvalid is the claim's member-validation constructor, handed to the
+// shared validators so they report in this record's vocabulary.
+func reconcileInvalid(field string, cause error) error {
+	return reconcileErr(ReconcileErrorInvalid, field, cause)
+}
+
+// reconcileIdentity is the claim's counterpart of the identity constructors
+// below, and it exists for the same reason they do.
+func reconcileIdentity(field string, cause error) error {
+	return reconcileErr(ReconcileErrorIdentity, field, cause)
+}
+
+// reconcileRecordFailure maps a shared versioned-record decode failure into the
+// claim vocabulary.
+func reconcileRecordFailure(failure versionedRecordFailure, field string, cause error) error {
+	switch failure {
+	case versionedRecordTooLarge:
+		return reconcileErr(ReconcileErrorTooLarge, field, cause)
+	case versionedRecordVersion:
+		return reconcileErr(ReconcileErrorVersion, field, cause)
+	default:
+		return reconcileErr(ReconcileErrorMalformed, field, cause)
 	}
 }
 

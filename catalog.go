@@ -111,6 +111,8 @@ type CatalogRecord struct {
 
 	LeaseEpoch            uint64
 	DesiredIdempotencyKey string
+	DesiredGeneration     uint64
+	DesiredWorkload       DesiredWorkload
 }
 
 // CatalogEntry is a catalog record together with the revision a caller passes
@@ -182,6 +184,7 @@ type CreateCatalogEntryRequest struct {
 	State                  sessionwire.SessionState
 	Residency              sessionwire.SessionResidency
 	DesiredPlacement       sessionwire.HostPlacement
+	DesiredWorkload        DesiredWorkload
 	IdempotencyKey         string
 }
 
@@ -258,6 +261,7 @@ type UpdateCatalogDesiredStateRequest struct {
 	IdempotencyKey         string
 	DesiredPlacement       sessionwire.HostPlacement
 	RuntimeCompatibilityID string
+	DesiredWorkload        DesiredWorkload
 }
 
 // CreateCatalogEntry binds the session's collision witnesses and creates its one
@@ -278,7 +282,12 @@ func (s *Store) CreateCatalogEntry(ctx context.Context, req CreateCatalogEntryRe
 		State:                  req.State,
 		Residency:              req.Residency,
 		DesiredPlacement:       req.DesiredPlacement,
+		DesiredWorkload:        req.DesiredWorkload,
 		DesiredIdempotencyKey:  req.IdempotencyKey,
+		// Creating a session names its desired placement, so the create IS the
+		// session's first desired-state write and the counter starts at one.
+		// See nextDesiredGeneration for what a controller reads it for.
+		DesiredGeneration: initialDesiredGeneration,
 	}
 	value, err := encodeCatalogRecord(record)
 	if err != nil {
@@ -395,10 +404,10 @@ func (s *Store) UpdateCatalogDesiredState(ctx context.Context, req UpdateCatalog
 	if req.ExpectedRevision != current.Revision {
 		return CatalogEntry{}, &CatalogError{Code: CatalogErrorConflict, Field: "expected_revision", Revision: current.Revision}
 	}
-	next := current.Record
-	next.DesiredPlacement = req.DesiredPlacement
-	next.RuntimeCompatibilityID = req.RuntimeCompatibilityID
-	next.DesiredIdempotencyKey = req.IdempotencyKey
+	next, err := applyDesiredState(current.Record, req)
+	if err != nil {
+		return CatalogEntry{}, err
+	}
 	return s.writeCatalogRecord(opCtx, scope, next, current.Revision)
 }
 
@@ -717,6 +726,8 @@ type catalogWire struct {
 	OpenGates              []sessionwire.GateProjection `json:"open_gates,omitempty"`
 	LeaseEpoch             uint64                       `json:"lease_epoch"`
 	DesiredIdempotencyKey  string                       `json:"desired_idempotency_key,omitempty"`
+	DesiredGeneration      uint64                       `json:"desired_generation"`
+	DesiredWorkload        *desiredWorkloadWire         `json:"desired_workload,omitempty"`
 }
 
 type checkpointWire struct {
@@ -749,6 +760,13 @@ func encodeCatalogRecord(record CatalogRecord) ([]byte, error) {
 		OpenGates:              record.OpenGates,
 		LeaseEpoch:             record.LeaseEpoch,
 		DesiredIdempotencyKey:  record.DesiredIdempotencyKey,
+		DesiredGeneration:      record.DesiredGeneration,
+	}
+	if !record.DesiredWorkload.isZero() {
+		wire.DesiredWorkload = &desiredWorkloadWire{
+			PayloadVersion: record.DesiredWorkload.PayloadVersion,
+			Payload:        record.DesiredWorkload.Payload,
+		}
 	}
 	if !record.Checkpoint.isZero() {
 		wire.Checkpoint = &checkpointWire{
@@ -801,6 +819,13 @@ func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 		OpenGates:              wire.OpenGates,
 		LeaseEpoch:             wire.LeaseEpoch,
 		DesiredIdempotencyKey:  wire.DesiredIdempotencyKey,
+		DesiredGeneration:      wire.DesiredGeneration,
+	}
+	if wire.DesiredWorkload != nil {
+		record.DesiredWorkload = DesiredWorkload{
+			PayloadVersion: wire.DesiredWorkload.PayloadVersion,
+			Payload:        wire.DesiredWorkload.Payload,
+		}
 	}
 	if wire.Checkpoint != nil {
 		record.Checkpoint = CheckpointSummary{
@@ -925,11 +950,20 @@ func canonicalCatalogRecord(record CatalogRecord) (CatalogRecord, error) {
 	if err := validateOpaque(string(record.Residency), "residency", catalogInvalid); err != nil {
 		return CatalogRecord{}, err
 	}
-	switch record.DesiredPlacement {
-	case sessionwire.HostPlacementPooled, sessionwire.HostPlacementDedicated:
-	default:
-		return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "desired_placement", nil)
+	if err := validateDesiredPlacement(record.DesiredPlacement); err != nil {
+		return CatalogRecord{}, err
 	}
+	// Every catalog record is created with a desired state, so a zero
+	// generation is a record this package never wrote rather than a session
+	// whose placement has not been decided yet.
+	if record.DesiredGeneration == 0 {
+		return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "desired_generation", nil)
+	}
+	workload, err := canonicalDesiredWorkload(record.DesiredWorkload)
+	if err != nil {
+		return CatalogRecord{}, err
+	}
+	record.DesiredWorkload = workload
 	if !rankableTime(record.CreatedAt) {
 		return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "created_at", nil)
 	}

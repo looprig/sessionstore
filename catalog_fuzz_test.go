@@ -49,11 +49,13 @@ func FuzzCatalogRecordCodec(f *testing.F) {
 	minimal.LastEventID = ""
 	minimal.RuntimeCompatibilityID = ""
 	minimal.DesiredIdempotencyKey = ""
+	minimal.DesiredWorkload = DesiredWorkload{}
 	minimal.LeaseEpoch = 0
 	f.Add(seed(minimal))
 
 	dedicated := full
 	dedicated.DesiredPlacement = sessionwire.HostPlacementDedicated
+	dedicated.DesiredWorkload = testDesiredWorkload()
 	dedicated.OpenGates = []sessionwire.GateProjection{testGate("gate-a", 1)}
 	f.Add(seed(dedicated))
 

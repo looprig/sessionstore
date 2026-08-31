@@ -128,6 +128,49 @@ compare-and-swap, which is what makes the epoch a fence rather than advice: a
 writer that observed a stale high-water mark loses the swap and, on re-reading,
 meets the successor's epoch.
 
+## Desired placement lives on the catalog record, not beside it
+
+Everything a placement controller needs is Factory-authored state on that same
+record: the desired placement mode, the runtime compatibility requirement, an
+opaque versioned platform workload payload, and a generation. `placement.go`
+adds the rules and the `PlacementIntent` projection; it declares no record and
+no error vocabulary of its own, because a second desired-placement record would
+need a consistency protocol between two rows with no cross-primitive transaction
+available to run it — the same argument that keeps the gate deadline index from
+carrying a second copy of a gate's content.
+
+**The workload payload is opaque and versioned.** `DesiredWorkload` is a byte
+string plus a caller-owned version label, bounded by
+`MaxDesiredWorkloadPayloadBytes` so an oversized one is reported against the
+member the caller actually wrote rather than as "the record is too large".
+Nothing here parses it: a Kubernetes PodSpec, a Nomad job and a future
+platform's manifest are the same value to this package, which is what keeps
+platform types out of the module and keeps a stored payload from becoming
+undecodable when a platform release changes. The version and the payload are
+present together or absent together, so "no workload desired" — the ordinary
+case for a pooled session — has exactly one spelling.
+
+**The generation is what tells a controller its work is stale.** The revision
+cannot: every Host heartbeat moves it, so a controller comparing revisions would
+re-reconcile on every projection write and never learn whether the DESIRE had
+changed. `DesiredGeneration` counts ACCEPTED desired-state writes. It starts at
+one, because creating a session names its desired placement; it does not move on
+a Host write, on an idempotent replay, or on a key reused for a different
+intent, all of which apply nothing. It is refused at the `uint64` ceiling rather
+than wrapped, because a wrap lands on a lower value that reads to every
+controller as a desired state it has already reconciled.
+
+A desired-state write REPLACES the desired members wholesale, as the Host-owned
+projection write replaces its own: moving a session back to pooled by naming no
+workload clears the workload. The one identity it cannot touch is `AgentID` —
+the request type has no member for it — because every journal record, workspace
+and runtime-compatibility decision the session has is downstream of it.
+
+`PlacementIntent` carries no lease epoch, no HostID, no endpoint, no residency
+and no journal position, and a test reads the source of `placement.go` and fails
+if any type there grows one. Observed placement is the registry's tuple, fenced
+by an epoch this projection structurally cannot name.
+
 ## Recent-first pages are one ranked query
 
 `ListSessions` returns a Core `SessionPage` from a single `ListRanked` call. The
@@ -596,3 +639,50 @@ writes bind — a listing names no row, and a target nothing has ever advertised
 has no witness to prove, so requiring one would answer "no capacity" with a
 failure. Cross-target safety comes from below instead: every row a page returns
 is held to the target its own bytes claim.
+
+## Reconciliation claims: duplicate suppression that is never a fence
+
+Any Factory replica may reconcile any session. `AcquireReconciliationClaim`
+takes a short-lived claim on one session first, so the other replicas that
+noticed the same due work do something else instead of scaling the same session
+several times over. `ReleaseReconciliationClaim` gives it back early and
+`GetReconciliationClaim` reports it, and only while it is live.
+
+**What makes concurrent reconcilers safe is not this record.** Deterministic
+command IDs, idempotent desired state, and the Host lease already do that with
+no claim in sight; a replica that ignored this record entirely would produce
+correct results and merely duplicate effort. The claim makes those mechanisms
+cheaper to rely on and nothing else.
+
+That is enforced structurally rather than documented, in three ways:
+
+- **The record cannot name ownership.** There is no lease epoch, no HostID, no
+  endpoint, no residency and no journal position on it, and no epoch member on
+  its error type. `HolderID` is a plain string rather than a `sessionwire`
+  identity, so a HostID cannot be passed for it by accident.
+  `TestReconciliationClaimCannotSpellSessionOwnership` reads the source and
+  fails if any type in the record's family grows one.
+- **Nothing else in this package reads a claim.** No other operation takes one,
+  checks one, or refuses without one, so there is nothing for a claim to
+  license. `TestNothingInThisPackageReadsAClaimToDecideAWrite` parses every
+  other production file and fails if one so much as names the record.
+- **Acquiring is not required to do the work.** It is advice with a deadline.
+
+The row's shape follows the Host registry's — one per session, filed in the
+session namespace, unranked, never due, read and written only by name — and it
+is never deleted, because this package writes no provider tombstones. There is
+no sweep, and therefore none of the head-of-line hazards a due view brings: a
+claim stops being a claim at its expiry, from its own bytes, at the instant a
+reader asks, and the next acquisition overwrites it.
+
+`ClaimedAt` is the store's clock and `ExpiresAt` is the holder's promise,
+bounded by `MaxReconciliationClaimTTL`. The bound matters even though a stuck
+claim causes delay rather than incorrectness: the failure is invisible, so
+nothing would ever report it, and unbounded it would take a session out of
+reconciliation for the life of the deployment. A release writes a claim whose
+expiry equals its claim instant, which has lapsed on arrival — "released" and
+"expired" are one state, so no reader has to know which it is looking at — and a
+repeated release is a success that writes nothing, because a caller cannot tell
+a lost reply from a failure. A claim that is not the caller's is refused with
+`held` while it is live and `lapsed` once it is not: the first says wait, the
+second says nobody is working and there is nothing of yours to release.
