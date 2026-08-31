@@ -604,17 +604,22 @@ func hostEpochFence(current CatalogRecord, epoch uint64) error {
 // epochFence is the fencing rule every Host-owned write in this package shares,
 // stated once.
 //
-// Three records had byte-identical copies of it differing only in the error
-// they built: the catalog's projection, the Host registration, and the object
-// pointers. What each copy was free to do was drift — to refuse an equal epoch,
+// FOUR records had byte-identical copies of it differing only in the error they
+// built: the catalog's projection, a command's claim, the Host registration,
+// and the object pointers. The fourth was found after the first three were
+// hoisted, which is the argument for the hoist rather than against it — the
+// copies are structurally identical and easy to miss, and inbox_claim.go's own
+// header had said for three tasks that its fence WAS this rule. What each copy
+// was free to do was drift — to refuse an equal epoch,
 // or to report the REQUESTED mark instead of the committed one — on the one
 // path that only runs when a Host has already been superseded and where a
 // weakened check therefore looks exactly like a passing one. It is the argument
 // checkFiledScope and validateOpaque make, and it applies with more force here,
 // because this is the rule that decides who may write at all.
 //
-// committed is the record's stored high-water mark and requested is the epoch
-// the caller named. An equal epoch is ADMITTED, because one lease grant
+// committed is the high-water mark the calling record measures against —
+// usually its own stored epoch, and for a command its current CLAIM's epoch —
+// and requested is the epoch the caller named. An equal epoch is ADMITTED, because one lease grant
 // legitimately writes many times; only a strictly lower one has provably lost
 // the session. The mark never falls, which is why every record that carries one
 // is retained rather than deleted.

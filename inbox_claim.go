@@ -694,8 +694,12 @@ func claimLive(record InboxRecord, now time.Time) bool {
 }
 
 // commandEpochFence admits a claiming write against the epoch the record's
-// current claim was taken under. See this file's header for why it is
-// hostEpochFence's rule and where the two differ.
+// current claim was taken under. It is epochFence in this record's vocabulary,
+// which is what this file's header has always said it should be: the two
+// fences answer the same question about the same lease, and a second idea of
+// when a Host has been superseded is the drift the shared rule exists to
+// prevent. What differs is only the mark it measures against — a CLAIM's epoch
+// rather than a record's — and the name a violation is given.
 //
 // It has no zero-epoch arm, and deliberately so: the one caller that may name no
 // epoch is RejectCommand, which does not call this at all for that caller.
@@ -709,10 +713,9 @@ func claimLive(record InboxRecord, now time.Time) bool {
 // site, or relaxing one of those refusals, makes zero reachable here, and a zero
 // arm added then would skip the fence entirely rather than merely restate it.
 func commandEpochFence(record InboxRecord, epoch uint64) error {
-	if epoch < record.Claim.LeaseEpoch {
-		return &InboxError{Code: InboxErrorEpoch, Field: "lease_epoch", Epoch: record.Claim.LeaseEpoch}
-	}
-	return nil
+	return epochFence(record.Claim.LeaseEpoch, epoch, func(committed uint64) error {
+		return &InboxError{Code: InboxErrorEpoch, Field: "lease_epoch", Epoch: committed}
+	})
 }
 
 // commandClaimFence admits a write that must come from the claim's OWNER: it

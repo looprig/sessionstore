@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"go/ast"
-	"go/parser"
 	"go/token"
 	"path/filepath"
 	"strconv"
@@ -741,10 +740,7 @@ func TestOrderedNamespacesAreDistinct(t *testing.T) {
 		if strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		file, err := parser.ParseFile(token.NewFileSet(), name, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
+		file := parseProductionFile(t, name)
 		parsed[name] = file
 		for _, declaration := range file.Decls {
 			generic, ok := declaration.(*ast.GenDecl)

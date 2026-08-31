@@ -2425,6 +2425,11 @@ func TestEpochFenceIsAHighWaterMark(t *testing.T) {
 
 	// Every record that fences a Host-owned write, driven through its own
 	// spelling of the rule. Each reports the committed mark in its own type.
+	//
+	// The set is exhaustive and must stay so: a fifth record that fences a
+	// Host-owned write and does not route through epochFence is a fifth copy,
+	// which is what this hoist exists to prevent and what a row here is the
+	// cheapest way to notice.
 	fences := map[string]struct {
 		refuse func(uint64) error
 		mark   func(error) uint64
@@ -2437,6 +2442,18 @@ func TestEpochFenceIsAHighWaterMark(t *testing.T) {
 				var typed *CatalogError
 				if !errors.As(err, &typed) || typed.Code != CatalogErrorEpoch {
 					t.Fatalf("catalog refusal = %T %v", err, err)
+				}
+				return typed.Epoch
+			},
+		},
+		"inbox": {
+			refuse: func(epoch uint64) error {
+				return commandEpochFence(InboxRecord{Claim: CommandClaim{LeaseEpoch: committed}}, epoch)
+			},
+			mark: func(err error) uint64 {
+				var typed *InboxError
+				if !errors.As(err, &typed) || typed.Code != InboxErrorEpoch {
+					t.Fatalf("inbox refusal = %T %v", err, err)
 				}
 				return typed.Epoch
 			},

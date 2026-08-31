@@ -691,3 +691,100 @@ repeated release is a success that writes nothing, because a caller cannot tell
 a lost reply from a failure. A claim that is not the caller's is refused with
 `held` while it is live and `lapsed` once it is not: the first says wait, the
 second says nobody is working and there is nothing of yours to release.
+
+## Object pointers: two high-water marks that a clear retains
+
+A session accumulates immutable objects, and for each ROLE exactly one of them
+is current. `pointers.go` stores that choice: one `OrderedIndex` record per
+`(session, role)`, filed in the session's own namespace, unranked, never due,
+read and written only by name, and never deleted. The roles are a closed set —
+workspace checkpoint, runtime checkpoint, and the active continuation the gate
+suspension plan will use — and each has its own `Set`/`Get`/`Clear` triple. The
+kind is spelled by the METHOD rather than carried in the request, so a caller
+cannot name a role this package has not defined, and because an `ObjectID`
+carries its own kind, `SetWorkspaceCheckpointPointer` refuses a runtime
+checkpoint reference before it touches a provider.
+
+A pointer is a NAME. Nothing on these paths reads, writes, copies or deletes a
+blob — `TestMovingAPointerNeverTouchesAnObject` counts the blob traffic of a
+replace and a clear and requires it to be zero — so every object a session has
+ever had stays exactly where it was, byte for byte, however the pointer moves.
+There is still no caller-facing deletion path for objects anywhere in this
+package.
+
+**Two fences, in an order that is part of the contract.** `LeaseEpoch` answers
+*may you write*: an equal epoch is admitted, because one lease grant checkpoints
+many times, and only a strictly lower one has provably lost the session.
+`Sequence` — the journal position the target was captured at — answers *is this
+newer*: an equal sequence is admitted, because one position can legitimately be
+captured twice, and only a strictly lower one is stale. The epoch is checked
+FIRST, and the two refusals ask for opposite responses:
+
+| code | what it means | what the caller should do |
+|---|---|---|
+| `epoch` | your lease has been superseded | stop; no retry under this epoch can succeed |
+| `sequence` | your lease is fine, your data is old | re-read the newer capture, then write |
+
+Reversing that order would hand a dead lease a `sequence` refusal, which it
+would satisfy and retry forever. The sequence fence is the one the epoch cannot
+supply: two writes under ONE grant are ordered only by their revision
+compare-and-swap, so without it a losing writer that retried would reinstate its
+older checkpoint over the newer one and every restore afterwards would silently
+lose the work in between. Both refusals carry both marks, because a caller that
+has to raise its epoch will have to satisfy the sequence too.
+
+**Clearing writes a tombstone and retains both marks.** `ClearWorkspaceCheckpointPointer`
+and its siblings never delete: they store a record whose target is nil — one nil
+rather than an enumeration of cleared members, so a live tombstone is
+unrepresentable — carrying the epoch that cleared it and the sequence it
+inherited. A clear is idempotent under one grant and returns the stored
+tombstone without writing; a LATER grant clearing an already-cleared pointer is
+not a repeat and rewrites it, or the fence would stay at the older epoch and
+every lease granted in between could still write. A role that was never set is
+`not_found`: cleanup is idempotent with respect to its own tombstone, not with
+respect to nothing, because writing one for a pointer that never existed would
+mint a fencing high-water mark out of an unverified caller-supplied epoch.
+
+**`cleared` and `not_found` license different next moves, and that is the whole
+reason they are two codes.** `not_found` says no role record exists, so a first
+write may name any epoch and any sequence. `cleared` says the record exists and
+names nothing: the next write must still beat BOTH retained marks, and the error
+carries them so a caller need not discover them by rejected write. Neither
+returns the record. Retention blocks a strictly LOWER sequence and nothing more,
+so a writer holding the exact capture that was abandoned may set it again at its
+own position — a clear means "there is no current one, and nothing older than
+this may become it", not "that object is retracted".
+
+**The catalog's checkpoint summary is a projection of this record, not a second
+opinion.** `UpdateCatalogHostState` replaces `CatalogRecord.Checkpoint`
+wholesale and zeroes it when a write omits it; that is deliberate and costs
+nothing precisely because the authoritative retained pointer lives here.
+`SessionPointer.CheckpointSummary()` is the intended path: it is the only way to
+build a summary from durable state, it refuses any role but the workspace
+checkpoint — the catalog validates a summary's reference as an opaque ObjectID
+and could not tell a runtime checkpoint from a workspace one — and a cleared
+pointer projects to the zero summary, which is how a clear reaches the catalog
+on the next projection write. Nothing on a pointer path reads the summary, so a
+stale or absent one changes nothing a pointer decides. The two records can
+therefore diverge, and the divergence is bounded by naming which is
+authoritative rather than by pretending it cannot happen: there is no
+cross-record transaction here, and `CheckpointSummary` is an exported struct, so
+a Host in another module can compose one from memory. Within this package a
+source guard holds the composition to the catalog's decoder and this projection;
+past the module boundary it is a convention.
+
+**One wrinkle a caller must know, and it is package-wide rather than the
+pointer's.** "There is no pointer" reaches a caller as two different error
+TYPES. A session whose collision witnesses were never bound is refused by the
+keyspace — `*KeyspaceError` with `binding_not_found` — before any pointer record
+is consulted, because a derived record name is never trusted on its own; a bound
+session with no record of that role is `*PointerError` with `not_found`.
+`TestPointerWritesBindTheSessionsWitness` pins the distinction and asserts the
+CLASS of the refusal rather than merely that one occurred, since the two make
+different claims about the world. `readHostRegistration` behaves identically, so
+a caller handling both records needs the same two arms in both places.
+
+These rows are permanent, one per role per session that has ever had one, and
+the registry's carry-forward contract applies here word for word: the only safe
+reaper is one that removes a session's whole scope at once, because deleting a
+pointer row alone destroys a fence while leaving the role writable at any epoch.

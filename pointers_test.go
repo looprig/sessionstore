@@ -72,7 +72,7 @@ func testSessionPointer() SessionPointer {
 func TestSessionPointerRoundTripsThroughStoredBytes(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range testPointerKinds() {
+	for _, kind := range sessionPointerKinds() {
 		t.Run(string(kind), func(t *testing.T) {
 			t.Parallel()
 
@@ -102,13 +102,6 @@ func TestSessionPointerRoundTripsThroughStoredBytes(t *testing.T) {
 			}
 		})
 	}
-}
-
-// testPointerKinds is every kind the package declares, derived from the closed
-// enum rather than listed here, so a kind added later is covered by every case
-// that ranges over it whether or not anyone remembers this file.
-func testPointerKinds() []SessionPointerKind {
-	return sessionPointerKinds()
 }
 
 func TestAClearedPointerHasExactlyOneSpelling(t *testing.T) {
@@ -213,7 +206,7 @@ func TestSessionPointerCanonicalizesItsInstantToUTC(t *testing.T) {
 func TestAPointerCannotNameAnObjectOfAnotherKind(t *testing.T) {
 	t.Parallel()
 
-	for _, kind := range testPointerKinds() {
+	for _, kind := range sessionPointerKinds() {
 		want, ok := kind.targetObjectKind()
 		if !ok {
 			t.Fatalf("%s names no object kind", kind)
@@ -270,7 +263,33 @@ func allObjectKinds(t *testing.T) []ObjectKind {
 func declaredObjectKinds(t *testing.T) map[string]ObjectKind {
 	t.Helper()
 	kinds := map[string]ObjectKind{}
-	for _, declaration := range parseProductionFile(t, "objects.go").Decls {
+	for name, text := range declaredTypedStringConstants(t, "objects.go", "ObjectKind") {
+		kinds[name] = ObjectKind(text)
+	}
+	return kinds
+}
+
+// declaredTypedStringConstants returns every constant one file declares with an
+// explicit named string type, by constant name.
+//
+// Two guards in this file need exactly this — the pointer roles and the object
+// kinds — and had it written out twice, byte-identically but for the type name,
+// beside a comment saying they were the same walk. That is the copy this
+// package has now argued against at checkFiledScope, declaredStoreOperations,
+// structFieldSpellings and epochFence, and the argument does not get weaker for
+// being about test machinery: what a copy is free to do is drift, and the drift
+// would land on a walk whose job is to notice that a hand-written set has gone
+// stale.
+//
+// It fails rather than skips on a constant of the named type that is not a
+// string literal, because such a constant exists and this walk cannot see its
+// value — reporting a smaller set than the file declares is the one outcome
+// every caller of this is built to detect and none of them could distinguish
+// from a correct answer.
+func declaredTypedStringConstants(t *testing.T, filename, typeName string) map[string]string {
+	t.Helper()
+	constants := map[string]string{}
+	for _, declaration := range parseProductionFile(t, filename).Decls {
 		generic, ok := declaration.(*ast.GenDecl)
 		if !ok || generic.Tok != token.CONST {
 			continue
@@ -281,23 +300,23 @@ func declaredObjectKinds(t *testing.T) map[string]ObjectKind {
 				continue
 			}
 			named, ok := value.Type.(*ast.Ident)
-			if !ok || named.Name != "ObjectKind" {
+			if !ok || named.Name != typeName {
 				continue
 			}
 			for i, literal := range value.Values {
 				basic, ok := literal.(*ast.BasicLit)
 				if !ok || basic.Kind != token.STRING {
-					t.Fatalf("an ObjectKind constant is not a string literal: %v", literal)
+					t.Fatalf("the %s constant %s is not a string literal: %v", typeName, value.Names[i].Name, literal)
 				}
 				text, err := strconv.Unquote(basic.Value)
 				if err != nil {
-					t.Fatalf("unquote: %v", err)
+					t.Fatalf("unquote %s: %v", value.Names[i].Name, err)
 				}
-				kinds[value.Names[i].Name] = ObjectKind(text)
+				constants[value.Names[i].Name] = text
 			}
 		}
 	}
-	return kinds
+	return constants
 }
 
 // acceptedObjectKinds returns the constant names ObjectKind.valid() accepts,
@@ -340,6 +359,25 @@ func acceptedObjectKinds(t *testing.T) map[string]bool {
 	return accepted
 }
 
+// parseProductionFile parses one of this package's own source files, which is
+// the first line of nearly every structural guard here.
+//
+// A NOTE FOR WHOEVER WRITES THE NEXT ONE. The source-reading machinery in this
+// suite is now complete enough that a new guard should be a COMPOSITION of it
+// rather than a fresh walk: parseProductionFile for the syntax,
+// declaredNames for every top-level name a file declares,
+// declaredStoreOperations for the public operations one file adds to Store,
+// declaredTypedStringConstants for a closed enum's members, and
+// structFieldSpellings for what a type can SPELL. Between them they answer
+// "what does this file declare", "what does it accept", and "what can it name",
+// which is every question these guards have needed so far.
+//
+// That matters more than tidiness, and the history is the argument: this file
+// has already shipped two hand-written sets claiming to be derived ones, and
+// both were caught only because someone re-read the comment. A guard built by
+// composing the above starts derived; a guard that opens a new AST walk starts
+// with a walk nobody has asserted anything about, and the S5.3 lesson is that
+// hoisting moves where the assertion is owed rather than removing it.
 func parseProductionFile(t *testing.T, filename string) *ast.File {
 	t.Helper()
 	file, err := parser.ParseFile(token.NewFileSet(), filename, nil, 0)
@@ -1657,36 +1695,8 @@ func TestSessionPointerKindsAreTheDeclaredOnes(t *testing.T) {
 	t.Parallel()
 
 	declared := map[string]bool{}
-	file, err := parser.ParseFile(token.NewFileSet(), "pointers.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse pointers.go: %v", err)
-	}
-	for _, declaration := range file.Decls {
-		generic, ok := declaration.(*ast.GenDecl)
-		if !ok || generic.Tok != token.CONST {
-			continue
-		}
-		for _, spec := range generic.Specs {
-			value, ok := spec.(*ast.ValueSpec)
-			if !ok {
-				continue
-			}
-			named, ok := value.Type.(*ast.Ident)
-			if !ok || named.Name != "SessionPointerKind" {
-				continue
-			}
-			for _, literal := range value.Values {
-				basic, ok := literal.(*ast.BasicLit)
-				if !ok || basic.Kind != token.STRING {
-					t.Fatalf("a SessionPointerKind constant is not a string literal: %v", literal)
-				}
-				text, err := strconv.Unquote(basic.Value)
-				if err != nil {
-					t.Fatalf("unquote: %v", err)
-				}
-				declared[text] = true
-			}
-		}
+	for _, text := range declaredTypedStringConstants(t, "pointers.go", "SessionPointerKind") {
+		declared[text] = true
 	}
 	if len(declared) < 3 {
 		t.Fatalf("found %d declared kinds (%v); the scan is not reaching the constants", len(declared), declared)
@@ -1770,11 +1780,7 @@ func TestNothingElseInThisPackageReadsAPointer(t *testing.T) {
 	// call to one. It is asked as a property of the file rather than by name,
 	// so package documentation moving between files does not break this.
 	declaresSomething := func(filename string) bool {
-		file, err := parser.ParseFile(token.NewFileSet(), filename, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", filename, err)
-		}
-		for _, declaration := range file.Decls {
+		for _, declaration := range parseProductionFile(t, filename).Decls {
 			generic, ok := declaration.(*ast.GenDecl)
 			if !ok || generic.Tok != token.IMPORT {
 				return true
@@ -1797,12 +1803,8 @@ func TestNothingElseInThisPackageReadsAPointer(t *testing.T) {
 	}
 
 	used := func(filename string) map[string]bool {
-		file, err := parser.ParseFile(token.NewFileSet(), filename, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", filename, err)
-		}
 		names := map[string]bool{}
-		ast.Inspect(file, func(node ast.Node) bool {
+		ast.Inspect(parseProductionFile(t, filename), func(node ast.Node) bool {
 			if ident, ok := node.(*ast.Ident); ok && pointerIdentifiers[ident.Name] {
 				names[ident.Name] = true
 			}
@@ -2206,5 +2208,62 @@ func TestAnUnmappableRoleIsRefusedWithoutWriting(t *testing.T) {
 	}
 	if entry := ops.mustGet(t, store); entry.Pointer.LeaseEpoch != pointerEpoch {
 		t.Fatalf("an unmappable role disturbed a real pointer: %+v", entry.Pointer)
+	}
+}
+
+// TestNoOtherProductionFileComposesACheckpointSummary is the first of the three
+// consequences in pointers.go's header, made enforceable as far as it can be.
+//
+// It is a narrower claim than the other two, and the narrowness is the point.
+// CheckpointSummary is an exported struct of exported fields, so a Host in
+// another module can compose one from memory and publish it; nothing here can
+// stop that, and the header says so. What CAN be held is this package's own
+// discipline: the summary is built in exactly two places — the catalog's
+// decoder, which reads it back out of stored bytes, and the pointer's
+// projection, which derives it from the authoritative record. A third would be
+// a second opinion about which checkpoint is current, which is precisely what
+// this record exists to prevent.
+//
+// Only POPULATED literals count. `CheckpointSummary{}` is the zero summary —
+// "no checkpoint has been committed" — and every path is free to spell that,
+// including the projection of a cleared pointer.
+func TestNoOtherProductionFileComposesACheckpointSummary(t *testing.T) {
+	t.Parallel()
+
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	allowed := map[string]bool{"catalog.go": true, "pointers.go": true}
+	found := map[string]int{}
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		ast.Inspect(parseProductionFile(t, name), func(node ast.Node) bool {
+			composite, ok := node.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			named, ok := composite.Type.(*ast.Ident)
+			if !ok || named.Name != "CheckpointSummary" || len(composite.Elts) == 0 {
+				return true
+			}
+			found[name]++
+			if !allowed[name] {
+				t.Errorf("%s composes a populated CheckpointSummary; the summary is a projection of the pointer, not a second opinion",
+					name)
+			}
+			return true
+		})
+	}
+
+	// Anti-vacuity, and it must not be satisfiable by the failure it excludes:
+	// the walk has to find the two composers that are SUPPOSED to be there, or
+	// a scan that matched nothing would report no violation and pass.
+	for name := range allowed {
+		if found[name] == 0 {
+			t.Fatalf("the walk found no populated CheckpointSummary in %s; it is not reaching composite literals", name)
+		}
 	}
 }

@@ -31,13 +31,23 @@ import (
 // write and zeroes it when a write omits it. That was accepted on the explicit
 // basis that clearing the summary loses no durable state because the
 // authoritative retained pointer is a separate epoch-fenced record — this one.
-// Three consequences follow, and they are enforced rather than described:
+// Three consequences follow. The second and third are enforced by
+// TestNothingElseInThisPackageReadsAPointer; the first is enforced ONLY WITHIN
+// THIS PACKAGE, and the difference is stated because it decides what a reader
+// may rely on:
 //
 //   - The summary is a PROJECTION OF THIS RECORD, not a second opinion.
 //     SessionPointer.CheckpointSummary below is the only way to build one from
-//     durable state, so a Host publishes what the pointer says rather than
+//     DURABLE STATE, so a Host publishes what the pointer says rather than
 //     composing a parallel answer by hand. There is exactly one summary type in
-//     this package and this file does not add another.
+//     this package and this file does not add another. What holds it is a
+//     source guard — no production file here composes a populated
+//     CheckpointSummary except the catalog's decoder and this projection — and
+//     that guard stops at the module boundary. CheckpointSummary is an exported
+//     struct of exported fields, so a Host in another module CAN compose one
+//     from memory and hand it to UpdateCatalogHostState, and nothing would
+//     notice. That is a convention this package cannot enforce, and it is why
+//     the two records are allowed to diverge at all.
 //   - Nothing here reads the summary. A pointer write consults the pointer
 //     record and nothing else, so a summary that is stale, empty, or never
 //     written cannot change what a pointer decides — which is what makes the
@@ -179,11 +189,20 @@ func sessionPointerKinds() []SessionPointerKind {
 // than excluded by a check somebody has to remember, and a cleared pointer
 // carries both high-waters and nothing else.
 //
-// UpdatedAt is the store's own clock reading at the moment the write was
-// accepted, not a caller's instant, for the reason ClearHostRegistrationRequest
-// carries no timestamp: nothing in this record has an expiry, so no decision
-// turns on this instant, and a caller-supplied one could only be wrong. It is
-// the record's audit line and the summary's capture instant.
+// UpdatedAt is the STORE's clock, not a caller's, for the reason
+// ClearHostRegistrationRequest carries no timestamp: nothing in this record has
+// an expiry, so no decision turns on this instant, and a caller-supplied one
+// could only be wrong. It is the record's audit line and the summary's capture
+// instant.
+//
+// It is read when the request is VALIDATED, before this store issues any
+// provider call — not when the write was accepted. A set reads it before
+// admission, the witness binding, the read and the compare-and-swap; a clear
+// reads it after its read and before its one swap, so the two paths do not even
+// stamp from the same point in their own sequences. That is precisely because
+// nothing decides on it: validating before any provider work is the property
+// worth having, and paying a round trip to make an audit line a few
+// milliseconds truer is not.
 //
 // The accumulation is one small permanent row per role per session that has
 // ever had one: never listed, never ranked, never due, and never read except by
@@ -246,11 +265,12 @@ type SessionPointerEntry struct {
 // workspace-checkpoint summary would put an object no restore can use where one
 // it can use belongs, and nothing downstream would notice.
 //
-// CapturedAt is this record's UpdatedAt, which is the instant the STORE
-// accepted the pointer rather than the instant the Host finished writing the
-// object. It is later than the true capture by one write, it is the only
-// instant this record has, and it is a rendering field: no decision in this
-// package or in the catalog turns on it.
+// CapturedAt is this record's UpdatedAt, which is neither the instant the Host
+// finished writing the object nor the instant the pointer was committed: it is
+// the store's clock as the pointer request was validated, which SessionPointer
+// states exactly. It therefore sits somewhere between the capture and the
+// commit. It is the only instant this record has, and it is a rendering field:
+// no decision in this package or in the catalog turns on it.
 func (p SessionPointer) CheckpointSummary() (CheckpointSummary, error) {
 	if p.Kind != SessionPointerWorkspaceCheckpoint {
 		return CheckpointSummary{}, pointerErr(PointerErrorInvalid, "kind", nil)
@@ -580,6 +600,8 @@ func (s *Store) setPointer(
 	if !found {
 		return s.createSessionPointer(opCtx, scope, pointer, value)
 	}
+	// Epoch first: a superseded lease must be told it lost the session, not
+	// told to fetch newer data and retry.
 	if err := pointerEpochFence(current.Pointer, req.LeaseEpoch); err != nil {
 		return SessionPointerEntry{}, err
 	}
@@ -643,11 +665,20 @@ func (s *Store) getPointer(
 // THE SEQUENCE IS CARRIED FORWARD FROM THE STORED RECORD, and that single
 // assignment is what step 3's "clearing retains the high-water" means. A clear
 // that reset it to zero would make the record forget which captures it had
-// already superseded, and the next write — from any lease at or above the
-// epoch, including one holding a copy from before the clear — could reinstate
-// an object the clear existed to abandon. The epoch is retained by the same
-// argument, one level up: the fence would fall and a lease that has already
-// lost the session could write again.
+// already superseded, so the next write — from any lease at or above the epoch
+// — could reinstate an object from anywhere in the session's history. The epoch
+// is retained by the same argument, one level up: the fence would fall and a
+// lease that has already lost the session could write again.
+//
+// WHAT RETENTION DOES NOT DO, stated because the obvious reading is too strong.
+// It blocks a STRICTLY LOWER sequence and nothing else, so a writer holding the
+// exact capture the clear abandoned can set it again, at its own position,
+// under an admitted epoch. That is the direct consequence of admitting an equal
+// sequence, which pointerSequenceFence explains and which one journal position
+// captured twice requires. A clear is therefore not a retraction of one object;
+// it is "there is no current one, and nothing older than this may become it".
+// A caller that needs the stronger promise has to move the session's epoch on,
+// which is a lease decision rather than a pointer one.
 //
 // It is idempotent under one grant: a repeat returns the stored tombstone
 // without writing. What carries that rule is the EQUALITY in the repeat
