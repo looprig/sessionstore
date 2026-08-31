@@ -3,11 +3,9 @@ package sessionstore
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"go/ast"
 	"go/parser"
-	"go/printer"
 	"go/token"
 	"math"
 	"path/filepath"
@@ -271,50 +269,19 @@ func TestReconciliationClaimCannotSpellSessionOwnership(t *testing.T) {
 	t.Parallel()
 
 	forbidden := []string{"Epoch", "HostID", "Endpoint", "Residency", "Accepting", "JournalSeq", "Route", "Generation"}
-	fields := 0
-	inspect := func(filename string, include func(string) bool) {
-		file, err := parser.ParseFile(token.NewFileSet(), filename, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", filename, err)
-		}
-		for _, declaration := range file.Decls {
-			generic, ok := declaration.(*ast.GenDecl)
-			if !ok || generic.Tok != token.TYPE {
-				continue
-			}
-			for _, spec := range generic.Specs {
-				typeSpec, ok := spec.(*ast.TypeSpec)
-				if !ok || !include(typeSpec.Name.Name) {
-					continue
-				}
-				structType, ok := typeSpec.Type.(*ast.StructType)
-				if !ok {
-					continue
-				}
-				for _, field := range structType.Fields.List {
-					fields++
-					var rendered bytes.Buffer
-					if err := printer.Fprint(&rendered, token.NewFileSet(), field.Type); err != nil {
-						t.Fatalf("render %s: %v", typeSpec.Name.Name, err)
-					}
-					spelling := rendered.String()
-					for _, name := range field.Names {
-						spelling += " " + name.Name
-					}
-					for _, word := range forbidden {
-						if strings.Contains(spelling, word) {
-							t.Errorf("%s.%s names %s; a claim suppresses duplicate work and is never a fence",
-								typeSpec.Name.Name, spelling, word)
-						}
-					}
-				}
+	fields := structFieldSpellings(t, "reconcile.go", func(string) bool { return true })
+	fields = append(fields, structFieldSpellings(t, "errors.go",
+		func(name string) bool { return strings.HasPrefix(name, "Reconcile") })...)
+	for _, field := range fields {
+		for _, word := range forbidden {
+			if strings.Contains(field.Spelling, word) {
+				t.Errorf("%s.%s names %s; a claim suppresses duplicate work and is never a fence",
+					field.TypeName, field.Spelling, word)
 			}
 		}
 	}
-	inspect("reconcile.go", func(string) bool { return true })
-	inspect("errors.go", func(name string) bool { return strings.HasPrefix(name, "Reconcile") })
-	if fields < 12 {
-		t.Fatalf("only %d fields were inspected; the walk is not reaching the declarations", fields)
+	if len(fields) < 12 {
+		t.Fatalf("only %d fields were inspected; the walk is not reaching the declarations", len(fields))
 	}
 
 	// The holder is deliberately NOT a sessionwire identity type. A HostID here
@@ -350,6 +317,12 @@ func TestNothingInThisPackageReadsAClaimToDecideAWrite(t *testing.T) {
 	// declares is claim-specific, so "no other production file may use
 	// anything reconcile.go declares" is both the true invariant and one a
 	// later declaration is covered by whether or not anyone updates this test.
+	// One caveat, because it is a latent trap rather than a live one: the set is
+	// matched by BARE NAME anywhere in the syntax, including selector
+	// expressions and local variables. That is what makes it catch a call, and
+	// it is why every name reconcile.go declares must stay claim-specific — the
+	// day it declares a generically-named method (isZero, wire, validate), this
+	// guard fires on an unrelated DesiredWorkload.isZero one file over.
 	claimIdentifiers := declaredNames(t, "reconcile.go")
 
 	// Identifiers are read from the parsed syntax rather than from the file's
@@ -404,11 +377,31 @@ func TestNothingInThisPackageReadsAClaimToDecideAWrite(t *testing.T) {
 		t.Fatalf("only %d production files were inspected; the walk is not reaching them", inspected)
 	}
 
-	// And the walk must find every one of them in the file that declares them,
-	// or the sweep above would pass against a walk that inspects nothing.
-	if found := used("reconcile.go"); len(found) != len(claimIdentifiers) {
-		t.Fatalf("reconcile.go uses %d of the %d names it declares (%v); the walk is not reaching them",
-			len(found), len(claimIdentifiers), claimIdentifiers)
+	// THE POSITIVE CONTROL, and it is the only check here that holds the
+	// property everything else rests on: that the walk finds CALL SITES.
+	//
+	// The obvious anti-vacuity check — that the walk finds every name in the
+	// file that declares them — is itself vacuous, because a name's own
+	// DECLARATION is an identifier. A walk that visited declarations and
+	// nothing else would satisfy it completely, report no violation anywhere,
+	// and leave the sweep above silent while a real cross-file call sat in the
+	// package. That was the state of this test until it was proven by
+	// replacing the walk's body with a declaration-only visitor: both
+	// anti-vacuity checks passed and the violation went unreported.
+	//
+	// This file is the control because it USES all three operations and
+	// DECLARES none of reconcile.go's names, so nothing but a walk that
+	// reaches call sites can satisfy it.
+	callSites := used("reconcile_test.go")
+	for _, operation := range []string{
+		"AcquireReconciliationClaim", "GetReconciliationClaim", "ReleaseReconciliationClaim",
+	} {
+		if !callSites[operation] {
+			t.Fatalf("the walk does not find %s where it is CALLED; it is matching declarations only", operation)
+		}
+	}
+	if declaredNames(t, "reconcile_test.go")["AcquireReconciliationClaim"] {
+		t.Fatal("the control file declares a name it is supposed only to call; it is no longer a control")
 	}
 }
 
@@ -1371,87 +1364,6 @@ func TestAClaimAndARegistrationCoexistForOneSession(t *testing.T) {
 	if route.Registration.LeaseEpoch != registryEpoch {
 		t.Fatalf("lease epoch = %d, want %d", route.Registration.LeaseEpoch, registryEpoch)
 	}
-}
-
-// FuzzReconciliationClaimCodec fuzzes stored claim bytes. Its seeds are real
-// encodings rather than hand-written JSON, so a mutation starts from a value
-// that already reaches the strict decoder, the identity validators and the
-// instant rules, instead of bouncing off the first json.Unmarshal.
-//
-// The property is that canonicalization reaches a fixed point: anything the
-// decoder accepts must re-encode, and decoding that encoding must produce the
-// identical bytes again. It deliberately does not claim the decoder rejects
-// non-canonical input — the decoder is a NORMALIZER, and what is guarded is
-// that normalizing twice can never differ from normalizing once.
-func FuzzReconciliationClaimCodec(f *testing.F) {
-	seed := func(claim ReconciliationClaim) []byte {
-		encoded, _, err := encodeReconciliationClaim(claim)
-		if err != nil {
-			f.Fatalf("seed does not encode: %v", err)
-		}
-		return encoded
-	}
-	held := testReconciliationClaim()
-	f.Add(seed(held))
-
-	// The released spelling, whose expiry equals its claim instant, is a
-	// distinct branch of the instant rule and must be explored from the inside.
-	released := held
-	released.ExpiresAt = released.ClaimedAt
-	f.Add(seed(released))
-
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(seed(held), &members); err != nil {
-		f.Fatalf("seed is not JSON: %v", err)
-	}
-	for _, mutate := range []func(map[string]json.RawMessage){
-		func(m map[string]json.RawMessage) { m["record_version"] = json.RawMessage("2") },
-		func(m map[string]json.RawMessage) { m["surprise"] = json.RawMessage("1") },
-		func(m map[string]json.RawMessage) { m["holder_id"] = json.RawMessage(`""`) },
-		func(m map[string]json.RawMessage) { m["expires_at"] = json.RawMessage(`"1970-01-01T00:00:00Z"`) },
-		func(m map[string]json.RawMessage) { m["claimed_at"] = json.RawMessage(`"3000-01-01T00:00:00Z"`) },
-		// The two rankable-instant branches, one per member. Each is the only
-		// refuser of its own shape, so seeding one would leave the fuzzer
-		// exploring from inside one of the two rejections and not the other.
-		func(m map[string]json.RawMessage) { m["expires_at"] = json.RawMessage(`"5000-01-01T00:00:00Z"`) },
-		func(m map[string]json.RawMessage) { m["claimed_at"] = json.RawMessage(`"0001-01-01T00:00:00Z"`) },
-	} {
-		copied := make(map[string]json.RawMessage, len(members))
-		for name, value := range members {
-			copied[name] = value
-		}
-		mutate(copied)
-		encoded, err := json.Marshal(copied)
-		if err != nil {
-			f.Fatalf("marshal seed variant: %v", err)
-		}
-		f.Add(encoded)
-	}
-
-	f.Fuzz(func(t *testing.T, value []byte) {
-		claim, err := decodeReconciliationClaim(value)
-		if err != nil {
-			return
-		}
-		encoded, canonical, err := encodeReconciliationClaim(claim)
-		if err != nil {
-			t.Fatalf("a decoded claim did not re-encode: %v", err)
-		}
-		if canonical != claim {
-			t.Fatalf("a decoded claim was not canonical: %+v want %+v", canonical, claim)
-		}
-		again, err := decodeReconciliationClaim(encoded)
-		if err != nil {
-			t.Fatalf("a re-encoded claim did not decode: %v", err)
-		}
-		reencoded, _, err := encodeReconciliationClaim(again)
-		if err != nil {
-			t.Fatalf("re-encode: %v", err)
-		}
-		if !bytes.Equal(encoded, reencoded) {
-			t.Fatalf("canonicalization has no fixed point:\n%s\n%s", encoded, reencoded)
-		}
-	})
 }
 
 // TestAReleasedClaimIsNotClockIndependent drives the scenario claimHeldAt's

@@ -6,9 +6,9 @@ import (
 	"errors"
 	"go/ast"
 	"go/parser"
-	"go/printer"
 	"go/token"
 	"math"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -458,46 +458,17 @@ func TestPlacementIntentCarriesOnlyDesiredState(t *testing.T) {
 
 	// The same question of every type the file declares, from source, so a
 	// member added to one of them cannot slip past the reflection above.
-	fields := 0
-	file, err := parser.ParseFile(token.NewFileSet(), "placement.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse placement.go: %v", err)
-	}
-	for _, declaration := range file.Decls {
-		generic, ok := declaration.(*ast.GenDecl)
-		if !ok || generic.Tok != token.TYPE {
-			continue
-		}
-		for _, spec := range generic.Specs {
-			typeSpec, ok := spec.(*ast.TypeSpec)
-			if !ok {
-				continue
-			}
-			structType, ok := typeSpec.Type.(*ast.StructType)
-			if !ok {
-				continue
-			}
-			for _, field := range structType.Fields.List {
-				fields++
-				var rendered bytes.Buffer
-				if err := printer.Fprint(&rendered, token.NewFileSet(), field.Type); err != nil {
-					t.Fatalf("render %s: %v", typeSpec.Name.Name, err)
-				}
-				spelling := rendered.String()
-				for _, name := range field.Names {
-					spelling += " " + name.Name
-				}
-				for _, word := range forbidden {
-					if strings.Contains(spelling, word) {
-						t.Errorf("%s.%s names %s; desired placement is a request, never an observation",
-							typeSpec.Name.Name, spelling, word)
-					}
-				}
+	fields := structFieldSpellings(t, "placement.go", func(string) bool { return true })
+	for _, field := range fields {
+		for _, word := range forbidden {
+			if strings.Contains(field.Spelling, word) {
+				t.Errorf("%s.%s names %s; desired placement is a request, never an observation",
+					field.TypeName, field.Spelling, word)
 			}
 		}
 	}
-	if fields < 6 {
-		t.Fatalf("only %d fields were inspected; the walk is not reaching the declarations", fields)
+	if len(fields) < 6 {
+		t.Fatalf("only %d fields were inspected; the walk is not reaching the declarations", len(fields))
 	}
 }
 
@@ -615,5 +586,168 @@ func TestCreateCarriesTheFirstDesiredWorkload(t *testing.T) {
 	}
 	if calls := recorder.snapshot(); len(calls) != 0 {
 		t.Fatalf("a refused create reached the provider: %+v", calls)
+	}
+}
+
+// TestOnlyTheDesiredStatePathsWriteTheGeneration is the cross product the
+// behavioural test above cannot be.
+//
+// `TestDesiredGenerationCountsAcceptedDesiredWrites` drives ONE non-desired
+// write path — UpdateCatalogHostState — and asserts the counter does not move.
+// But writeCatalogRecord has five callers, two of them in gates.go, and adding
+// `next.DesiredGeneration++` to OpenGate passes the whole suite green while
+// destroying the counter's meaning: every gate opened would tell every
+// placement controller that its reconciliation was stale. Driving each caller
+// by hand is a hand-written list where the invariant is a cross product over
+// write paths, and a sixth caller added later would be covered by nobody.
+//
+// So the assertion is structural, in the shape of the claim isolation guard:
+// find every function in this package that WRITES the member, and require each
+// to be one this file expects. A path added later fails here until someone
+// classifies it, which is the point — the two codec functions below are exactly
+// such a classification, and they are excluded with a reason rather than
+// omitted.
+func TestOnlyTheDesiredStatePathsWriteTheGeneration(t *testing.T) {
+	t.Parallel()
+
+	// Where the generation may be written, and why each is legitimate.
+	expected := map[string]string{
+		"placement.go/applyDesiredState": "the one path that ADVANCES it, after the key and the revision have settled",
+		"catalog.go/CreateCatalogEntry":  "the one path that mints it, because creating a session names its desired placement",
+		"catalog.go/encodeCatalogRecord": "codec carry-through: copies the record's value into the wire shape unchanged",
+		"catalog.go/decodeCatalogRecord": "codec carry-through: copies the wire value back into the record unchanged",
+	}
+
+	found := map[string]bool{}
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	inspected := 0
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		inspected++
+		for _, declaration := range file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if !ok || function.Body == nil {
+				continue
+			}
+			site := name + "/" + function.Name.Name
+			ast.Inspect(function.Body, func(node ast.Node) bool {
+				switch node := node.(type) {
+				case *ast.AssignStmt:
+					// `x.DesiredGeneration = ...`, in any assignment form.
+					for _, target := range node.Lhs {
+						if writesDesiredGeneration(target) {
+							found[site] = true
+						}
+					}
+				case *ast.IncDecStmt:
+					// `x.DesiredGeneration++`, which is the mutation this test
+					// exists for and is not an AssignStmt.
+					if writesDesiredGeneration(node.X) {
+						found[site] = true
+					}
+				case *ast.KeyValueExpr:
+					// `DesiredGeneration: ...` inside a composite literal, which
+					// is how both codec paths and the create path write it.
+					if key, ok := node.Key.(*ast.Ident); ok && key.Name == "DesiredGeneration" {
+						found[site] = true
+					}
+				}
+				return true
+			})
+		}
+	}
+	if inspected < 8 {
+		t.Fatalf("only %d production files were inspected; the walk is not reaching them", inspected)
+	}
+
+	for site := range found {
+		if expected[site] == "" {
+			t.Errorf("%s writes DesiredGeneration and this test does not expect it; "+
+				"a write path outside the desired-state paths makes the counter mean something else", site)
+		}
+	}
+	for site, reason := range expected {
+		if !found[site] {
+			t.Errorf("%s no longer writes DesiredGeneration (%s); the walk or the expectation is stale", site, reason)
+		}
+	}
+}
+
+// writesDesiredGeneration reports whether an expression names the record's
+// generation member as the target of a write.
+func writesDesiredGeneration(target ast.Expr) bool {
+	selector, ok := target.(*ast.SelectorExpr)
+	return ok && selector.Sel.Name == "DesiredGeneration"
+}
+
+// TestAStoredWorkloadPayloadIsNormalizedNotPreserved pins the fact
+// DesiredWorkload's own comment states, because that comment is a warning to a
+// later task and a warning nothing exercises is a warning that rots.
+//
+// encoding/json decodes a []byte with NON-STRICT base64, so a stored payload
+// whose final quantum has dirty padding bits decodes to the same bytes and
+// re-encodes to a different spelling. The record is still canonical in the
+// sense the codec fuzzer asserts — normalizing twice equals normalizing once —
+// but it is NOT byte-identical to what a non-canonical writer stored, which is
+// what a bytes-identity check on a write reply would assume.
+func TestAStoredWorkloadPayloadIsNormalizedNotPreserved(t *testing.T) {
+	t.Parallel()
+
+	record := testCatalogRecord()
+	record.DesiredWorkload = DesiredWorkload{PayloadVersion: "workload/v1", Payload: []byte{0x01}}
+	canonical, err := encodeCatalogRecord(record)
+	if err != nil {
+		t.Fatalf("encodeCatalogRecord: %v", err)
+	}
+	if !strings.Contains(string(canonical), `"payload":"AQ=="`) {
+		t.Fatalf("the canonical spelling of one 0x01 byte is not what this test assumes: %s", canonical)
+	}
+
+	// The same byte, spelled with dirty padding bits, which base64's decoder
+	// accepts and this package therefore stores.
+	dirty := []byte(strings.Replace(string(canonical), `"payload":"AQ=="`, `"payload":"AR=="`, 1))
+	if bytes.Equal(dirty, canonical) {
+		t.Fatal("could not build the non-canonical spelling")
+	}
+	decoded, err := decodeCatalogRecord(dirty)
+	if err != nil {
+		t.Fatalf("a non-canonical payload spelling was refused: %v", err)
+	}
+	if !bytes.Equal(decoded.DesiredWorkload.Payload, []byte{0x01}) {
+		t.Fatalf("payload = %v, want [1]", decoded.DesiredWorkload.Payload)
+	}
+
+	// Re-encoding it does NOT reproduce the stored bytes — the point of the
+	// warning — while decoding the re-encoding is stable, which is the property
+	// the codec actually promises.
+	reencoded, err := encodeCatalogRecord(decoded)
+	if err != nil {
+		t.Fatalf("re-encode: %v", err)
+	}
+	if bytes.Equal(reencoded, dirty) {
+		t.Fatal("the stored bytes survived a round trip; the warning on DesiredWorkload is now false")
+	}
+	if !bytes.Equal(reencoded, canonical) {
+		t.Fatalf("re-encoding did not reach the canonical form:\n%s\n%s", reencoded, canonical)
+	}
+	again, err := decodeCatalogRecord(reencoded)
+	if err != nil {
+		t.Fatalf("decode the re-encoding: %v", err)
+	}
+	third, err := encodeCatalogRecord(again)
+	if err != nil {
+		t.Fatalf("third encode: %v", err)
+	}
+	if !bytes.Equal(third, reencoded) {
+		t.Fatal("canonicalization has no fixed point")
 	}
 }

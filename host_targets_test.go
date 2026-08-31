@@ -1482,56 +1482,128 @@ func TestStaleAdvertisementsDoNotPermanentlyFillPlacementPages(t *testing.T) {
 // It reads the SOURCE rather than a hand-listed set of types, so a type added
 // to this record later is covered without anyone remembering to add it, and it
 // covers the one foreign type this record publishes as well.
+// structFieldSpelling is one field of one struct, rendered the way the guards
+// below ask their question of it: the field's TYPE as written in the source,
+// followed by its names.
+type structFieldSpelling struct {
+	TypeName string
+	Spelling string
+}
+
+// structFieldSpellings renders every field of every struct one file declares
+// whose type name include accepts.
+//
+// It is shared because three record kinds now ask the same structural question
+// — can this record SPELL a thing it must never carry — and the walk that
+// answers it had been copied twice, byte-identically but for the message. This
+// package has made that argument twice already, at checkFiledScope and at
+// declaredStoreOperations, and the reason is not tidiness: what a copy is free
+// to do is drift, on a path where a weakened check looks exactly like a passing
+// one. This walk has more knobs than most. Drop the printer.Fprint and it stops
+// seeing typed fields, so an embedded LeaseEpoch would pass; drop the
+// field.Names loop and it stops seeing names, so a `Epoch uint64` would. Each
+// caller keeps what is genuinely its own — its forbidden list, its message, and
+// its own floor on how many fields a non-vacuous walk must reach.
+func structFieldSpellings(t *testing.T, filename string, include func(string) bool) []structFieldSpelling {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), filename, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", filename, err)
+	}
+	var fields []structFieldSpelling
+	for _, declaration := range file.Decls {
+		generic, ok := declaration.(*ast.GenDecl)
+		if !ok || generic.Tok != token.TYPE {
+			continue
+		}
+		for _, spec := range generic.Specs {
+			typeSpec, ok := spec.(*ast.TypeSpec)
+			if !ok || !include(typeSpec.Name.Name) {
+				continue
+			}
+			structType, ok := typeSpec.Type.(*ast.StructType)
+			if !ok {
+				continue
+			}
+			for _, field := range structType.Fields.List {
+				var rendered bytes.Buffer
+				if err := printer.Fprint(&rendered, token.NewFileSet(), field.Type); err != nil {
+					t.Fatalf("render %s: %v", typeSpec.Name.Name, err)
+				}
+				spelling := rendered.String()
+				for _, name := range field.Names {
+					spelling += " " + name.Name
+				}
+				fields = append(fields, structFieldSpelling{TypeName: typeSpec.Name.Name, Spelling: spelling})
+			}
+		}
+	}
+	return fields
+}
+
+// TestStructFieldSpellingsRendersTypesAndNames guards the shared walk itself,
+// which sharing alone does not.
+//
+// Hoisting three copies into one place removes the drift between them and
+// leaves the machinery unguarded: dropping the printer.Fprint stops the walk
+// seeing typed fields, and dropping the field.Names loop stops it seeing names.
+// Both mutations survived all three ownership tests, because each of those asks
+// only whether a FORBIDDEN word appears — a walk that renders nothing at all
+// reports no forbidden word and passes. So the property is asserted positively
+// here, once, on behalf of every caller: an embedded LeaseEpoch is caught by
+// the type half, and a `Epoch uint64` by the name half.
+func TestStructFieldSpellingsRendersTypesAndNames(t *testing.T) {
+	t.Parallel()
+
+	spelling := func(fields []structFieldSpelling, want string) bool {
+		for _, field := range fields {
+			if field.Spelling == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	// A NAMED field renders as its source type followed by its name, so a guard
+	// looking for either half finds it.
+	claim := structFieldSpellings(t, "reconcile.go", func(name string) bool { return name == "ReconciliationClaim" })
+	if len(claim) == 0 {
+		t.Fatal("the walk found no fields on ReconciliationClaim")
+	}
+	if !spelling(claim, "string HolderID") {
+		t.Errorf("ReconciliationClaim fields = %+v, want one spelled %q", claim, "string HolderID")
+	}
+	if !spelling(claim, "sessionwire.TenantID TenantID") {
+		t.Errorf("ReconciliationClaim fields = %+v, want a qualified type rendered with its name", claim)
+	}
+
+	// An EMBEDDED field has no name and renders as its type alone, which is the
+	// case a name-only walk would drop entirely.
+	page := structFieldSpellings(t, "catalog.go", func(name string) bool { return name == "SessionPage" })
+	if !spelling(page, "sessionwire.SessionPage") {
+		t.Errorf("SessionPage fields = %+v, want the embedded type rendered on its own", page)
+	}
+}
+
 func TestHostTargetsCannotSpellSessionOwnership(t *testing.T) {
 	t.Parallel()
 
 	forbidden := []string{"TenantID", "SessionID", "LeaseEpoch"}
-	fields := 0
-	inspect := func(filename string, include func(string) bool) {
-		file, err := parser.ParseFile(token.NewFileSet(), filename, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", filename, err)
-		}
-		for _, declaration := range file.Decls {
-			generic, ok := declaration.(*ast.GenDecl)
-			if !ok || generic.Tok != token.TYPE {
-				continue
-			}
-			for _, spec := range generic.Specs {
-				typeSpec, ok := spec.(*ast.TypeSpec)
-				if !ok || !include(typeSpec.Name.Name) {
-					continue
-				}
-				structType, ok := typeSpec.Type.(*ast.StructType)
-				if !ok {
-					continue
-				}
-				for _, field := range structType.Fields.List {
-					fields++
-					var rendered bytes.Buffer
-					if err := printer.Fprint(&rendered, token.NewFileSet(), field.Type); err != nil {
-						t.Fatalf("render %s: %v", typeSpec.Name.Name, err)
-					}
-					spelling := rendered.String()
-					for _, name := range field.Names {
-						spelling += " " + name.Name
-					}
-					for _, word := range forbidden {
-						if strings.Contains(spelling, word) {
-							t.Errorf("%s.%s names %s; this record is capacity, and capacity is never authority",
-								typeSpec.Name.Name, spelling, word)
-						}
-					}
-				}
+	// Every type in the record's own file, plus its error type wherever the
+	// package's single error home puts it.
+	fields := structFieldSpellings(t, "host_targets.go", func(string) bool { return true })
+	fields = append(fields, structFieldSpellings(t, "errors.go",
+		func(name string) bool { return strings.HasPrefix(name, "HostTarget") })...)
+	for _, field := range fields {
+		for _, word := range forbidden {
+			if strings.Contains(field.Spelling, word) {
+				t.Errorf("%s.%s names %s; this record is capacity, and capacity is never authority",
+					field.TypeName, field.Spelling, word)
 			}
 		}
 	}
-	// Every type in the record's own file, plus its error type wherever the
-	// package's single error home puts it.
-	inspect("host_targets.go", func(string) bool { return true })
-	inspect("errors.go", func(name string) bool { return strings.HasPrefix(name, "HostTarget") })
-	if fields < 20 {
-		t.Fatalf("only %d fields were inspected; the walk is not reaching the declarations", fields)
+	if len(fields) < 20 {
+		t.Fatalf("only %d fields were inspected; the walk is not reaching the declarations", len(fields))
 	}
 
 	// The projection a placement page publishes is core's, so the same question

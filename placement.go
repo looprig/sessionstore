@@ -75,6 +75,18 @@ const MaxDesiredWorkloadPayloadBytes = 16 << 10
 // PayloadVersion is caller-owned text and is never interpreted here. It exists
 // so that a reconciler reading a payload it does not understand can say so
 // instead of misreading it.
+//
+// A NOTE OWED TO WHOEVER ADDS A BYTES-IDENTITY CHECK TO THE CATALOG. This
+// member makes the catalog record's stored bytes a normalizer's output rather
+// than a fixed point of the caller's input: encoding/json decodes a []byte with
+// non-strict base64, so a stored "AR==" decodes to one byte and re-encodes as
+// "AQ==". The record still round-trips CANONICALLY — decode, encode, decode
+// again is stable, which is what the codec fuzzer asserts — but a check
+// comparing a provider's reply against the exact bytes handed to it, as
+// verifyReconciliationClaimBytes and verifyRegistrationBytes do for records
+// with no []byte member, would refuse a faithful reply to a value some other
+// writer had stored non-canonically. Compare re-encoded forms there, not raw
+// bytes.
 type DesiredWorkload struct {
 	PayloadVersion string
 	Payload        []byte
@@ -201,6 +213,19 @@ func applyDesiredState(current CatalogRecord, req UpdateCatalogDesiredStateReque
 
 // PlacementIntent is the complete Factory-authored answer to "what should exist
 // for this session", and nothing else.
+//
+// COMPLETE AS TO AUTHORSHIP, NOT AS TO SUFFICIENCY, and the difference decides
+// whether a controller acting on one alone is correct. This is the only one of
+// the record's three projections that drops State — Summary and Status both
+// carry it — so an intent cannot say whether the session it describes is still
+// alive. A controller holding only this could create a dedicated workload for a
+// session that has ended. Read CatalogRecord.State, or Status(), from the SAME
+// entry: one read of one record answers both questions, and taking them from
+// one entry is what makes the pair consistent.
+//
+// Excluding the observation is nonetheless right, and is this type's whole
+// discipline — an intent that carried liveness would be a request and a fact in
+// one value, and the next reader would not know which half it was acting on.
 //
 // It is what a placement controller reads, and its shape is the reason it
 // exists as a type rather than as a handful of catalog members a caller picks

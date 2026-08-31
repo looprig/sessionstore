@@ -124,6 +124,22 @@ const MaxReconciliationClaimTTL = 5 * time.Minute
 // because only the caller knows how long its work takes, and it is bounded
 // above for that reason.
 //
+// WHICH CLOCK, AND WHAT THAT DOES NOT BUY. Taking the claim instant from the
+// store rather than the request removes a degree of freedom from the REQUEST;
+// it does not make the instant authoritative. The clock is caller-injected and
+// unchecked (see WithClock), and a Factory replica embeds its own Store, so
+// s.clock is that replica's clock one level down. Liveness is therefore
+// evaluated against the READING replica's clock and is skew-relative in both
+// directions: a slow replica sees another's claim live longer than its holder
+// meant, and a fast one takes it over early. There is no shared time here and
+// none is available.
+//
+// That is affordable for the reason this file's header gives and for no other:
+// the claim licenses nothing, so the worst either direction produces is
+// duplicated or delayed work that was already safe to do concurrently. It would
+// NOT be affordable for a record whose expiry decided who may write, which is
+// why the Host lease is a lease and this is not one.
+//
 // A claim whose expiry EQUALS its claim instant has lapsed on arrival, which is
 // exactly what ReleaseReconciliationClaim writes. That is not a second state
 // needing a marker of its own: "released" and "expired" are the same fact to
@@ -403,7 +419,13 @@ func (s *Store) AcquireReconciliationClaim(
 	if !found {
 		return s.createReconciliationClaim(opCtx, scope, claim, value)
 	}
-	if current.Claim.HolderID != req.HolderID && claimHeldAt(current.Claim, now) {
+	// The comparison and the write both name the CANONICAL holder rather than
+	// the request's, as encodeReconciliationClaim's own contract requires. The
+	// two are identical today — validateOpaque rejects but never normalizes —
+	// which is exactly why the rule is worth obeying while it costs nothing: a
+	// normalization added to that validator later would otherwise compare one
+	// spelling and store another.
+	if current.Claim.HolderID != claim.HolderID && claimHeldAt(current.Claim, now) {
 		return ReconciliationClaimEntry{}, &ReconcileError{
 			Code: ReconcileErrorHeld, Field: "holder_id", ExpiresAt: current.Claim.ExpiresAt}
 	}
@@ -485,33 +507,14 @@ func (s *Store) ReleaseReconciliationClaim(
 	if err != nil {
 		return ReconciliationClaimEntry{}, err
 	}
-	if err := validateOpaque(req.HolderID, "holder_id", reconcileInvalid); err != nil {
-		return ReconciliationClaimEntry{}, err
-	}
-	opCtx, release, err := s.admitForeground(ctx)
-	if err != nil {
-		return ReconciliationClaimEntry{}, err
-	}
-	defer release()
-
 	now := s.clock.Now()
-	current, found, err := s.readReconciliationClaim(opCtx, scope, req.TenantID, req.SessionID)
-	if err != nil {
-		return ReconciliationClaimEntry{}, err
-	}
-	if !found {
-		return ReconciliationClaimEntry{}, reconcileErr(ReconcileErrorNotFound, "record", nil)
-	}
-	if current.Claim.HolderID != req.HolderID {
-		if claimHeldAt(current.Claim, now) {
-			return ReconciliationClaimEntry{}, &ReconcileError{
-				Code: ReconcileErrorHeld, Field: "holder_id", ExpiresAt: current.Claim.ExpiresAt}
-		}
-		return ReconciliationClaimEntry{}, reconcileErr(ReconcileErrorLapsed, "holder_id", nil)
-	}
-	if !claimHeldAt(current.Claim, now) {
-		return current, nil
-	}
+	// The record this release would write is built and validated BEFORE
+	// anything is read, which does three things at once: it refuses a malformed
+	// request before the store is admitted, as every operation here does; it
+	// states the holder rule once, in the encoder, rather than in a second
+	// up-front validateOpaque that would refuse with the identical code and
+	// field; and it gives the comparison below the CANONICAL holder to compare
+	// against instead of the request's spelling.
 	value, released, err := encodeReconciliationClaim(ReconciliationClaim{
 		TenantID:  req.TenantID,
 		SessionID: req.SessionID,
@@ -521,6 +524,29 @@ func (s *Store) ReleaseReconciliationClaim(
 	})
 	if err != nil {
 		return ReconciliationClaimEntry{}, err
+	}
+	opCtx, release, err := s.admitForeground(ctx)
+	if err != nil {
+		return ReconciliationClaimEntry{}, err
+	}
+	defer release()
+
+	current, found, err := s.readReconciliationClaim(opCtx, scope, req.TenantID, req.SessionID)
+	if err != nil {
+		return ReconciliationClaimEntry{}, err
+	}
+	if !found {
+		return ReconciliationClaimEntry{}, reconcileErr(ReconcileErrorNotFound, "record", nil)
+	}
+	if current.Claim.HolderID != released.HolderID {
+		if claimHeldAt(current.Claim, now) {
+			return ReconciliationClaimEntry{}, &ReconcileError{
+				Code: ReconcileErrorHeld, Field: "holder_id", ExpiresAt: current.Claim.ExpiresAt}
+		}
+		return ReconciliationClaimEntry{}, reconcileErr(ReconcileErrorLapsed, "holder_id", nil)
+	}
+	if !claimHeldAt(current.Claim, now) {
+		return current, nil
 	}
 	return s.writeReconciliationClaim(opCtx, scope, released, value, current.Revision)
 }
