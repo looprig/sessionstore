@@ -593,14 +593,43 @@ func (s *Store) readCatalogEntry(
 // UpdateCatalogHostState and both gate writes — so none of them can drift into
 // a different idea of when a Host has been superseded.
 //
-// An equal epoch is admitted because one grant legitimately writes many times;
-// only a strictly lower one has provably lost the session. The zero check is
-// deliberately NOT here: each caller makes it before its read, so an epochless
-// request is refused as the caller mistake it is rather than being reported as
-// whatever the read happened to find.
+// It is epochFence in the catalog's vocabulary; the rule, and why an equal
+// epoch is admitted, are stated there.
 func hostEpochFence(current CatalogRecord, epoch uint64) error {
-	if epoch < current.LeaseEpoch {
-		return &CatalogError{Code: CatalogErrorEpoch, Field: "lease_epoch", Epoch: current.LeaseEpoch}
+	return epochFence(current.LeaseEpoch, epoch, func(committed uint64) error {
+		return &CatalogError{Code: CatalogErrorEpoch, Field: "lease_epoch", Epoch: committed}
+	})
+}
+
+// epochFence is the fencing rule every Host-owned write in this package shares,
+// stated once.
+//
+// Three records had byte-identical copies of it differing only in the error
+// they built: the catalog's projection, the Host registration, and the object
+// pointers. What each copy was free to do was drift — to refuse an equal epoch,
+// or to report the REQUESTED mark instead of the committed one — on the one
+// path that only runs when a Host has already been superseded and where a
+// weakened check therefore looks exactly like a passing one. It is the argument
+// checkFiledScope and validateOpaque make, and it applies with more force here,
+// because this is the rule that decides who may write at all.
+//
+// committed is the record's stored high-water mark and requested is the epoch
+// the caller named. An equal epoch is ADMITTED, because one lease grant
+// legitimately writes many times; only a strictly lower one has provably lost
+// the session. The mark never falls, which is why every record that carries one
+// is retained rather than deleted.
+//
+// fail receives the COMMITTED mark rather than the requested one, because that
+// is the only value a refused caller can act on, and it names what a violation
+// is CALLED in the calling record's vocabulary — the RULE is stated here.
+//
+// The zero check is deliberately not here. Whether an epochless request is a
+// caller mistake or a corrupted record depends on which side supplied it, so
+// each caller makes that check before its read; folding it in would report a
+// caller mistake as whatever the read happened to find.
+func epochFence(committed, requested uint64, fail func(committed uint64) error) error {
+	if requested < committed {
+		return fail(committed)
 	}
 	return nil
 }

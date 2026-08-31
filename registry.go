@@ -733,20 +733,20 @@ func routableAt(record HostRegistration, now time.Time) error {
 }
 
 // registrationEpochFence admits a Host-owned write against the registration's
-// committed high-water epoch. It is hostEpochFence's rule stated in this
-// record's vocabulary, for the reason commandEpochFence is: an equal epoch is
-// admitted because one grant writes many times, only a strictly lower one has
-// provably lost the session, and the high-water never falls.
+// committed high-water epoch. It is epochFence stated in this record's
+// vocabulary, for the reason commandEpochFence is: the shared rule is that an
+// equal epoch is admitted because one grant writes many times, only a strictly
+// lower one has provably lost the session, and the high-water never falls; what
+// belongs to this record is the NAME of a violation.
 //
 // The zero check is deliberately NOT here, as it is not there: each caller
 // makes it before its read — a publisher through encodeHostRegistration, a
 // cleanup explicitly — so an epochless request is refused as the caller mistake
 // it is rather than being reported as whatever the read happened to find.
 func registrationEpochFence(current HostRegistration, epoch uint64) error {
-	if epoch < current.LeaseEpoch {
-		return &RegistryError{Code: RegistryErrorEpoch, Field: "lease_epoch", Epoch: current.LeaseEpoch}
-	}
-	return nil
+	return epochFence(current.LeaseEpoch, epoch, func(committed uint64) error {
+		return &RegistryError{Code: RegistryErrorEpoch, Field: "lease_epoch", Epoch: committed}
+	})
 }
 
 // createHostRegistration creates the first registration a session has ever had.

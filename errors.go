@@ -814,6 +814,112 @@ func reconcileRecordFailure(failure versionedRecordFailure, field string, cause 
 	}
 }
 
+// PointerErrorCode classifies an object pointer failure.
+//
+// It is its own vocabulary rather than the catalog's, and the reason is the one
+// this whole record exists for: the catalog carries a checkpoint SUMMARY that a
+// projection write replaces wholesale, and this record carries the
+// authoritative name. A caller that could handle both with one code set would
+// be one refactor away from treating a failure to write the copy as a failure
+// to write the truth, or the reverse.
+//
+// The codes that need their reasons stated:
+//
+//   - Cleared — the pointer exists and names nothing. It is not an error in the
+//     caller and not an absence: the record is there, it holds both high-water
+//     marks, and it is those marks the failure carries. Reporting it as
+//     NotFound would tell a caller that a session had never had this pointer,
+//     which licenses a first write at any epoch and any sequence.
+//   - Epoch — the request names a strictly lower lease epoch than the record's
+//     committed high-water mark, so the caller has provably lost the session.
+//   - Sequence — the epoch was accepted and the target is OLDER than the one
+//     already named. Distinct from Epoch because the caller's authority is not
+//     in question and retrying will not help: what it holds is stale.
+//   - NotFound — no pointer record of this kind exists at all. Distinct from
+//     Cleared for the reason above, and the distinction is what stops a clear
+//     from being confused with a session that has never checkpointed.
+//
+// Conflict means a lost revision compare-and-swap and nothing else — re-read
+// and retry — which is the meaning it has for every other record kind here.
+type PointerErrorCode string
+
+const (
+	PointerErrorInvalid   PointerErrorCode = "invalid"
+	PointerErrorNotFound  PointerErrorCode = "not_found"
+	PointerErrorCleared   PointerErrorCode = "cleared"
+	PointerErrorEpoch     PointerErrorCode = "epoch"
+	PointerErrorSequence  PointerErrorCode = "sequence"
+	PointerErrorDeleted   PointerErrorCode = "deleted"
+	PointerErrorIdentity  PointerErrorCode = "identity"
+	PointerErrorConflict  PointerErrorCode = "conflict"
+	PointerErrorUnknown   PointerErrorCode = "unknown"
+	PointerErrorBackend   PointerErrorCode = "backend"
+	PointerErrorMalformed PointerErrorCode = "malformed"
+	PointerErrorVersion   PointerErrorCode = "version"
+	PointerErrorTooLarge  PointerErrorCode = "too_large"
+)
+
+// PointerError is a typed, redacted object pointer failure. Field names the
+// offending input or stage and never carries a provider name, a key, or a
+// record payload.
+//
+// Revision is populated only for PointerErrorConflict, carrying the value that
+// is itself the answer, as the other record kinds do for that code.
+//
+// Epoch and Sequence are the two high-water marks the record retains, and they
+// are populated by exactly the three codes that refuse a write or withhold a
+// target: Epoch, Sequence and Cleared. Disclosing them is not a courtesy. They
+// are the only durable facts a caller's next attempt has to satisfy, nothing
+// else in this package reads them out, and a cleared pointer in particular
+// hands back no record at all — so withholding them would leave probing by
+// rejected write as a caller's only way to learn what it must name. The
+// registry discloses its epoch on its two no-route codes for the same reason.
+//
+// A DELIBERATE ASYMMETRY WITH THE TARGET: neither the refusals nor the cleared
+// report names the object that IS stored. A caller learns what it must beat,
+// never what it lost to.
+type PointerError struct {
+	Code     PointerErrorCode
+	Field    string
+	Epoch    uint64
+	Sequence uint64
+	Revision uint64
+	Cause    error
+}
+
+func (e *PointerError) Error() string {
+	message := "sessionstore: pointer " + string(e.Code)
+	if e.Field != "" {
+		message += " (" + e.Field + ")"
+	}
+	return message
+}
+
+func (e *PointerError) Unwrap() error { return e.Cause }
+
+func pointerErr(code PointerErrorCode, field string, cause error) error {
+	return &PointerError{Code: code, Field: field, Cause: cause}
+}
+
+// pointerIdentity is the pointer's counterpart of the identity constructors
+// below, and it exists for the same reason they do.
+func pointerIdentity(field string, cause error) error {
+	return pointerErr(PointerErrorIdentity, field, cause)
+}
+
+// pointerRecordFailure maps a shared versioned-record decode failure into the
+// pointer vocabulary.
+func pointerRecordFailure(failure versionedRecordFailure, field string, cause error) error {
+	switch failure {
+	case versionedRecordTooLarge:
+		return pointerErr(PointerErrorTooLarge, field, cause)
+	case versionedRecordVersion:
+		return pointerErr(PointerErrorVersion, field, cause)
+	default:
+		return pointerErr(PointerErrorMalformed, field, cause)
+	}
+}
+
 // The three identity constructors below are what let checkFiledScope be shared.
 // They are separate from the Invalid constructors above them because the two
 // say different things: an Invalid names a value that is wrong, while an

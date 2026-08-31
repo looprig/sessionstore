@@ -2378,3 +2378,106 @@ func TestListSessionsStepsOverARowItCannotRead(t *testing.T) {
 		})
 	}
 }
+
+// TestEpochFenceIsAHighWaterMark guards the shared fence itself, which sharing
+// alone does not.
+//
+// Three records fenced Host-owned writes with three byte-identical comparisons
+// differing only in the error they built, and each of the three was free to
+// drift on the one path that only runs when a Host has already been superseded.
+// Hoisting them removes the drift and leaves the machinery unasserted — a fence
+// that returned nil unconditionally would pass every caller's rejection test
+// that only checks the ADMITTED direction, and one that passed the REQUESTED
+// epoch to its failure constructor would pass every test that only checks that
+// some refusal occurred. So the property is asserted positively here, once, on
+// behalf of all three:
+//
+//   - Equal is admitted, because one grant writes many times.
+//   - Higher is admitted.
+//   - Strictly lower is refused, and the refusal is built from the COMMITTED
+//     mark, which is the only value a caller can act on.
+//
+// The three vocabularies are then driven through their own fences, so a record
+// that stops routing through the shared rule fails here rather than silently
+// keeping a private copy.
+func TestEpochFenceIsAHighWaterMark(t *testing.T) {
+	t.Parallel()
+
+	const committed = 7
+	for _, requested := range []uint64{committed, committed + 1, math.MaxUint64} {
+		if err := epochFence(committed, requested, func(uint64) error {
+			return errors.New("refused")
+		}); err != nil {
+			t.Errorf("epoch %d against a committed %d was refused", requested, committed)
+		}
+	}
+	var reported uint64
+	err := epochFence(committed, committed-1, func(mark uint64) error {
+		reported = mark
+		return errors.New("refused")
+	})
+	if err == nil {
+		t.Fatal("a strictly lower epoch was admitted")
+	}
+	if reported != committed {
+		t.Fatalf("the refusal was built from %d; it must be built from the committed mark %d", reported, committed)
+	}
+
+	// Every record that fences a Host-owned write, driven through its own
+	// spelling of the rule. Each reports the committed mark in its own type.
+	fences := map[string]struct {
+		refuse func(uint64) error
+		mark   func(error) uint64
+	}{
+		"catalog": {
+			refuse: func(epoch uint64) error {
+				return hostEpochFence(CatalogRecord{LeaseEpoch: committed}, epoch)
+			},
+			mark: func(err error) uint64 {
+				var typed *CatalogError
+				if !errors.As(err, &typed) || typed.Code != CatalogErrorEpoch {
+					t.Fatalf("catalog refusal = %T %v", err, err)
+				}
+				return typed.Epoch
+			},
+		},
+		"registry": {
+			refuse: func(epoch uint64) error {
+				return registrationEpochFence(HostRegistration{LeaseEpoch: committed}, epoch)
+			},
+			mark: func(err error) uint64 {
+				var typed *RegistryError
+				if !errors.As(err, &typed) || typed.Code != RegistryErrorEpoch {
+					t.Fatalf("registry refusal = %T %v", err, err)
+				}
+				return typed.Epoch
+			},
+		},
+		"pointer": {
+			refuse: func(epoch uint64) error {
+				return pointerEpochFence(SessionPointer{LeaseEpoch: committed}, epoch)
+			},
+			mark: func(err error) uint64 {
+				var typed *PointerError
+				if !errors.As(err, &typed) || typed.Code != PointerErrorEpoch {
+					t.Fatalf("pointer refusal = %T %v", err, err)
+				}
+				return typed.Epoch
+			},
+		},
+	}
+	for name, fence := range fences {
+		t.Run(name, func(t *testing.T) {
+			if err := fence.refuse(committed); err != nil {
+				t.Fatalf("an equal epoch was refused: %v", err)
+			}
+			err := fence.refuse(committed - 1)
+			if err == nil {
+				t.Fatal("a strictly lower epoch was admitted")
+			}
+			if got := fence.mark(err); got != committed {
+				t.Fatalf("refusal carried %d, want the committed mark %d", got, committed)
+			}
+		})
+	}
+}

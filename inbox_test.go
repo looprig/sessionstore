@@ -5,6 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -713,17 +718,107 @@ func TestAdmitCommandBindsTheSessionsCollisionWitnesses(t *testing.T) {
 // sharing one would put rows with different codecs, different ranking, and
 // different due semantics into one stream or table, where a ranked or due query
 // issued for one kind would page through the other's rows.
+//
+// The set is DERIVED FROM SOURCE rather than listed here, for the reason
+// TestCursorMagicsAreDistinct's is: a hand-written list covers the kinds its
+// author remembered, and this one covered six of seven the moment a seventh
+// record kind was added — the new namespace could have collided with any of
+// them without anything failing. What is scanned for is the thing that
+// MATTERS: every constant this package names as the Namespace of a
+// storage.OrderedID, which is the only way a namespace is ever used. A record
+// kind added later is covered whether or not anyone updates this test.
 func TestOrderedNamespacesAreDistinct(t *testing.T) {
 	t.Parallel()
 
-	namespaces := map[string]string{
-		"catalog":  catalogNamespace,
-		"gates":    gateNamespace,
-		"inbox":    inboxNamespace,
-		"registry": registryNamespace,
-		"targets":  hostTargetNamespace,
-		"claims":   reconcileNamespace,
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob: %v", err)
 	}
+	// Pass one: every string constant this package declares, by name.
+	constants := map[string]string{}
+	parsed := map[string]*ast.File{}
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		parsed[name] = file
+		for _, declaration := range file.Decls {
+			generic, ok := declaration.(*ast.GenDecl)
+			if !ok || generic.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range generic.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok || len(value.Names) != 1 || len(value.Values) != 1 {
+					continue
+				}
+				literal, ok := value.Values[0].(*ast.BasicLit)
+				if !ok || literal.Kind != token.STRING {
+					continue
+				}
+				text, err := strconv.Unquote(literal.Value)
+				if err != nil {
+					continue
+				}
+				constants[value.Names[0].Name] = text
+			}
+		}
+	}
+
+	// Pass two: every constant NAMED as the Namespace of an OrderedID.
+	namespaces := map[string]string{}
+	for filename, file := range parsed {
+		ast.Inspect(file, func(node ast.Node) bool {
+			composite, ok := node.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			selector, ok := composite.Type.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != "OrderedID" {
+				return true
+			}
+			for _, element := range composite.Elts {
+				pair, ok := element.(*ast.KeyValueExpr)
+				if !ok {
+					continue
+				}
+				key, ok := pair.Key.(*ast.Ident)
+				if !ok || key.Name != "Namespace" {
+					continue
+				}
+				named, ok := pair.Value.(*ast.Ident)
+				if !ok {
+					t.Fatalf("%s files an OrderedID under a namespace that is not a named constant", filename)
+				}
+				value, ok := constants[named.Name]
+				if !ok {
+					t.Fatalf("%s names the namespace %s, which is not a string constant this scan found",
+						filename, named.Name)
+				}
+				namespaces[named.Name] = value
+			}
+			return true
+		})
+	}
+
+	// Anti-vacuity: the scan must reach the kinds this package is known to
+	// have, or a broken walk would report a vacuous pass. The count is the
+	// weaker half — it is the named kind that proves the walk resolved a
+	// constant rather than merely visiting one.
+	if len(namespaces) < 7 {
+		t.Fatalf("found %d ordered namespaces (%v); the scan is not reaching the declarations",
+			len(namespaces), namespaces)
+	}
+	for _, known := range []string{"inboxNamespace", "pointerNamespace"} {
+		if namespaces[known] == "" {
+			t.Fatalf("the scan did not reach %s, a namespace it is known to cover: %v", known, namespaces)
+		}
+	}
+
 	seen := map[string]string{}
 	for kind, namespace := range namespaces {
 		if other, ok := seen[namespace]; ok {
