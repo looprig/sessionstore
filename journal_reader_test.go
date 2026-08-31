@@ -832,3 +832,61 @@ func TestJournalReadsFailClosedOnACorruptStoredFrame(t *testing.T) {
 		})
 	}
 }
+
+// TestJournalReadsFailClosedOnATruncatedStream drives the fault that announces
+// itself as success. A drained cursor is how every honest walk finishes, so a
+// stream that ends before the captured tip produces a well-formed page — an
+// empty one, with an empty NextCursor, over a journal that has records — and a
+// caller following the documented "start with FromSeq, then follow the cursor"
+// protocol concludes the session's public history is empty.
+//
+// Its mirror is a record PAST the captured tip, which the walk refuses rather
+// than returns and which therefore also leaves the walk short of its bound.
+// Both are unreachable through a conforming provider — storage documents
+// sequences as dense and a cursor as observing the tip as of Read, taken after
+// the Tip call — which is exactly why they are stated rather than assumed. This
+// is scanCommandApplication's rule, held by the reader one file over.
+func TestJournalReadsFailClosedOnATruncatedStream(t *testing.T) {
+	tests := map[string]func(*scriptedLedger){
+		"the stream drains before the captured tip": func(scripted *scriptedLedger) {
+			scripted.onCursor = func(cursor storage.Cursor) storage.Cursor {
+				return &scriptedCursor{Cursor: cursor, fail: io.EOF}
+			}
+		},
+		"the stream hands back a record past the captured tip": func(scripted *scriptedLedger) {
+			scripted.onCursor = func(cursor storage.Cursor) storage.Cursor {
+				return &scriptedCursor{Cursor: cursor, rewrite: func(record storage.Record) storage.Record {
+					record.Seq += 1000
+					return record
+				}}
+			}
+		},
+	}
+	for name, script := range tests {
+		t.Run(name, func(t *testing.T) {
+			backend := memstore.New()
+			scripted := &scriptedLedger{Ledger: backend.Ledger}
+			backend.Ledger = scripted
+			store := openJournalStore(t, backend)
+			mixedSession(t, store)
+			// Scripted only once the fixture is durable, so the walk reads a
+			// journal that really does have records to be short of.
+			script(scripted)
+
+			_, err := store.ReadPublicJournal(context.Background(), ReadPublicJournalRequest{
+				TenantID: testTenant, SessionID: testSession,
+			})
+			publicError := requireJournalCode(t, err, JournalErrorIntegrity)
+			if publicError.Field != "read" {
+				t.Fatalf("Field = %q, want read", publicError.Field)
+			}
+			// The runtime replay walks the same code and fails the same way:
+			// a privileged replay over a prefix of the journal is the same
+			// wrong answer with more authority behind it.
+			_, err = store.ReadRuntimeJournal(context.Background(), ReadRuntimeJournalRequest{
+				TenantID: testTenant, SessionID: testSession,
+			})
+			requireJournalCode(t, err, JournalErrorIntegrity)
+		})
+	}
+}

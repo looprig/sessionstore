@@ -279,9 +279,12 @@ func (s *Store) planJournalRead(
 // page is never cut short by private traffic it is not returning.
 //
 // The walk stops at the record limit, at the byte budget, or at the captured
-// tip. The first selected record of a page is always admitted, so a page can
-// never fail to make progress; a record that does not fit the remaining budget
-// is deferred to the next page, which means its body may be resolved twice.
+// tip — and at nothing else: a walk that ends anywhere else has not observed
+// every sequence through the tip it captured, and is refused rather than
+// returned. The first selected record of a page is always admitted, so a page
+// can never fail to make progress; a record that does not fit the remaining
+// budget is deferred to the next page, which means its body may be resolved
+// twice.
 func walkJournal[T any](
 	scan *journalScan,
 	selects func(Envelope) bool,
@@ -301,13 +304,13 @@ func walkJournal[T any](
 	for {
 		record, err := cursor.Next(scan.ctx)
 		if errors.Is(err, io.EOF) {
-			return page, nil
+			break
 		}
 		if err != nil {
 			return nil, journalErr(JournalErrorBackend, "read", err)
 		}
 		if record.Seq > scan.capturedTip {
-			return page, nil
+			break
 		}
 		env, err := DecodeEnvelope(record.Payload)
 		if err != nil {
@@ -316,7 +319,7 @@ func walkJournal[T any](
 		if selects(env) {
 			if len(page) >= scan.limit {
 				scan.truncate(record.Seq)
-				return page, nil
+				break
 			}
 			item, cost, err := build(record.Seq, env, record.Payload)
 			if err != nil {
@@ -324,16 +327,39 @@ func walkJournal[T any](
 			}
 			if len(page) > 0 && used+cost > scan.maxBytes {
 				scan.truncate(record.Seq)
-				return page, nil
+				break
 			}
 			page = append(page, item)
 			used += cost
 		}
 		scan.covered = record.Seq
 		if record.Seq == scan.capturedTip {
-			return page, nil
+			break
 		}
 	}
+	// The walk must have REACHED its bound, unless it stopped SHORT of it on
+	// purpose. A page that ends at the record limit or the byte budget is
+	// truncated and says so, and its cursor resumes where it stopped; a page
+	// that ends anywhere else claims to have covered everything through the tip
+	// it captured, and here that claim would be false.
+	//
+	// This is the fault that announces itself as success. A drained cursor is
+	// how every honest walk finishes, so a stream that ends early yields a
+	// well-formed page — fewer events than the journal holds, an empty
+	// NextCursor, CoveredThrough short of CapturedTip — and a caller following
+	// the documented protocol stops there, concluding the session's history
+	// ends where the stream did. The refusal of a record PAST the captured tip
+	// above lands here too, for the same reason and by the same route.
+	//
+	// Both are unreachable through a conforming provider: storage documents
+	// sequences as dense and a cursor as observing the tip as of Read, which is
+	// taken after the tip this scan captured. That is why the invariant is
+	// stated rather than assumed. It is scanCommandApplication's rule, whose
+	// walk carries the same bound for the same reason.
+	if scan.covered < scan.capturedTip && !scan.truncated {
+		return nil, journalErr(JournalErrorIntegrity, "read", nil)
+	}
+	return page, nil
 }
 
 // truncate marks the page as ending before seq, which is where the next page
