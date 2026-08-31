@@ -683,12 +683,60 @@ func TestTransitionsFileTheDueStateTheRecordDerives(t *testing.T) {
 func TestTerminalTransitionsLeaveTheCommandNotDueAndDirectlyGettable(t *testing.T) {
 	t.Parallel()
 
-	for _, state := range []string{"applied", "rejected"} {
-		t.Run(state, func(t *testing.T) {
+	// The state each terminal transition is made FROM, so the recorder can be
+	// reset immediately before the settling write and see only that write.
+	tests := []struct {
+		state  string
+		from   string
+		settle func(store *Store, entry InboxEntry) (InboxEntry, error)
+	}{
+		{state: "applied", from: "applying", settle: func(store *Store, entry InboxEntry) (InboxEntry, error) {
+			return store.CompleteCommand(context.Background(), testCompleteRequest(entry, inboxEpoch))
+		}},
+		{state: "rejected", from: "pending", settle: func(store *Store, entry InboxEntry) (InboxEntry, error) {
+			return store.RejectCommand(context.Background(), testRejectRequest(entry, inboxEpoch))
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.state, func(t *testing.T) {
 			t.Parallel()
 
-			store, clock, admitted := inboxFixture(t, memstore.New())
-			terminal := inboxStates[state](t, store, clock, admitted)
+			base := memstore.New()
+			ordered := &recordingOrdered{OrderedIndex: base.OrderedIndex}
+			base.OrderedIndex = ordered
+			store, clock, admitted := inboxFixture(t, base)
+			before := inboxStates[test.from](t, store, clock, admitted)
+
+			ordered.reset()
+			terminal, err := test.settle(store, before)
+			if err != nil {
+				t.Fatalf("settle from %s: %v", test.from, err)
+			}
+
+			// ATOMICALLY, asserted where it is claimed. The settled outcome and
+			// the departure from the due view are one provider write, so there
+			// is no instant at which a reader can see a command that is
+			// terminal and still due, or due and already settled. A revision
+			// comparison alone would not say this: a path that wrote the
+			// outcome and then un-filed the due state in a second
+			// compare-and-swap would still return a record whose revision
+			// matches what is stored, having passed through exactly the state
+			// this rules out.
+			var ops []string
+			for _, call := range ordered.snapshot() {
+				ops = append(ops, call.op)
+			}
+			if len(ops) != 2 || ops[0] != "get" || ops[1] != "update" {
+				t.Fatalf("settling issued %v, want one get then one update", ops)
+			}
+			update, _ := ordered.lastOf("update")
+			if update.due != (storage.Due{}) {
+				t.Fatalf("the settling write filed due %+v, want not due", update.due)
+			}
+			if update.expectedRevision != before.Revision {
+				t.Fatalf("the settling write named revision %d, want %d", update.expectedRevision, before.Revision)
+			}
 
 			stored := storedInboxRecord(t, store, terminal)
 			if stored.Due != (storage.Due{}) {
@@ -697,9 +745,9 @@ func TestTerminalTransitionsLeaveTheCommandNotDueAndDirectlyGettable(t *testing.
 			if stored.Deleted {
 				t.Fatal("a terminal command was tombstoned rather than settled")
 			}
-			// Atomically: one revision separates the non-terminal record from
-			// the settled, undue one, so no reader can observe a settled
-			// command that is still due.
+			// The record the transition returned is the record that is stored,
+			// so what the assertions above hold that write to is what a later
+			// reader meets.
 			if stored.Revision != terminal.Revision {
 				t.Fatalf("the stored revision %d is not the one the transition returned %d", stored.Revision, terminal.Revision)
 			}

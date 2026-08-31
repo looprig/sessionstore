@@ -8,5 +8,10 @@ coverage.txt
 # corpus, including crashers a fuzz run writes out, and those must be
 # committable so a reproducer is never silently discarded.
 
+# Per-target fuzz output, kept by `make fuzz` so a failure's message text
+# survives a scrolled or piped run. It is diagnosis, not a finding: a real
+# finding is the reproducer Go writes under testdata/fuzz, which is committable.
+/.fuzzlogs/
+
 # Editor/OS cruft
 .DS_Store

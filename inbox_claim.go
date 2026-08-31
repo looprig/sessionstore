@@ -428,10 +428,15 @@ func (s *Store) RejectCommand(ctx context.Context, req RejectCommandRequest) (In
 // the public status say nothing that the acknowledgement of the original request
 // had not already said, for the whole life of the command.
 //
-// The claim's LIVENESS deliberately does not enter into it. A command whose
-// claim has lapsed is still a command someone started; the public caller cannot
-// act on the difference, and reporting it would leak a scheduling detail that
-// changes with a clock rather than with the command.
+// The claim's LIVENESS deliberately does not enter into it, and the reason is a
+// property the mapping has and would otherwise lose: it is MONOTONE. No
+// transition in this file writes a state that projects backwards — nothing
+// returns a claimed or applying command to pending — so a public status never
+// regresses from pending to accepted, and a caller polling one sees a sequence
+// that only moves forward. A liveness-sensitive mapping would break exactly
+// that: a command whose claim lapsed would report accepted again, and would
+// flap between the two as claims were taken and expired, on a schedule that is a
+// property of the clock rather than of the command.
 //
 // It lives here rather than beside the record because the mapping is a statement
 // about the machine, and it is offered here rather than left to each consumer
@@ -527,11 +532,20 @@ func requestedClaim(epoch uint64, expiresAt time.Time, now time.Time) (CommandCl
 // same convention the apply deadline uses, so an instant is never simultaneously
 // inside one bound and outside the other.
 //
-// The zero-claim conjunct states the intent and decides nothing: an absent claim
-// has the zero instant for an expiry and no clock reading this package will
-// accept precedes it, so the comparison alone would already answer false. It
-// stays because a reader should not have to reconstruct that argument to see
-// that an unclaimed command is unclaimed.
+// The zero-claim conjunct is LOAD-BEARING, and the argument that it is not is
+// worth writing down because it is the one a reader is likely to reconstruct: an
+// absent claim has the zero instant for an expiry, so the time comparison alone
+// looks like it would already answer false. It would not. time.Time represents
+// instants before the zero one, WithClock accepts any Clock, and nothing
+// validates what clock.Now() returns — rankableTime bounds the timestamps this
+// package STORES, not the clock it reads. Under a clock reading earlier than the
+// zero instant the comparison alone reports every unclaimed command as claimed,
+// and a reconciler is told the claim is held on a command nobody has ever
+// touched.
+//
+// So the conjunct is what makes this predicate a function of the RECORD rather
+// than of the clock's lower bound: a command with no claim has no live claim at
+// any instant a Clock can produce.
 func claimLive(record InboxRecord, now time.Time) bool {
 	return !record.Claim.isZero() && now.Before(record.Claim.ExpiresAt)
 }
@@ -545,6 +559,12 @@ func claimLive(record InboxRecord, now time.Time) bool {
 // Stating "unless the epoch is zero" here as well would put the reconciler's
 // exemption in two places, and the copy that was not the one being read would be
 // the one that was wrong.
+//
+// That rests on zero being UNREACHABLE at every call site, not on the fence
+// being indifferent to it — the three claiming transitions refuse a zero epoch
+// before they read anything, and rejection wraps this call. Adding a fourth call
+// site, or relaxing one of those refusals, makes zero reachable here, and a zero
+// arm added then would skip the fence entirely rather than merely restate it.
 func commandEpochFence(record InboxRecord, epoch uint64) error {
 	if epoch < record.Claim.LeaseEpoch {
 		return &InboxError{Code: InboxErrorEpoch, Field: "lease_epoch", Epoch: record.Claim.LeaseEpoch}
