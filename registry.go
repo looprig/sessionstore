@@ -32,13 +32,23 @@ const (
 	// MaxHostRegistrationRecordBytes bounds an encoded registration. It is far
 	// tighter than the catalog's and the inbox's bounds because this record has
 	// no open-ended member: it is a fixed tuple of identities, each of them
-	// bounded by sessionwire.MaxIDBytes, so a spelling anywhere near this
-	// ceiling is already a record nothing in this package can have produced.
+	// bounded by sessionwire.MaxIDBytes.
 	//
-	// Like those bounds it sits below storage.MaxOrderedValueBytes, so a record
-	// this package accepts always fits in the provider and there is no state
-	// that can be written but not rewritten.
-	MaxHostRegistrationRecordBytes = 8 << 10
+	// The ceiling has to allow for JSON ESCAPING, and that is what sizes it. An
+	// identity is any valid UTF-8 of at most MaxIDBytes bytes — control
+	// characters included, which both TenantID.Validate and validateOpaque
+	// accept — and Go escapes each of those as \u00XX, six bytes for one. The
+	// worst acceptable registration is therefore about six times the sum of its
+	// identity lengths, which at 8 KiB was 95 bytes OVER the bound: records the
+	// validators accept were refused here, and the comment that used to sit
+	// here said a spelling near the ceiling was one nothing could produce. It
+	// was measuring ASCII. TestLargestAcceptableRegistrationFitsTheBound now
+	// builds the real worst case and reports the measured size.
+	//
+	// Like the other bounds it sits below storage.MaxOrderedValueBytes, so a
+	// record this package accepts always fits in the provider and there is no
+	// state that can be written but not rewritten.
+	MaxHostRegistrationRecordBytes = 16 << 10
 )
 
 // Stated as an unsigned constant for the reason the catalog and the inbox state

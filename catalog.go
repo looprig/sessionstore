@@ -419,59 +419,65 @@ func (s *Store) UpdateCatalogDesiredState(ctx context.Context, req UpdateCatalog
 // safety instead comes from below: every record the provider returns is held to
 // the tenant it itself claims, so a scope two tenants somehow shared would fail
 // the page closed rather than disclose a row.
-func (s *Store) ListSessions(ctx context.Context, req ListSessionsRequest) (sessionwire.SessionPage, error) {
+func (s *Store) ListSessions(ctx context.Context, req ListSessionsRequest) (SessionPage, error) {
 	limit, ok := s.pageLimit(req.Limit)
 	if !ok {
-		return sessionwire.SessionPage{}, catalogErr(CatalogErrorInvalid, "limit", nil)
+		return SessionPage{}, catalogErr(CatalogErrorInvalid, "limit", nil)
 	}
 	scope, err := s.deriveTenantScope(req.TenantID)
 	if err != nil {
-		return sessionwire.SessionPage{}, err
+		return SessionPage{}, err
 	}
 	var after storage.RankedCursor
 	if req.Cursor != "" {
 		if after, err = s.decodeCatalogCursor(req.TenantID, req.Cursor); err != nil {
-			return sessionwire.SessionPage{}, err
+			return SessionPage{}, err
 		}
 	}
 	opCtx, release, err := s.admitForeground(ctx)
 	if err != nil {
-		return sessionwire.SessionPage{}, err
+		return SessionPage{}, err
 	}
 	defer release()
 
 	ranked, err := s.backend.OrderedIndex.ListRanked(opCtx, catalogNamespace, scope.CatalogScope, after, limit)
 	if err != nil {
-		return sessionwire.SessionPage{}, classifyCatalogOrderedError(err, "list")
+		return SessionPage{}, classifyCatalogOrderedError(err, "list")
 	}
-	page := sessionwire.SessionPage{Sessions: make([]sessionwire.SessionSummary, 0, len(ranked.Records))}
-	for index, stored := range ranked.Records {
+	page := SessionPage{SessionPage: sessionwire.SessionPage{
+		Sessions: make([]sessionwire.SessionSummary, 0, len(ranked.Records))}}
+	for _, stored := range ranked.Records {
 		// The stable key is the identity the provider filed the record under
 		// and the record carries its own; catalogEntry holds one to the other
 		// and both to the requested tenant, which is the same check a direct
 		// get makes and is deliberately not restated here.
 		//
-		// A failure here fails the WHOLE page, and it is located by position:
-		// one unreadable row otherwise makes a tenant permanently unlistable
-		// with an error naming no row, so an operator has nothing to repair.
-		// The position is a coordinate in this response, not a provider key or
-		// any of the record's bytes, so it discloses nothing the redaction rule
-		// on CatalogError withholds.
-		position := "sessions[" + strconv.Itoa(index) + "]"
+		// A ROW THAT FAILS IS SKIPPED AND COUNTED, never returned as the page's
+		// error. This reader failed the whole page for a long time, on the
+		// argument that skipping would hide a keyspace collision — but nothing
+		// in this package rewrites a row it cannot vouch for, so the row is
+		// permanent, and a failed page issues no continuation, so every session
+		// ranked behind it becomes unreachable too. That is not fail-closed, it
+		// is a tenant permanently unlistable with no repair API to repair it
+		// with. UnreadableSkipped answers the original objection directly: the
+		// condition is reported to the caller rather than hidden, and the row
+		// itself is still never disclosed.
 		entry, err := catalogEntry(stored, req.TenantID, sessionwire.SessionID(stored.ID.StableKey))
 		if err != nil {
-			return sessionwire.SessionPage{}, locateCatalogError(err, position)
+			page.UnreadableSkipped++
+			continue
 		}
 		summary, err := entry.Record.Summary()
 		if err != nil {
-			return sessionwire.SessionPage{}, locateCatalogError(err, position)
+			page.UnreadableSkipped++
+			continue
 		}
 		page.Sessions = append(page.Sessions, summary)
 	}
 	if ranked.NextCursor != "" {
 		next, err := s.encodeCatalogCursor(req.TenantID, ranked.NextCursor)
 		if err != nil {
-			return sessionwire.SessionPage{}, err
+			return SessionPage{}, err
 		}
 		page.NextCursor = next
 	}
@@ -481,9 +487,29 @@ func (s *Store) ListSessions(ctx context.Context, req ListSessionsRequest) (sess
 	// order ListRanked promises, and publishing it would hand a caller a page
 	// whose own contract it violates.
 	if err := page.Validate(); err != nil {
-		return sessionwire.SessionPage{}, catalogErr(CatalogErrorBackend, "sessions", err)
+		return SessionPage{}, catalogErr(CatalogErrorBackend, "sessions", err)
 	}
 	return page, nil
+}
+
+// SessionPage is one bounded page of a tenant's sessions together with what
+// producing it cost, as DueGatePage is for the deadline view.
+//
+// It embeds Core's page rather than replacing it, so a caller still reads
+// Sessions and NextCursor directly and can hand the embedded value to anything
+// that takes a sessionwire.SessionPage.
+//
+// UnreadableSkipped counts rows this reader could not hold to their own
+// identity and therefore did not publish. It is not a diagnostic afterthought:
+// it is what makes skipping such a row safe to do at all, because it leaves the
+// caller able to tell "this tenant has three sessions" from "this tenant has
+// three sessions and one row I could not vouch for". A nonzero count is durable
+// — nothing in this package rewrites such a row — so it means a build that
+// understands the row is needed, not that a retry will help.
+type SessionPage struct {
+	sessionwire.SessionPage
+
+	UnreadableSkipped int
 }
 
 // The catalog page cursor. Its payload is the provider's own ranked cursor,

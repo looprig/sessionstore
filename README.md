@@ -515,7 +515,7 @@ Three things remove a row from the placement page, and nothing else does:
   handed an endpoint this store will not vouch for, but the row stays ranked. A
   nonzero count means the directory is owed a sweep.
 
-**No single row can fail a placement page.** Every per-row refusal is counted
+**No single row can fail a bounded page, anywhere in this package.** Every per-row refusal is counted
 and stepped over — lapsed ones in `LapsedSkipped`, undecodable and misfiled ones
 in `UnreadableSkipped` — and that is the strongest rule in this record rather
 than leniency. Nothing here ever rewrites a row it cannot read, because a newer
@@ -526,6 +526,16 @@ Skipping leaves the newer writer's row untouched and starts publishing it the
 instant a reader that understands it asks. A failure returned from
 `ListCompatibleHosts` is therefore always about the query — a bad limit, a
 foreign cursor, a provider that could not answer — and never about one row.
+
+`ListDueGates` and `ListSessions` obey the same rule, and they were changed to.
+Both used to fail the whole page on one row, and both were reachable states with
+no way out: a single undecodable gate intent sits at the head of an ascending
+deadline view that has no cursor at all, so it disabled gate expiry for *every
+tenant* permanently; a single undecodable catalog row made a tenant unlistable
+and, because a failed page issues no continuation, took every session ranked
+behind it too. They report `DueGatePage.Unreadable` and
+`SessionPage.UnreadableSkipped`. `SessionPage` is this package's own type
+embedding Core's, added for exactly that count.
 
 Nothing here calls the provider's `Delete`, and it cannot: the ordered index
 promises an identity is never reusable after a tombstone, while a Host that
@@ -542,12 +552,14 @@ which case the write loses. A sweep that trusted the page alone would withdraw
 the capacity of a Host that is alive, and `StillLive` counts the rows the
 revalidation saved.
 
-A sweep queries at one due bound for its whole length, which is required rather
-than tidy: a due cursor binds to the exact bound that issued it. That bound
-therefore travels in the sweep's own continuation, and carrying it costs nothing
-in safety — the bound only selects which rows a page contains, and every row is
-revalidated against its own stored expiry before anything is written, so a bound
-this store never issued can at worst make the sweep look at rows it then
+A sweep queries at one due bound for its whole walk, because a due cursor binds
+to the exact bound that issued it; the bound therefore travels in the sweep's
+own continuation, while the instant each row is revalidated against is read
+fresh. The two are deliberately allowed to differ: the bound decides only which
+rows a page contains, the revalidation decides whether any of them may be
+withdrawn, and a fresh reading is monotonically at or after the bound, which is
+the safe direction. Carrying the bound therefore costs nothing in safety — a
+bound this store never issued can at worst make the sweep look at rows it then
 declines to touch.
 
 A row the sweep cannot decode stays due, so it heads every later ascending due
@@ -563,6 +575,18 @@ spends its whole budget on those rows and withdraws nothing, forever. What
 supplies progress is the CONTINUATION on the result: a sweep that runs out of
 budget reports where it stopped, and a caller that pages until `Exhausted`
 reaches every row however many unreadable ones precede them.
+
+**There is no in-band repair for a genuinely corrupt row.** A row that is not a
+newer writer's — one whose bytes are damaged rather than merely unfamiliar — is
+permanent: it cannot be withdrawn, because a withdrawal is built from the
+record's own decoded identity; it cannot be republished, because a Host names a
+target and a host rather than a row; it cannot be swept, for the reason above;
+and `Delete` is correctly unusable here, because it would retire that Host's
+identity for the target forever. So a persistently nonzero `Unreadable` or
+`UnreadableSkipped` is not something a retry, a sweep, or an operator command
+resolves — it needs a build that understands the row, or direct provider-level
+intervention outside this package. The counts exist so that state is visible
+rather than silent; they are not a queue that drains.
 
 `ListCompatibleHosts` is one ranked provider query per page: the target is the
 ranking scope, so the restriction and the capacity order are both inside the

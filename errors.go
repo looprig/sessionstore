@@ -614,6 +614,15 @@ func registryRecordFailure(failure versionedRecordFailure, field string, cause e
 //
 // Conflict means a lost revision compare-and-swap and nothing else — re-read
 // and retry — which is the meaning it has for every other record kind here.
+//
+// TWO ERROR TYPES REACH A CALLER OF THIS RECORD, and a consumer must handle
+// both. Validating a target reports *InvalidIdentityError for AgentID, because
+// that is what every identity derivation in this package reports for a
+// sessionwire identity, while the opaque runtime id and the placement enum
+// report *HostTargetError — so one malformed request surfaces as either type
+// depending on which member is wrong. That is the package's convention rather
+// than this record's choice, and it is written down here because this record is
+// the first one a Host or a Factory calls.
 type HostTargetErrorCode string
 
 const (

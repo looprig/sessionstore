@@ -1107,11 +1107,7 @@ func TestListDueGatesRejectsAnIntentThatNamesAnotherGate(t *testing.T) {
 	}
 	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-a", mustEncodeGateIntent(t, impostor), impostor.Deadline)
 
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	got := assertCatalogCode(t, err, CatalogErrorIdentity)
-	if !strings.HasPrefix(got.Field, "due_gates[0].") {
-		t.Fatalf("failure field = %q, want the failing row's position", got.Field)
-	}
+	assertDueGatesStepOver(t, store, 1)
 }
 
 // TestListDueGatesRejectsAnIntentFiledUnderAnotherSession covers the other half
@@ -1128,11 +1124,7 @@ func TestListDueGatesRejectsAnIntentFiledUnderAnotherSession(t *testing.T) {
 	// Filed under session-2's order scope while claiming session-1.
 	putRawGateIntent(t, store, catalogTenant, "session-2", "gate-a", mustEncodeGateIntent(t, misfiled), misfiled.Deadline)
 
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	got := assertCatalogCode(t, err, CatalogErrorIdentity)
-	if got.Field != "due_gates[0].ordering_scope" {
-		t.Fatalf("failure field = %q, want due_gates[0].ordering_scope", got.Field)
-	}
+	assertDueGatesStepOver(t, store, 1)
 }
 
 // TestListDueGatesRejectsAnIntentRankedIntoAnotherSession is the fourth member.
@@ -1162,10 +1154,7 @@ func TestListDueGatesRejectsAnIntentRankedIntoAnotherSession(t *testing.T) {
 		t.Fatalf("seed intent: %v", err)
 	}
 
-	_, err = store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[0].ranking_scope" {
-		t.Fatalf("failure field = %q, want due_gates[0].ranking_scope", got.Field)
-	}
+	assertDueGatesStepOver(t, store, 1)
 }
 
 // TestListDueGatesRejectsAnIntentDueAtSomethingElse closes the third member of
@@ -1180,10 +1169,7 @@ func TestListDueGatesRejectsAnIntentDueAtSomethingElse(t *testing.T) {
 		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(24*time.Hour)))
 	moveGateIntentDue(t, store, catalogTenant, "session-1", "gate-a", catalogDeadline.Add(-time.Hour))
 
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[0].due" {
-		t.Fatalf("failure field = %q, want due_gates[0].due", got.Field)
-	}
+	assertDueGatesStepOver(t, store, 1)
 }
 
 // TestListDueGatesRejectsAnIntentFiledNotDue closes the OTHER half of the same
@@ -1211,10 +1197,7 @@ func TestListDueGatesRejectsAnIntentFiledNotDue(t *testing.T) {
 		return page, err
 	})
 
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[0].due" {
-		t.Fatalf("failure field = %q, want due_gates[0].due", got.Field)
-	}
+	assertDueGatesStepOver(t, store, 1)
 }
 
 // TestListDueGatesRefusesATombstonedRow holds the provider to the one due-view
@@ -1233,10 +1216,7 @@ func TestListDueGatesRefusesATombstonedRow(t *testing.T) {
 		return page, err
 	})
 
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	if got := assertCatalogCode(t, err, CatalogErrorDeleted); got.Field != "due_gates[0].gate_intent" {
-		t.Fatalf("failure field = %q, want due_gates[0].gate_intent", got.Field)
-	}
+	assertDueGatesStepOver(t, store, 1)
 }
 
 // TestListDueGatesChecksEveryRowsFiling extends the identity check past the
@@ -1257,9 +1237,11 @@ func TestListDueGatesChecksEveryRowsFiling(t *testing.T) {
 	}
 	putRawGateIntent(t, store, catalogTenant, "session-2", "gate-b", mustEncodeGateIntent(t, misfiled), misfiled.Deadline)
 
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[1].ordering_scope" {
-		t.Fatalf("failure field = %q, want due_gates[1].ordering_scope", got.Field)
+	// The well-filed row ahead of it is still reported, which is what proves
+	// the misfiled one behind it was stepped over rather than ending the page.
+	due := assertDueGatesStepOver(t, store, 1)
+	if got := dueGateIDs(due); len(got) != 1 || got[0] != "session-1/gate-a" {
+		t.Fatalf("due gates = %v, want the well-filed row", got)
 	}
 }
 
@@ -1281,13 +1263,7 @@ func TestListDueGatesRejectsAMisfiledRowWithoutReadingTheSession(t *testing.T) {
 	putRawGateIntent(t, store, catalogTenant, "session-2", "gate-a", mustEncodeGateIntent(t, misfiled), misfiled.Deadline)
 
 	before := len(ordered.snapshot())
-	if _, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
-		DueAtOrBefore: catalogDeadline, Limit: 10,
-	}); err == nil {
-		t.Fatal("a misfiled row was accepted")
-	} else {
-		assertCatalogCode(t, err, CatalogErrorIdentity)
-	}
+	assertDueGatesStepOver(t, store, 1)
 	for _, call := range ordered.snapshot()[before:] {
 		if call.op == "get" && call.id.Namespace == catalogNamespace {
 			t.Fatal("a misfiled row cost a catalog read before it was refused")
@@ -1295,13 +1271,12 @@ func TestListDueGatesRejectsAMisfiledRowWithoutReadingTheSession(t *testing.T) {
 	}
 }
 
-func TestListDueGatesFailsClosedOnACorruptIntent(t *testing.T) {
+func TestListDueGatesStepsOverACorruptIntent(t *testing.T) {
 	store := openTestStore(t)
 	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
 	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-a", []byte("{not json"), catalogDeadline.Add(-time.Hour))
 
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	assertCatalogCode(t, err, CatalogErrorMalformed)
+	assertDueGatesStepOver(t, store, 1)
 }
 
 // --- redaction ------------------------------------------------------------
@@ -1632,4 +1607,210 @@ func TestGateOperationsRefuseAfterClose(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestListDueGatesStepsOverARowItCannotRead is the critical property of a
+// deadline view that has no continuation: one row must never be able to disable
+// it. The view is ascending by deadline, a row this build cannot decode has a
+// deadline in the past that never changes, and nothing rewrites such a row — so
+// a reader that failed the page on one would switch gate expiry off for EVERY
+// TENANT, permanently, with no limit and no bound able to reach past it.
+//
+// Unreadable is what keeps that from being silent, and it is a different signal
+// from Examined: a remnant is a row that was read and reported nothing, while
+// this is a row that could not be read at all.
+func TestListDueGatesStepsOverARowItCannotRead(t *testing.T) {
+	store := openTestStore(t)
+	bound := catalogDeadline
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+
+	// Sorted first by the earlier deadline, so it heads the ascending view.
+	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-corrupt",
+		[]byte(`{"record_version":2,"gate_id":"gate-corrupt"}`), bound.Add(-2*time.Hour))
+	mustOpenGateOn(t, store, catalogTenant, "session-1",
+		gateWithDeadline(testGate("gate-due", 5), bound.Add(-time.Hour)))
+
+	due := mustListDueGates(t, store, bound)
+	if got := dueGateIDs(due); len(got) != 1 || got[0] != "session-1/gate-due" {
+		t.Fatalf("due gates = %v, want [session-1/gate-due]", got)
+	}
+	if due.Unreadable != 1 {
+		t.Fatalf("unreadable = %d, want 1", due.Unreadable)
+	}
+	if due.Examined != 2 {
+		t.Fatalf("examined = %d, want both rows", due.Examined)
+	}
+	// And it stays reachable: nothing here retires the corrupt row, so the
+	// only thing standing between it and a disabled deadline view is this skip.
+	again := mustListDueGates(t, store, bound)
+	if got := dueGateIDs(again); len(got) != 1 {
+		t.Fatalf("due gates on a second pass = %v, want the live gate again", got)
+	}
+}
+
+// TestGateIntentFilingIsHeldToTheRecord drives every component of a stored
+// intent's filing that this package checks, one perturbation at a time.
+//
+// It exists as a DIRECT call because ListDueGates no longer surfaces per-row
+// reasons: a row that fails is counted and stepped over, which is what keeps
+// one row from disabling the deadline view, but it also means the list path can
+// only prove that the checks are wired in — not which arm fired. The arms are
+// the substance, so they are pinned here, in the shape registry.go's and
+// host_targets.go's filing tests use.
+func TestGateIntentFilingIsHeldToTheRecord(t *testing.T) {
+	t.Parallel()
+
+	store := openTestStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	deadline := catalogDeadline.Add(-time.Hour)
+	mustOpenGateOn(t, store, catalogTenant, "session-1", gateWithDeadline(testGate("gate-a", 5), deadline))
+	scope, err := store.deriveSessionScope(catalogTenant, "session-1")
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	conforming, err := store.backend.OrderedIndex.Get(context.Background(), gateIntentID(scope, "gate-a"))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	otherGate := mustEncodeGateIntent(t, gateIntent{
+		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-b",
+		OpenedEventID: "event-gate-b", OpenedJournalSeq: 5, Deadline: deadline,
+	})
+
+	// The whole row check a due page performs, in the order it performs it.
+	readRow := func(stored storage.OrderedRecord) error {
+		intent, err := gateIntentFor(stored)
+		if err != nil {
+			return err
+		}
+		return verifyGateIntentFiling(stored, intent, scope)
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*storage.OrderedRecord)
+		want    CatalogErrorCode
+		field   string
+		covered string
+	}{
+		{
+			name:    "a tombstone, which would report a RETIRED gate as due",
+			mutate:  func(r *storage.OrderedRecord) { r.Deleted = true },
+			want:    CatalogErrorDeleted,
+			field:   "gate_intent",
+			covered: "Deleted",
+		},
+		{
+			name:    "an intent naming a gate other than the key it was filed under",
+			mutate:  func(r *storage.OrderedRecord) { r.Value = otherGate },
+			want:    CatalogErrorIdentity,
+			field:   "gate_intent",
+			covered: "Value",
+		},
+		{
+			name:    "filed under a stable key that is not the gate",
+			mutate:  func(r *storage.OrderedRecord) { r.ID.StableKey = "gate-elsewhere" },
+			want:    CatalogErrorIdentity,
+			field:   "gate_intent",
+			covered: "ID.StableKey",
+		},
+		{
+			name:    "filed in another session's ordering scope",
+			mutate:  func(r *storage.OrderedRecord) { r.ID.OrderingScope += "/elsewhere" },
+			want:    CatalogErrorIdentity,
+			field:   "ordering_scope",
+			covered: "ID.OrderingScope",
+		},
+		{
+			name:    "ranked into another session's scope",
+			mutate:  func(r *storage.OrderedRecord) { r.RankingScope += "/elsewhere" },
+			want:    CatalogErrorIdentity,
+			field:   "ranking_scope",
+			covered: "RankingScope",
+		},
+		{
+			// The instant moves and the state does not: a page that trusted
+			// its index would report a gate as expired because the INDEX said
+			// so while the record's own deadline was a day away.
+			name:    "due at an instant that is not the gate's deadline",
+			mutate:  func(r *storage.OrderedRecord) { r.Due.UnixMillis-- },
+			want:    CatalogErrorIdentity,
+			field:   "due",
+			covered: "Due",
+		},
+		{
+			// And the state moves while the instant does not, which is the
+			// half a millisecond-only comparison waves through.
+			name: "filed not due at the right instant",
+			mutate: func(r *storage.OrderedRecord) {
+				r.Due = storage.Due{State: storage.NotDue, UnixMillis: deadline.UnixMilli()}
+			},
+			want:    CatalogErrorIdentity,
+			field:   "due",
+			covered: "Due",
+		},
+		{
+			name:    "a stored intent this reader cannot decode",
+			mutate:  func(r *storage.OrderedRecord) { r.Value = []byte("{not json") },
+			want:    CatalogErrorMalformed,
+			field:   "gate_intent",
+			covered: "Value",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			stored := conforming
+			test.mutate(&stored)
+			got := assertCatalogCode(t, readRow(stored), test.want)
+			if got.Field != test.field {
+				t.Fatalf("field = %q, want %q (%v)", got.Field, test.field, got)
+			}
+		})
+	}
+
+	// The unperturbed row must pass, or every case above could be passing for
+	// a reason that has nothing to do with the component it perturbs.
+	if err := readRow(conforming); err != nil {
+		t.Fatalf("a conforming row was rejected: %v", err)
+	}
+
+	// The cross product rather than a hand-written list standing in for one.
+	excluded := map[string]string{
+		"Revision":     "provider state with no counterpart in the record",
+		"Order":        "not exposed, and the due view is not in acceptance order",
+		"ID.Namespace": "a package constant with no counterpart in the record",
+		"Rank":         "intents are written unranked and nothing ranks or reads them",
+	}
+	perturbed := map[string]bool{}
+	for _, test := range tests {
+		perturbed[test.covered] = true
+	}
+	for _, member := range orderedRecordMembers(t) {
+		if perturbed[member] == (excluded[member] != "") {
+			t.Errorf("storage.OrderedRecord.%s is %s; it must be exactly one of perturbed here or excluded with a reason",
+				member, map[bool]string{true: "both perturbed and excluded", false: "neither perturbed nor excluded"}[perturbed[member]])
+		}
+	}
+}
+
+// assertDueGatesStepOver reads the whole due view and requires that exactly
+// unreadable rows were counted and stepped over rather than ending the page.
+//
+// It replaces a family of assertions that each named the arm that refused a
+// row. Those moved to TestGateIntentFilingIsHeldToTheRecord when this reader
+// stopped surfacing per-row reasons; what the list path can still prove — and
+// what these tests exist for — is that the check is WIRED IN and that the row
+// does not take the deployment-wide deadline view down with it.
+func assertDueGatesStepOver(t *testing.T, store *Store, unreadable int) DueGatePage {
+	t.Helper()
+	due, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
+		DueAtOrBefore: catalogDeadline, Limit: 10})
+	if err != nil {
+		t.Fatalf("one row ended the whole deadline view: %v", err)
+	}
+	if due.Unreadable != unreadable {
+		t.Fatalf("unreadable = %d, want %d (page %+v)", due.Unreadable, unreadable, dueGateIDs(due))
+	}
+	return due
 }

@@ -1565,7 +1565,7 @@ func mustCreateSession(
 	}
 }
 
-func listedSessionIDs(page sessionwire.SessionPage) []sessionwire.SessionID {
+func listedSessionIDs(page SessionPage) []sessionwire.SessionID {
 	ids := make([]sessionwire.SessionID, 0, len(page.Sessions))
 	for _, summary := range page.Sessions {
 		ids = append(ids, summary.SessionID)
@@ -1621,7 +1621,7 @@ func openHostileListStore(t *testing.T) (*Store, *hostileOrdered) {
 	return openStore(t, base), hostile
 }
 
-func mustListSessions(t *testing.T, store *Store, req ListSessionsRequest) sessionwire.SessionPage {
+func mustListSessions(t *testing.T, store *Store, req ListSessionsRequest) SessionPage {
 	t.Helper()
 	page, err := store.ListSessions(context.Background(), req)
 	if err != nil {
@@ -2018,11 +2018,12 @@ func TestListSessionsBoundsACursorBeforeDecodingIt(t *testing.T) {
 // the identity check a listed record must pass: the tenant it claims and the
 // stable key it was stored under.
 //
-// The poisoned row is neither first nor last in the page, and the error must
-// name its position. One unreadable row fails the whole page — skipping it
-// would hide a keyspace collision indefinitely — so without a locator a tenant
-// becomes permanently unlistable with an error that names nothing an operator
-// can repair.
+// The poisoned row is neither first nor last in the page, so this also proves
+// the check runs for EVERY row rather than for the first one. What it no longer
+// asserts is a returned error: a row that fails is stepped over and counted,
+// because failing the page would make the tenant permanently unlistable and
+// would take every session ranked behind the poisoned row with it. See
+// TestListSessionsStepsOverARowItCannotRead for that argument in full.
 func TestListSessionsHoldsEveryRecordToTheRequestedIdentity(t *testing.T) {
 	const poisonedRow = 1
 	for name, corrupt := range map[string]struct{ from, to string }{
@@ -2052,16 +2053,14 @@ func TestListSessionsHoldsEveryRecordToTheRequestedIdentity(t *testing.T) {
 				return page, nil
 			})
 
-			page, err := store.ListSessions(context.Background(), ListSessionsRequest{TenantID: catalogTenant, Limit: 10})
-			if err == nil {
-				t.Fatalf("a listing returned %v for a record it could not hold to its identity", listedSessionIDs(page))
+			page := mustListSessions(t, store, ListSessionsRequest{TenantID: catalogTenant, Limit: 10})
+			if page.UnreadableSkipped != 1 {
+				t.Fatalf("unreadable = %d, want the one poisoned row", page.UnreadableSkipped)
 			}
-			got := assertCatalogCode(t, err, CatalogErrorIdentity)
-			if want := "sessions[1].record"; got.Field != want {
-				t.Fatalf("field = %q, want %q: a failed page must name the row an operator has to repair", got.Field, want)
-			}
-			if len(page.Sessions) != 0 {
-				t.Fatalf("a failed listing returned %d sessions", len(page.Sessions))
+			for _, id := range listedSessionIDs(page) {
+				if id == "session-a2" || id == "session-z" {
+					t.Fatalf("a record this reader could not vouch for was published: %v", listedSessionIDs(page))
+				}
 			}
 		})
 	}
@@ -2323,5 +2322,56 @@ func TestListSessionsUnderTheLegacyLayout(t *testing.T) {
 	assertKeyspaceCode(t, err, KeyspaceLegacyTenant)
 	if reached := len(audit.rankedCalls()) - before; reached != 0 {
 		t.Fatalf("an unauthorized tenant reached the provider %d times", reached)
+	}
+}
+
+// TestListSessionsStepsOverARowItCannotRead is the reachability property a
+// paged listing has to have. A row this build cannot hold to its own identity
+// stays in the tenant's ranked scope forever and nothing in this package
+// rewrites it, so a reader that failed the page on one would make the tenant
+// permanently unlistable — and, because a failed page issues no continuation,
+// every session ranked behind that row unreachable with it.
+//
+// The count is what keeps the condition visible rather than hidden, which is
+// the objection that kept this reader failing closed: a caller can distinguish
+// "this tenant has three sessions" from "this tenant has three sessions and one
+// row I could not vouch for".
+func TestListSessionsStepsOverARowItCannotRead(t *testing.T) {
+	const poisonedRow = 1
+	for name, corrupt := range map[string]struct{ from, to string }{
+		"foreign tenant":  {`"tenant_id":"tenant-a"`, `"tenant_id":"tenant-z"`},
+		"foreign key":     {`"session_id":"session-a2"`, `"session_id":"session-z"`},
+		"unknown version": {`"record_version":1`, `"record_version":2`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, hostile := openHostileListStore(t)
+			mustCreateSession(t, store, catalogTenant, "session-a1", catalogActiveAt)
+			mustCreateSession(t, store, catalogTenant, "session-a2", catalogActiveAt.Add(time.Minute))
+			mustCreateSession(t, store, catalogTenant, "session-a3", catalogActiveAt.Add(2*time.Minute))
+			hostile.answerRanked(func(page storage.RankedPage, err error) (storage.RankedPage, error) {
+				if err != nil {
+					return page, err
+				}
+				if len(page.Records) != 3 {
+					t.Fatalf("provider returned %d records, want 3", len(page.Records))
+				}
+				record := &page.Records[poisonedRow]
+				rewritten := bytes.Replace(record.Value, []byte(corrupt.from), []byte(corrupt.to), 1)
+				if bytes.Equal(rewritten, record.Value) {
+					t.Fatalf("could not corrupt %s in %s", name, record.Value)
+				}
+				record.Value = rewritten
+				return page, nil
+			})
+
+			page := mustListSessions(t, store, ListSessionsRequest{TenantID: catalogTenant, Limit: 10})
+			got := listedSessionIDs(page)
+			if len(got) != 2 || got[0] != "session-a3" || got[1] != "session-a1" {
+				t.Fatalf("sessions = %v, want the two rows this reader can vouch for", got)
+			}
+			if page.UnreadableSkipped != 1 {
+				t.Fatalf("unreadable = %d, want 1", page.UnreadableSkipped)
+			}
+		})
 	}
 }

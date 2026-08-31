@@ -193,12 +193,27 @@ type DueGate struct {
 // the store's page size, so the comparison is available to a caller that did
 // not name one.
 //
+// Unreadable counts rows this reader could not decode, or that disagreed with
+// the filing they were found under. It is a DIFFERENT signal from a remnant: a
+// remnant is a row that was read and reported nothing, this is a row that could
+// not be read at all, and the two want different responses.
+//
+// Such a row is skipped rather than failing the page, and that is the strongest
+// rule here rather than leniency. This view is ascending by deadline, an
+// unreadable row's deadline is in the past and never changes, nothing in this
+// package rewrites it, and there is no continuation to step past it with — so a
+// reader that failed the page on one would switch gate expiry off for EVERY
+// TENANT, permanently, with no limit and no bound able to reach beyond it. That
+// is the same starvation this file already documents for remnants, in its
+// unrecoverable form.
+//
 // The type exists rather than a second return value so the continuation a later
 // task adds is an added field rather than a changed signature.
 type DueGatePage struct {
-	Gates    []DueGate
-	Examined int
-	Limit    int
+	Gates      []DueGate
+	Examined   int
+	Unreadable int
+	Limit      int
 }
 
 // OpenGate records a gate's deadline and then projects it as publicly open.
@@ -490,7 +505,8 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) (DueG
 		position := "due_gates[" + strconv.Itoa(index) + "]"
 		intent, err := gateIntentFor(stored)
 		if err != nil {
-			return DueGatePage{}, locateCatalogError(err, position)
+			due.Unreadable++
+			continue
 		}
 		key := dueSessionKey{tenant: intent.TenantID, session: intent.SessionID}
 		session, cached := sessions[key]
@@ -499,7 +515,8 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) (DueG
 			// provider work is done on its behalf: a misfiled row costs no
 			// round trip.
 			if session.scope, err = s.deriveSessionScope(intent.TenantID, intent.SessionID); err != nil {
-				return DueGatePage{}, locateCatalogError(err, position)
+				due.Unreadable++
+				continue
 			}
 		}
 		// The intent must be FILED as its own bytes say it should be. It is
@@ -507,7 +524,8 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) (DueG
 		// verified belongs to the ROW, and a cached session would otherwise let
 		// a misfiled intent through behind a well-filed one.
 		if err := verifyGateIntentFiling(stored, intent, session.scope); err != nil {
-			return DueGatePage{}, locateCatalogError(err, position)
+			due.Unreadable++
+			continue
 		}
 		if !cached {
 			entry, err := s.readCatalogEntry(opCtx, session.scope, intent.TenantID, intent.SessionID)
@@ -521,7 +539,17 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) (DueG
 				// provider error — is a reason to stop rather than to conclude
 				// anything about this gate.
 				if !noSuchSession(err) {
-					return DueGatePage{}, locateCatalogError(err, position)
+					if !rowLocalCatalogFailure(err) {
+						return DueGatePage{}, locateCatalogError(err, position)
+					}
+					// The session's own record is unreadable, which is a fact
+					// about THIS row's session rather than about the view. It
+					// is counted and stepped over for the reason Unreadable
+					// documents; a provider failure is not, because it says
+					// nothing about any row and continuing would turn an
+					// outage into a page of silent zeroes.
+					due.Unreadable++
+					continue
 				}
 			} else {
 				session.exists = true
@@ -838,4 +866,35 @@ func gateIntentFor(stored storage.OrderedRecord) (gateIntent, error) {
 		return gateIntent{}, catalogErr(CatalogErrorIdentity, "gate_intent", nil)
 	}
 	return intent, nil
+}
+
+// rowLocalCatalogFailure reports whether a catalog failure is a fact about ONE
+// record rather than about the store or the provider.
+//
+// The distinction is what lets a bounded reader step over a row without turning
+// an outage into a page of silent zeroes. A record that cannot be decoded, that
+// disagrees with the identity it was filed under, or whose session's collision
+// witness has been taken by another identity is a durable fact about that row:
+// retrying reports it again, no other row is implicated, and failing the whole
+// page on it disables the reader for every caller. A backend error, an
+// ambiguous mutation, or a caller mistake is not about the row at all.
+//
+// It is deliberately a CLOSED list of the row-local codes rather than an open
+// list of the others, so a code added later is treated as page-failing until
+// someone decides it is row-local. The safe default is to stop.
+func rowLocalCatalogFailure(err error) bool {
+	var keyspace *KeyspaceError
+	if errors.As(err, &keyspace) {
+		return keyspace.Code == KeyspaceHashCollision
+	}
+	var failure *CatalogError
+	if !errors.As(err, &failure) {
+		return false
+	}
+	switch failure.Code {
+	case CatalogErrorIdentity, CatalogErrorMalformed, CatalogErrorVersion, CatalogErrorTooLarge:
+		return true
+	default:
+		return false
+	}
 }

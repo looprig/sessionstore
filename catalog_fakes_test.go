@@ -172,6 +172,7 @@ type hostileOrdered struct {
 	due          func(storage.DuePage, error) (storage.DuePage, error)
 	createErr    error
 	createRefile func(storage.OrderedRecord) storage.OrderedRecord
+	updateRefile func(storage.OrderedRecord) storage.OrderedRecord
 }
 
 // failCreates makes every later Create return err.
@@ -406,3 +407,32 @@ var (
 	_ storage.OrderedIndex = (*listAuditOrdered)(nil)
 	_ storage.OrderedIndex = permissiveRankedOrdered{}
 )
+
+// refileUpdates rewrites the record every later Update RETURNS, leaving what
+// was stored alone. It is refileCreates for the compare-and-swap path, and it
+// is the only way to reach a reply check on a write that has ALREADY COMMITTED
+// — which is a different outcome from a failed write and, for a sweep, has to
+// be accounted for differently.
+func (o *hostileOrdered) refileUpdates(rewrite func(storage.OrderedRecord) storage.OrderedRecord) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.updateRefile = rewrite
+}
+
+func (o *hostileOrdered) Update(
+	ctx context.Context,
+	id storage.OrderedID,
+	expectedRevision uint64,
+	value []byte,
+	rank storage.Rank,
+	due storage.Due,
+) (storage.OrderedRecord, error) {
+	record, err := o.OrderedIndex.Update(ctx, id, expectedRevision, value, rank, due)
+	o.mu.Lock()
+	refile := o.updateRefile
+	o.mu.Unlock()
+	if err != nil || refile == nil {
+		return record, err
+	}
+	return refile(record), nil
+}

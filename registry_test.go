@@ -740,22 +740,19 @@ func TestHostRegistrationObservationProjectsTheTuple(t *testing.T) {
 func TestLargestAcceptableRegistrationFitsTheBound(t *testing.T) {
 	t.Parallel()
 
-	fill := func(prefix string) string {
-		return prefix + strings.Repeat("x", sessionwire.MaxIDBytes-len(prefix))
-	}
 	largest := HostRegistration{
-		TenantID:   sessionwire.TenantID(fill("tenant-")),
-		SessionID:  sessionwire.SessionID(fill("session-")),
+		TenantID:   sessionwire.TenantID(worstCaseIdentity()),
+		SessionID:  sessionwire.SessionID(worstCaseIdentity()),
 		LeaseEpoch: math.MaxUint64,
 		ObservedAt: registryObservedAt,
 		ExpiresAt:  registryExpiresAt,
 		Route: &HostRoute{
-			HostID:                 sessionwire.HostID(fill("host-")),
+			HostID:                 sessionwire.HostID(worstCaseIdentity()),
 			HostGeneration:         math.MaxUint64,
-			AgentID:                sessionwire.AgentID(fill("agent-")),
-			RuntimeCompatibilityID: fill("runtime-"),
+			AgentID:                sessionwire.AgentID(worstCaseIdentity()),
+			RuntimeCompatibilityID: worstCaseIdentity(),
 			Placement:              sessionwire.HostPlacementDedicated,
-			InternalEndpoint:       sessionwire.InternalEndpoint(fill("wss://h.internal/")),
+			InternalEndpoint:       worstCaseEndpoint(),
 			Residency:              sessionwire.SessionResidencyAttaching,
 			Accepting:              true,
 		},
@@ -768,6 +765,8 @@ func TestLargestAcceptableRegistrationFitsTheBound(t *testing.T) {
 		t.Fatalf("the largest acceptable registration is %d bytes, at or above the %d-byte bound",
 			len(encoded), MaxHostRegistrationRecordBytes)
 	}
+	t.Logf("largest acceptable registration = %d bytes against a %d-byte bound",
+		len(encoded), MaxHostRegistrationRecordBytes)
 	if _, err := decodeHostRegistration(encoded); err != nil {
 		t.Fatalf("the largest acceptable registration does not decode: %v", err)
 	}

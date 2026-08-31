@@ -39,6 +39,14 @@ const (
 	// record has no open-ended member: it is a fixed tuple of bounded
 	// identities, two instants, and three scalars.
 	//
+	// It allows for JSON ESCAPING, which is what sizes it rather than the sum
+	// of the identity lengths. An identity is any valid UTF-8 of at most
+	// MaxIDBytes bytes, control characters included, and Go escapes each of
+	// those as \u00XX — six bytes for one — so the worst acceptable record is
+	// about six times what an ASCII fixture measures. See
+	// TestLargestAcceptableHostTargetFitsTheBound, which builds that record
+	// rather than an ASCII one.
+	//
 	// It sits below storage.MaxOrderedValueBytes, so a record this package
 	// accepts always fits in the provider and there is no state that can be
 	// written but not rewritten. A heartbeat rewrites this row on a fixed
@@ -54,7 +62,7 @@ const (
 	// TestLargestAcceptableHostTargetFitsTheBound, which fails if the members
 	// ever grow into it. On the DECODE path it is live: those bytes are not
 	// this package's to bound.
-	MaxHostTargetRecordBytes = 8 << 10
+	MaxHostTargetRecordBytes = 16 << 10
 )
 
 // Stated as an unsigned constant for the reason the catalog, the inbox, and the
@@ -92,17 +100,19 @@ const MaxHostTargetAvailableCapacity uint64 = 1 << 20
 // returns. This ceiling bounds how long a single skewed clock reading can hold
 // that position before the row is even eligible to be reconciled away.
 //
-// THE COUNTER-ARGUMENT, recorded so the next reader sees both. The ceiling
-// binds only a Host whose clock is badly skewed — a healthy Host's promise is
-// its heartbeat interval, orders of magnitude below this — and for exactly that
-// population a Factory can be handed a dead endpoint on every placement attempt
-// at the target for the whole window. Five minutes was argued for on that basis
-// and is defensible. Fifteen is kept because the failure it trades against is
-// the opposite one: a ceiling below a real deployment's heartbeat interval
-// refuses HEALTHY Hosts, which removes capacity rather than merely mis-offering
-// it, and this package has no visibility into what that interval is. The choice
-// is a judgement call within a factor of three, it is pinned at both boundaries
-// by TestPublishHostTargetBoundsTheHeartbeatPromise, and it is cheap to change:
+// THE COUNTER-ARGUMENT, recorded so the next reader sees both. The ceiling is
+// measured against THIS STORE's clock, so it binds two populations rather than
+// one: a Host whose clock runs fast, and a perfectly-clocked Host whose
+// heartbeat interval is simply longer than the ceiling. Whichever it is, that
+// Host's row can be offered to placement for up to the whole window after the
+// process behind it has died, and five minutes was argued for on exactly that
+// basis. Fifteen is kept because the two populations pull in opposite
+// directions: tightening the ceiling shortens the dead-endpoint window for the
+// first, and REFUSES the second outright — which removes capacity rather than
+// merely mis-offering it — and this package cannot see a deployment's heartbeat
+// interval to tell them apart. The choice is a judgement call within a factor
+// of three, it is pinned at both boundaries by
+// TestPublishHostTargetBoundsTheHeartbeatPromise, and it is cheap to change:
 // nothing derives from it and no stored record embeds it.
 const MaxHostTargetTTL = 15 * time.Minute
 
@@ -866,9 +876,16 @@ func verifyHostTargetBytes(stored storage.OrderedRecord, value []byte) error {
 //     live Host's ability to advertise, which is reported rather than treated
 //     as absence — treating it as absence would send a publisher into a create
 //     the provider must refuse, forever.
-//   - The record's own target and HostID — held to what the caller asked for,
-//     so a provider returning another target's row cannot put a Host into a
-//     placement page for capacity it never offered.
+//   - The record's own target and HostID — held to what the caller supplied.
+//     The TARGET half is the load-bearing one and is real on every path: a
+//     provider returning another target's row cannot put a Host into a
+//     placement page for capacity it never offered. The HOST half is only a
+//     caller's value on the NAMED paths; a placement page has no host in its
+//     request and passes the stable key the provider itself supplied, so on
+//     that path this comparison is between two provider-supplied values and the
+//     check below is what carries it. That is stated rather than quietly true,
+//     because a reader who assumed both halves were caller-checked everywhere
+//     would think the row was pinned harder than it is.
 //   - StableKey — held to the record's HostID. This is the provider's choice
 //     rather than the caller's, and a provider that hashes the key stores the
 //     original for exactly this comparison. It is not a restatement of the
@@ -1014,14 +1031,20 @@ type ListCompatibleHostsRequest struct {
 //     position in every later page; a nonzero count means the directory is owed
 //     a ReconcileHostTargets pass, which is the only thing that clears it.
 //   - UnreadableSkipped counts rows this build could not decode, or that
-//     disagreed with the filing they were found under. Such a row is skipped
-//     rather than FAILING THE PAGE, and that is load-bearing rather than
-//     lenient. Nothing in this package ever rewrites a row it cannot read — a
-//     newer writer may have produced it — so a reader that failed the page on
-//     one would take every Host serving that target out of service permanently,
-//     with no recovery path anywhere in the system. Skipping keeps the newer
-//     writer's row untouched and starts publishing it the instant a reader that
-//     understands it asks, while the count keeps the condition visible.
+//     disagreed with the filing they were found under.
+//
+// THE RULE FOR AN UNREADABLE ROW IS STATED HERE AND NOWHERE ELSE, because a
+// rule restated in five places is a rule that drifts in four of them. Such a
+// row is skipped rather than FAILING THE PAGE, and that is load-bearing rather
+// than lenient: nothing in this package ever rewrites a row it cannot read — a
+// newer writer may have produced it — so the row is permanent, and a reader
+// that failed the page on one would take every Host serving that target out of
+// service for as long as it existed, with no recovery path anywhere in the
+// system. Skipping keeps the newer writer's row untouched and starts publishing
+// it the instant a reader that understands it asks; the count keeps the
+// condition visible; and README.md records that a genuinely corrupt row has no
+// in-band repair at all. ListDueGates and ListSessions obey the same rule for
+// the same reason.
 //
 // A page may therefore contain fewer than Limit entries while still issuing a
 // continuation. A caller that wants a specific number of candidates pages until
@@ -1099,14 +1122,11 @@ const (
 // row is still ranked and still occupies a position in every later page, and
 // ReconcileHostTargets is what removes it. The count says so out loud.
 //
-// NO SINGLE ROW CAN FAIL A PAGE. Every per-row refusal is counted and stepped
-// over, and that is the strongest rule in this file, because the alternative is
-// unrecoverable: nothing in this package ever rewrites a row it cannot read, so
-// a page that failed on one would take every Host serving that target out of
-// service for as long as the row existed, which is forever. The two counts on
-// HostTargetPage are what keep that from being silent. A failure returned from
-// here is therefore always about the QUERY — a bad limit, a foreign cursor, a
-// provider that could not answer — and never about one row.
+// NO SINGLE ROW CAN FAIL A PAGE: every per-row refusal is counted and stepped
+// over. HostTargetPage states why that is the strongest rule here rather than
+// leniency. The consequence for this signature is what matters at the call
+// site: a failure returned from here is always about the QUERY — a bad limit, a
+// foreign cursor, a provider that could not answer — and never about one row.
 func (s *Store) ListCompatibleHosts(ctx context.Context, req ListCompatibleHostsRequest) (HostTargetPage, error) {
 	limit, ok := s.pageLimit(req.Limit)
 	if !ok {
@@ -1362,16 +1382,13 @@ type ReconcileHostTargetsRequest struct {
 	// that on its own — and a token this store did not issue for a sweep is
 	// refused with HostTargetErrorCursor.
 	//
-	// Resuming is not an optimization. A row the sweep cannot handle stays due,
-	// so it heads every later ascending due page; once such rows fill the page
-	// budget, a sweep that always restarted at the head would reach nothing
-	// behind them, and because nothing removes an unreadable row that
-	// population never shrinks. The continuation is what makes the cost of
-	// those rows bounded rather than the progress zero.
+	// Resuming is not an optimization; see DefaultHostTargetReconcilePages for
+	// why a page budget alone leaves this sweep able to make no progress at
+	// all.
 	Cursor sessionwire.Cursor
 }
 
-// HostTargetReconcileResult accounts for every row one sweep scanned. The four
+// HostTargetReconcileResult accounts for every row one sweep scanned. The five
 // outcomes sum to Scanned, which is asserted rather than assumed: a sweep that
 // silently dropped a row would otherwise look like a sweep that had nothing to
 // do.
@@ -1386,11 +1403,15 @@ type ReconcileHostTargetsRequest struct {
 //     moved out from under it. Nothing was decided and a later sweep will see
 //     the row again if it is still lapsed.
 //   - Unreadable — the row could not be decoded, or disagreed with the filing
-//     it was found under. The sweep steps over it and does NOT rewrite it: a
-//     row this sweep cannot read may be one a NEWER writer produced, and
-//     un-ranking that during a rolling upgrade would take live capacity out of
-//     service on every pass. A nonzero count is an operator's signal, not a
-//     transient.
+//     it was found under. The sweep steps over it and does NOT rewrite it, for
+//     the reason HostTargetPage gives. A nonzero count is an operator's signal,
+//     not a transient: nothing retires such a row.
+//   - Unverified — the compare-and-swap COMMITTED and the provider's reply then
+//     failed this package's checks on it. The withdrawal is durable, so the row
+//     is handled and no later sweep will revisit it, but this sweep cannot say
+//     that it is: the reply it was given does not describe what it wrote. It is
+//     its own outcome rather than folded into Contended, which means the
+//     opposite — that nothing was decided.
 //
 // Exhausted reports whether the sweep reached the end of the due view within
 // its page budget. NextCursor is nonempty exactly when it did not, and a caller
@@ -1402,6 +1423,7 @@ type HostTargetReconcileResult struct {
 	StillLive  int
 	Contended  int
 	Unreadable int
+	Unverified int
 
 	Exhausted  bool
 	NextCursor sessionwire.Cursor
@@ -1418,17 +1440,26 @@ type HostTargetReconcileResult struct {
 // leaves it ranked — so a deployment that never calls this accumulates ranked
 // capacity that no longer exists.
 //
-// The sweep takes ONE clock reading and uses it for both the due bound and the
-// per-row revalidation, which is required rather than tidy: the ordered index
-// binds a due cursor to the exact bound that issued it, so a sweep that
-// re-read the clock per page could not page at all, and a revalidation against
-// a different instant from the bound could withdraw a row the bound had already
-// judged.
+// The due BOUND is fixed for one walk and the revalidation INSTANT is not, and
+// the difference is deliberate rather than an oversight. The bound is fixed
+// because the ordered index binds a due cursor to the exact bound that issued
+// it, so a walk that recomputed it could not page at all; on a resumed call the
+// bound therefore comes from the continuation while the clock reading is fresh.
+//
+// They are allowed to differ because the bound decides only WHICH rows a page
+// contains and the revalidation decides whether any of them may be withdrawn. A
+// fresh reading is monotonically at or after the bound, which is the safe
+// direction: withdrawal requires the row's own stored expiry to have lapsed at
+// that reading, so a row judged due at the bound and heartbeated since is still
+// refused, and a row that lapsed after the bound is simply not in the page.
 //
 // A failure reading the due view returns the counts accrued so far beside the
 // error rather than a zero result: a sweep that withdrew rows and then lost the
 // provider did that work, and reporting nothing would make a caller's next
-// decision — sweep again now, or wait — rest on a number it knows is false.
+// decision — sweep again now, or wait — rest on a number it knows is false. It
+// returns the walk's POSITION too, for the same reason it returns one on a
+// budget exhaustion: without it a caller that lost the provider halfway pays
+// the cost of every unreadable row ahead of it all over again.
 //
 // Each row is revalidated against its OWN STORED EXPIRY before anything is
 // written, and the compare-and-swap onto the revision the page reported is what
@@ -1475,6 +1506,17 @@ func (s *Store) ReconcileHostTargets(
 	for range pages {
 		due, err := s.backend.OrderedIndex.ListDue(opCtx, hostTargetNamespace, bound, after, limit)
 		if err != nil {
+			// The walk's POSITION survives the failure. A caller that lost the
+			// provider mid-walk would otherwise restart at the head of the due
+			// view, paying the whole cost of every unreadable row ahead of it
+			// again — which is the cost this continuation exists to stop
+			// paying. The counts accrued so far travel with it for the reason
+			// stated above.
+			if after != "" {
+				if next, cursorErr := s.encodeHostTargetSweepCursor(bound, after); cursorErr == nil {
+					result.NextCursor = next
+				}
+			}
 			return result, classifyHostTargetOrderedError(err, "list_due")
 		}
 		for _, stored := range due.Records {
@@ -1522,13 +1564,16 @@ const (
 	hostTargetSweepCursorVersion byte = 1
 
 	hostTargetSweepBoundBytes = 8
-
-	// The ceiling is enforced on ISSUE as well as on presentation, so a token
-	// this store hands out is always one it will accept back — and here that is
-	// sharper than usual, because a continuation this sweep cannot reissue is a
-	// sweep that silently reverts to making no progress.
-	maxHostTargetSweepCursorPayload = maxHostTargetCursorBytes - cursorPayloadAt
 )
+
+// The sweep reuses the placement page's payload ceiling rather than declaring
+// an equal one of its own. Two constants with the same definition are a
+// distinction that is not there: they would be free to drift apart for no
+// stated reason, and a reader would have to check whether the difference meant
+// something. The ceiling is enforced on ISSUE as well as on presentation, so a
+// token this store hands out is always one it will accept back — and for the
+// sweep that is sharper than usual, because a continuation it cannot reissue is
+// a sweep that silently reverts to making no progress.
 
 // hostTargetSweepCursorScope binds the continuation to this cursor KIND and to
 // nothing else. A sweep names no tenant, no target and no host — that is what
@@ -1542,7 +1587,7 @@ func (s *Store) encodeHostTargetSweepCursor(bound int64, after storage.DueCursor
 	payload := make([]byte, hostTargetSweepBoundBytes, hostTargetSweepBoundBytes+len(after))
 	binary.BigEndian.PutUint64(payload, uint64(bound)) // #nosec G115 -- a signed bound round-trips through the same width
 	payload = append(payload, after...)
-	if len(payload) > maxHostTargetSweepCursorPayload {
+	if len(payload) > maxHostTargetCursorPayload {
 		return "", hostTargetErr(HostTargetErrorBackend, "next_cursor", nil)
 	}
 	token := encodeCursorEnvelope(
@@ -1556,7 +1601,7 @@ func (s *Store) encodeHostTargetSweepCursor(bound int64, after storage.DueCursor
 func (s *Store) decodeHostTargetSweepCursor(cursor sessionwire.Cursor) (int64, storage.DueCursor, error) {
 	payload, ok := decodeCursorEnvelope(
 		hostTargetSweepCursorMagic, hostTargetSweepCursorVersion, s.hostTargetSweepCursorScope(),
-		string(cursor), hostTargetSweepBoundBytes+1, maxHostTargetSweepCursorPayload)
+		string(cursor), hostTargetSweepBoundBytes+1, maxHostTargetCursorPayload)
 	if !ok {
 		return 0, "", hostTargetErr(HostTargetErrorCursor, "cursor", nil)
 	}
@@ -1625,6 +1670,18 @@ func (s *Store) reconcileHostTargetRow(
 				// The row moved under the sweep. Nothing was decided, which is
 				// the correct outcome: a concurrent heartbeat wins.
 				result.Contended++
+				return nil
+			case HostTargetErrorIdentity:
+				// The compare-and-swap COMMITTED and the provider's reply then
+				// failed this package's checks on it. That is neither a
+				// withdrawal this sweep can claim nor a contention — the row is
+				// durably handled and no later sweep will see it — so it is
+				// counted as its own outcome and the pass continues. Ending the
+				// pass here would leave the row attributed to nothing, which is
+				// exactly the accounting this result promises never happens,
+				// and would let one bad reply do to a sweep what one unreadable
+				// row must not do to a placement page.
+				result.Unverified++
 				return nil
 			}
 		}
