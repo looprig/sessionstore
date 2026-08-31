@@ -667,21 +667,6 @@ func catalogEntry(
 	return CatalogEntry{Record: record, Revision: stored.Revision}, nil
 }
 
-// locateCatalogError prefixes a per-row failure with the row's position in the
-// page, preserving its code, its cause, and the member the underlying error
-// already named. The result reads like the paths this file already produces for
-// nested members — "sessions[3].tenant_id" rather than a bare "record" — so a
-// page that fails names both which row is unreadable and what about it is.
-func locateCatalogError(err error, position string) error {
-	var catalog *CatalogError
-	if !errors.As(err, &catalog) {
-		return err
-	}
-	located := *catalog
-	located.Field = position + "." + catalog.Field
-	return &located
-}
-
 // classifyCatalogOrderedError maps an OrderedIndex outcome into the catalog
 // vocabulary while preserving the cause for errors.Is and errors.As.
 func classifyCatalogOrderedError(err error, field string) error {

@@ -1244,51 +1244,153 @@ func TestReconcileHostTargetsRevalidatesTheStoredExpiry(t *testing.T) {
 	})
 }
 
-// TestReconcileHostTargetsCountsAPostWriteReplyFailure covers the one outcome
-// that happens AFTER the compare-and-swap has already committed: the provider's
-// reply does not describe what this package wrote.
+// TestReconcileHostTargetsCountsAPostWriteReplyFailure covers the outcomes that
+// happen AFTER the compare-and-swap has already committed: the provider's reply
+// does not describe what this package wrote.
 //
 // The withdrawal is durable at that point, so the row is handled — but the
 // sweep cannot say so, and it must not end the pass either. Ending it would
 // leave the documented accounting false (a row scanned and attributed to
 // nothing) and would let one misbehaving reply do to the sweep exactly what one
 // unreadable row must not do to a placement page.
+//
+// The two cases are the two families the reply check produces, and the second
+// is here because the first was not enough: the arm was originally written for
+// the identity failures alone, so a reply whose VALUE could not be decoded
+// still ended the pass. That is the same defect twice — a fix scoped to the
+// path a test happened to drive — which is why hostTargetWriteOutcome is now
+// exhaustive over the code set rather than a list of the codes anyone thought
+// of. See TestHostTargetWriteOutcomeClassifiesEveryCode.
 func TestReconcileHostTargetsCountsAPostWriteReplyFailure(t *testing.T) {
 	t.Parallel()
 
-	base := memstore.New()
-	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
-	base.OrderedIndex = hostile
-	store, clock := hostTargetFixture(t, base)
-	publishCapacity(t, store, "host-a", 1, targetExpiresAt)
-	publishCapacity(t, store, "host-b", 1, targetExpiresAt)
-	clock.set(targetLapsedAt)
-
-	// The reply is rewritten only for the first row, so the second proves the
-	// sweep carried on.
-	hostile.refileUpdates(func(record storage.OrderedRecord) storage.OrderedRecord {
-		if record.ID.StableKey == "host-a" {
+	tests := map[string]func(storage.OrderedRecord) storage.OrderedRecord{
+		"a reply whose view state is not what was filed": func(record storage.OrderedRecord) storage.OrderedRecord {
 			record.Rank = storage.Rank{Ranked: true, Value: 99}
-		}
-		return record
-	})
-	result := mustReconcile(t, store, ReconcileHostTargetsRequest{})
-	if result.Scanned != 2 || result.Unverified != 1 || result.Withdrawn != 1 {
-		t.Fatalf("sweep = %+v, want one unverified reply and the other row withdrawn", result)
-	}
-	if !result.Exhausted {
-		t.Fatalf("sweep = %+v, want the view exhausted", result)
+			return record
+		},
+		"a reply carrying a record this build cannot decode": func(record storage.OrderedRecord) storage.OrderedRecord {
+			record.Value = []byte(`{"record_version":2,"agent_id":"agent-a"}`)
+			return record
+		},
+		"a reply carrying a record that fails its own rules": func(record storage.OrderedRecord) storage.OrderedRecord {
+			record.Value = bytes.Replace(record.Value, []byte(`"placement":"pooled"`), []byte(`"placement":"nonsense"`), 1)
+			return record
+		},
 	}
 
-	// The withdrawal really did commit, which is why it is its own outcome
-	// rather than a contention: nothing will revisit this row.
-	stored := storedHostTargetRow(t, store, testHostTargetKey(), "host-a")
-	if stored.Due != (storage.Due{}) || stored.Rank != (storage.Rank{}) {
-		t.Fatalf("the withdrawal did not commit: rank %+v due %+v", stored.Rank, stored.Due)
+	for name, rewrite := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			base := memstore.New()
+			hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+			base.OrderedIndex = hostile
+			store, clock := hostTargetFixture(t, base)
+			publishCapacity(t, store, "host-a", 1, targetExpiresAt)
+			publishCapacity(t, store, "host-b", 1, targetExpiresAt)
+			clock.set(targetLapsedAt)
+
+			// Only the first row's reply is rewritten, so the second proves the
+			// sweep carried on rather than ending the pass.
+			hostile.refileUpdates(func(record storage.OrderedRecord) storage.OrderedRecord {
+				if record.ID.StableKey != "host-a" {
+					return record
+				}
+				return rewrite(record)
+			})
+			result := mustReconcile(t, store, ReconcileHostTargetsRequest{})
+			if result.Scanned != 2 || result.Unverified != 1 || result.Withdrawn != 1 {
+				t.Fatalf("sweep = %+v, want one unverified reply and the other row withdrawn", result)
+			}
+			if !result.Exhausted {
+				t.Fatalf("sweep = %+v, want the view exhausted", result)
+			}
+
+			// The withdrawal really did commit, which is why it is its own
+			// outcome rather than a contention: nothing will revisit this row.
+			stored := storedHostTargetRow(t, store, testHostTargetKey(), "host-a")
+			if stored.Due != (storage.Due{}) || stored.Rank != (storage.Rank{}) {
+				t.Fatalf("the withdrawal did not commit: rank %+v due %+v", stored.Rank, stored.Due)
+			}
+		})
 	}
 }
 
-// TestReconcileHostTargetsPagesPastARowItCannotHandle is the head-of-line
+// TestHostTargetWriteOutcomeClassifiesEveryCode is the guard that makes the
+// arms above exhaustive rather than a list of the failures someone remembered.
+//
+// The sweep's write classifier decides between three things: the write did not
+// happen, the write happened and its reply cannot be vouched for, and the
+// failure says nothing about this row at all. Getting a code into the wrong one
+// is not cosmetic — a committed withdrawal counted as a contention makes the
+// sweep understate its work, and a reply failure counted as fatal ends the pass
+// and falsifies the accounting HostTargetReconcileResult promises.
+//
+// The code set is READ FROM SOURCE rather than listed here, for the reason
+// orderedRecordMembers is: this arm has now been written twice with a
+// hand-picked list and been incomplete both times.
+func TestHostTargetWriteOutcomeClassifiesEveryCode(t *testing.T) {
+	t.Parallel()
+
+	// Codes a failed sweep write cannot produce, each with the reason it
+	// cannot. A code that is neither classified below nor excluded here fails
+	// this test until someone decides which it is.
+	excluded := map[HostTargetErrorCode]string{
+		HostTargetErrorBackend:    "not about this row; continuing would burn the budget failing every row",
+		HostTargetErrorUnknown:    "an ambiguous mutation says nothing about whether the withdrawal committed",
+		HostTargetErrorCursor:     "a write issues no listing and presents no cursor",
+		HostTargetErrorWithdrawn:  "only HostTarget.Report produces it, and the sweep does not project",
+		HostTargetErrorGeneration: "only a fence produces it, and the sweep names no generation of its own",
+	}
+
+	file, err := parser.ParseFile(token.NewFileSet(), "errors.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse errors.go: %v", err)
+	}
+	codes := map[string]HostTargetErrorCode{}
+	for _, declaration := range file.Decls {
+		generic, ok := declaration.(*ast.GenDecl)
+		if !ok || generic.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range generic.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok || len(value.Names) != 1 || len(value.Values) != 1 {
+				continue
+			}
+			named, ok := value.Type.(*ast.Ident)
+			if !ok || named.Name != "HostTargetErrorCode" {
+				continue
+			}
+			literal, ok := value.Values[0].(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				continue
+			}
+			text, err := strconv.Unquote(literal.Value)
+			if err != nil {
+				t.Fatalf("unquote %s: %v", value.Names[0].Name, err)
+			}
+			codes[value.Names[0].Name] = HostTargetErrorCode(text)
+		}
+	}
+	if len(codes) < 13 {
+		t.Fatalf("found %d codes (%v); the scan is not reaching the declarations", len(codes), codes)
+	}
+
+	for name, code := range codes {
+		outcome := hostTargetWriteOutcome(code)
+		reason, isExcluded := excluded[code]
+		switch {
+		case isExcluded && outcome != hostTargetSweepFatal:
+			t.Errorf("%s is excluded (%s) but is classified as a row outcome", name, reason)
+		case !isExcluded && outcome == hostTargetSweepFatal:
+			t.Errorf("%s is neither classified as a sweep outcome nor excluded with a reason", name)
+		}
+	}
+}
+
+// TestReconcileHostTargetsPagesPastARowItCannotHandle// TestReconcileHostTargetsPagesPastARowItCannotHandle is the head-of-line
 // question asked directly. A row the sweep cannot read stays due, so it is at
 // the head of every later ascending due page; the sweep must page PAST it and
 // reach the rows behind it rather than spending every pass on the same row.

@@ -515,17 +515,18 @@ Three things remove a row from the placement page, and nothing else does:
   handed an endpoint this store will not vouch for, but the row stays ranked. A
   nonzero count means the directory is owed a sweep.
 
-**No single row can fail a bounded page, anywhere in this package.** Every per-row refusal is counted
-and stepped over — lapsed ones in `LapsedSkipped`, undecodable and misfiled ones
-in `UnreadableSkipped` — and that is the strongest rule in this record rather
-than leniency. Nothing here ever rewrites a row it cannot read, because a newer
-writer may have produced it; so a reader that failed the whole page on one would
-take *every* Host serving that target out of service for as long as the row
-existed, which is forever, with no recovery path anywhere in the system.
-Skipping leaves the newer writer's row untouched and starts publishing it the
-instant a reader that understands it asks. A failure returned from
-`ListCompatibleHosts` is therefore always about the query — a bad limit, a
-foreign cursor, a provider that could not answer — and never about one row.
+**No single row can fail a bounded page, anywhere in this package.** Every
+per-row refusal is counted and stepped over — lapsed ones in `LapsedSkipped`,
+undecodable and misfiled ones in `UnreadableSkipped` — and that is the strongest
+rule in this record rather than leniency. Nothing here ever rewrites a row it
+cannot read, because a newer writer may have produced it; so a reader that
+failed the whole page on one would take *every* Host serving that target out of
+service for as long as the row existed, which is forever, with no recovery path
+anywhere in the system. Skipping leaves the newer writer's row untouched and
+starts publishing it the instant a reader that understands it asks. A failure
+returned from `ListCompatibleHosts` is therefore always about the query — a bad
+limit, a foreign cursor, a provider that could not answer — and never about one
+row.
 
 `ListDueGates` and `ListSessions` obey the same rule, and they were changed to.
 Both used to fail the whole page on one row, and both were reachable states with

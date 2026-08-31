@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"strconv"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -497,12 +496,7 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) (DueG
 	// whole catalog records, so a page holds at most its own row count times
 	// MaxCatalogOpenGates projections instead of that many 256 KiB records.
 	sessions := make(map[dueSessionKey]dueSession, len(page.Records))
-	for index, stored := range page.Records {
-		// A failure is located by position for the same reason a listing's is:
-		// one unreadable row must not make the whole due view unreadable with
-		// an error naming nothing. The position is a coordinate in this
-		// response, not a provider key.
-		position := "due_gates[" + strconv.Itoa(index) + "]"
+	for _, stored := range page.Records {
 		intent, err := gateIntentFor(stored)
 		if err != nil {
 			due.Unreadable++
@@ -540,7 +534,15 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) (DueG
 				// anything about this gate.
 				if !noSuchSession(err) {
 					if !rowLocalCatalogFailure(err) {
-						return DueGatePage{}, locateCatalogError(err, position)
+						// Reported WITHOUT a row position, deliberately. This
+						// branch has just decided the failure is not about this
+						// row — it is a provider fault or an ambiguous outcome
+						// — so labelling it "due_gates[3]" would point an
+						// operator at a row that is very likely fine. Every
+						// failure that IS about a row is counted above and
+						// never returned at all, which is what left this the
+						// only path out and made the label wrong.
+						return DueGatePage{}, err
 					}
 					// The session's own record is unreadable, which is a fact
 					// about THIS row's session rather than about the view. It

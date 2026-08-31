@@ -1665,22 +1665,11 @@ func (s *Store) reconcileHostTargetRow(
 	if _, err := s.writeHostTarget(ctx, scope, withdrawal, value, entry.Revision); err != nil {
 		var failure *HostTargetError
 		if errors.As(err, &failure) {
-			switch failure.Code {
-			case HostTargetErrorConflict, HostTargetErrorNotFound, HostTargetErrorDeleted:
-				// The row moved under the sweep. Nothing was decided, which is
-				// the correct outcome: a concurrent heartbeat wins.
+			switch hostTargetWriteOutcome(failure.Code) {
+			case hostTargetSweepContended:
 				result.Contended++
 				return nil
-			case HostTargetErrorIdentity:
-				// The compare-and-swap COMMITTED and the provider's reply then
-				// failed this package's checks on it. That is neither a
-				// withdrawal this sweep can claim nor a contention — the row is
-				// durably handled and no later sweep will see it — so it is
-				// counted as its own outcome and the pass continues. Ending the
-				// pass here would leave the row attributed to nothing, which is
-				// exactly the accounting this result promises never happens,
-				// and would let one bad reply do to a sweep what one unreadable
-				// row must not do to a placement page.
+			case hostTargetSweepUnverified:
 				result.Unverified++
 				return nil
 			}
@@ -1689,4 +1678,67 @@ func (s *Store) reconcileHostTargetRow(
 	}
 	result.Withdrawn++
 	return nil
+}
+
+// hostTargetSweepOutcome is what one failed sweep write means for the row it
+// was attempted on.
+type hostTargetSweepOutcome uint8
+
+const (
+	// hostTargetSweepContended: the write did not happen. The row moved under
+	// the sweep and a concurrent heartbeat won, which is the correct outcome.
+	hostTargetSweepContended hostTargetSweepOutcome = iota + 1
+
+	// hostTargetSweepUnverified: the write COMMITTED and the provider's reply
+	// then failed this package's checks on it. The withdrawal is durable and no
+	// later sweep will revisit the row, but this sweep cannot vouch for it.
+	hostTargetSweepUnverified
+
+	// hostTargetSweepFatal: the failure says nothing about this row, so the
+	// pass ends. It is also what an UNCLASSIFIED code gets, which is the safe
+	// direction: stopping is recoverable, silently miscounting is not.
+	hostTargetSweepFatal
+)
+
+// hostTargetWriteOutcome classifies a failed sweep write.
+//
+// It exists as a function over the CODE, rather than as arms inlined at the one
+// call site, so that it can be held to covering every code the vocabulary has —
+// which is the whole point, because this classification has now been written
+// twice from a hand-picked list and been incomplete both times. The first
+// version handled only the write-did-not-happen codes, so a committed
+// withdrawal whose reply failed ended the pass; the second added the identity
+// failure and still missed the decode family, because the test that drove it
+// only produced an identity failure. Both are the same defect: a fix scoped to
+// the path a test happened to drive.
+//
+// TestHostTargetWriteOutcomeClassifiesEveryCode reads the code set from source
+// and requires each member to be either classified here or excluded there with
+// a reason, so the third omission fails a test instead of falsifying the
+// accounting HostTargetReconcileResult promises.
+//
+// The unverified arm is every way the REPLY can be refused: the record's own
+// bytes failing to decode, to carry a known version, to fit the bound, or to
+// satisfy its own rules, and the filing and byte checks that follow. They are
+// one outcome because they say one thing — this package cannot vouch for what
+// the provider returned — and none of them says the write did not land.
+//
+// THIS IS THE ONLY PLACE IN THE PACKAGE THAT CLASSIFIES A DECODED REPLY, which
+// was checked rather than assumed after the second omission. The other places
+// that branch on an error code all classify a PROVIDER OUTCOME, where the
+// decode family cannot arise: noSuchSession and retireGateIntent read a Get's
+// result, JournalWriter.latch reads an append's. rowLocalCatalogFailure is the
+// one other consumer that must span both, and it names the decode family
+// explicitly for this reason. A future consumer that inspects a reply belongs
+// here rather than in a fourth list.
+func hostTargetWriteOutcome(code HostTargetErrorCode) hostTargetSweepOutcome {
+	switch code {
+	case HostTargetErrorConflict, HostTargetErrorNotFound, HostTargetErrorDeleted:
+		return hostTargetSweepContended
+	case HostTargetErrorIdentity, HostTargetErrorInvalid, HostTargetErrorMalformed,
+		HostTargetErrorVersion, HostTargetErrorTooLarge:
+		return hostTargetSweepUnverified
+	default:
+		return hostTargetSweepFatal
+	}
 }
