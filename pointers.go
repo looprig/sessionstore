@@ -681,12 +681,22 @@ func (s *Store) clearPointer(
 	if req.LeaseEpoch == 0 {
 		return SessionPointerEntry{}, pointerErr(PointerErrorInvalid, "lease_epoch", nil)
 	}
-	// The ROLE is deliberately not validated up front. It is the method's
-	// rather than the caller's, so it cannot be wrong; and if a kind were ever
-	// added to the enum without a mapping, the tombstone this operation encodes
-	// below would refuse it with the identical code and field. An up-front gate
-	// whose absence a deeper validator masks with the same error is a guard no
-	// test can hold and a reader has to run both to learn which one decides.
+	// The ROLE is deliberately not validated up front, and the reason is NOT
+	// that a deeper validator restates the rule — it is that this path cannot
+	// reach one. The read below comes first, and for a role with no object-kind
+	// mapping no record can exist to find: setPointer refuses such a role
+	// before it writes anything, so the only stored rows are of mappable roles.
+	// An unmappable role therefore reports not_found here, and never reaches
+	// the encode that would have called it invalid. getPointer has the same
+	// shape and the same answer.
+	//
+	// That is fail-closed and costs nothing: nothing is written, and no fence
+	// is minted from an unverified epoch. It is also unreachable through the
+	// public surface, because the role is the METHOD's rather than the
+	// caller's. TestAnUnmappableRoleIsRefusedWithoutWriting drives all three
+	// operations rather than leaving this paragraph to stand for them — an
+	// earlier version of this comment claimed the codes agreed, and they do
+	// not.
 	opCtx, release, err := s.admitForeground(ctx)
 	if err != nil {
 		return SessionPointerEntry{}, err

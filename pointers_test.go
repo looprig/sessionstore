@@ -133,6 +133,79 @@ func TestAClearedPointerHasExactlyOneSpelling(t *testing.T) {
 	}
 }
 
+// TestSessionPointerCanonicalizesItsInstantToUTC is the case every sibling
+// record has and this one did not: deleting the .UTC() from
+// canonicalSessionPointer survived the whole suite, while the function's own
+// doc promised "its one canonical spelling: a UTC instant".
+//
+// The zone is not cosmetic and the ASSERTION IS THE BYTES. Go encodes a
+// time.Time with its offset, so two writers at ONE instant in two zones would
+// produce two different encodings of one record — which is precisely what
+// "encoding and decoding both end here, so two encoders cannot disagree" denies,
+// and what verifySessionPointerBytes would then reject on a faithful provider
+// reply. The offset round-trips, so the codec fuzzer's fixed point holds either
+// way and cannot stand in for this.
+//
+// Both directions are driven: a request-shaped record encoded, and stored bytes
+// carrying an offset decoded, because canonicalization is claimed for both.
+func TestSessionPointerCanonicalizesItsInstantToUTC(t *testing.T) {
+	t.Parallel()
+
+	zone := time.FixedZone("elsewhere", 5*3600)
+	elsewhere := testSessionPointer()
+	elsewhere.UpdatedAt = elsewhere.UpdatedAt.In(zone)
+	if elsewhere.UpdatedAt.Location() == time.UTC {
+		t.Fatal("the fixture is already UTC; this case proves nothing")
+	}
+	encoded, canonical, err := encodeSessionPointer(elsewhere)
+	if err != nil {
+		t.Fatalf("encodeSessionPointer: %v", err)
+	}
+	if canonical.UpdatedAt.Location() != time.UTC {
+		t.Fatalf("the instant was not canonicalized: %v", canonical.UpdatedAt)
+	}
+	if !canonical.UpdatedAt.Equal(elsewhere.UpdatedAt) {
+		t.Fatalf("canonicalization moved the instant: %v", canonical.UpdatedAt)
+	}
+
+	// One instant, two zones, one encoding. This is the byte identity every
+	// concurrent writer and every provider-reply check depends on.
+	utc := testSessionPointer()
+	utcEncoded, _, err := encodeSessionPointer(utc)
+	if err != nil {
+		t.Fatalf("encodeSessionPointer: %v", err)
+	}
+	if !bytes.Equal(encoded, utcEncoded) {
+		t.Fatalf("two writers at one instant encoded differently:\n%s\n%s", encoded, utcEncoded)
+	}
+
+	// The decode path makes the same promise, so a record stored with an offset
+	// by an older writer reads back canonical.
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(utcEncoded, &members); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	offset, err := json.Marshal(pointerUpdatedAt.In(zone))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if bytes.Equal(members["updated_at"], offset) {
+		t.Fatal("the stored spelling already carries the offset; this case proves nothing")
+	}
+	members["updated_at"] = offset
+	stored, err := json.Marshal(members)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	decoded, err := decodeSessionPointer(stored)
+	if err != nil {
+		t.Fatalf("decodeSessionPointer: %v", err)
+	}
+	if decoded.UpdatedAt.Location() != time.UTC || !decoded.UpdatedAt.Equal(pointerUpdatedAt) {
+		t.Fatalf("a stored offset instant did not decode canonical: %v", decoded.UpdatedAt)
+	}
+}
+
 // TestAPointerCannotNameAnObjectOfAnotherKind is the typed half of this record:
 // the pointer kind DECIDES the object kind its target must be, so a workspace
 // checkpoint pointer cannot be made to name a runtime checkpoint by a caller
@@ -145,7 +218,7 @@ func TestAPointerCannotNameAnObjectOfAnotherKind(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s names no object kind", kind)
 		}
-		for _, object := range allObjectKinds() {
+		for _, object := range allObjectKinds(t) {
 			pointer := testSessionPointer()
 			pointer.Kind = kind
 			target := testObjectReference(object, 3)
@@ -166,14 +239,171 @@ func TestAPointerCannotNameAnObjectOfAnotherKind(t *testing.T) {
 	}
 }
 
-// allObjectKinds is every object kind the package declares. It is derived from
-// the source rather than listed, so the cross product above stays a cross
-// product when a kind is added.
-func allObjectKinds() []ObjectKind {
-	return []ObjectKind{
-		ObjectKindJournalPublic, ObjectKindJournalRuntime, ObjectKindCommandPayload,
-		ObjectKindToolResult, ObjectKindWorkspaceCheckpoint, ObjectKindRuntimeCheckpoint,
-		ObjectKindArtifact, ObjectKindAttachment, ObjectKindContinuation, ObjectKindRuntimeObject,
+// allObjectKinds is every object kind objects.go declares, READ OUT OF THE
+// SOURCE.
+//
+// It was a literal slice, with a doc comment claiming exactly what this one now
+// does. That is the defect TestOrderedNamespacesAreDistinct had one file over
+// and that this commit fixed there: a hand-written list covers the kinds its
+// author remembered, so an eleventh ObjectKind would have left the cross
+// product above quietly testing ten of eleven with the whole suite green. A
+// comment asserting a property the code lacks is worse than no comment,
+// because the next reader stops checking.
+//
+// The walk is the same one TestSessionPointerKindsAreTheDeclaredOnes uses on
+// the pointer roles: constants declared with the named type. Its own
+// correctness is asserted by TestAllObjectKindsIsTheDeclaredSet, which holds
+// the derived set to what ObjectKind.valid() accepts in BOTH directions — a
+// broken walk returns fewer, and a kind declared without being made valid (or
+// made valid without being declared) is a disagreement between the two.
+func allObjectKinds(t *testing.T) []ObjectKind {
+	t.Helper()
+	var kinds []ObjectKind
+	for _, kind := range declaredObjectKinds(t) {
+		kinds = append(kinds, kind)
+	}
+	return kinds
+}
+
+// declaredObjectKinds returns every ObjectKind constant objects.go declares, by
+// CONSTANT NAME, so the two guards below can compare names as well as values.
+func declaredObjectKinds(t *testing.T) map[string]ObjectKind {
+	t.Helper()
+	kinds := map[string]ObjectKind{}
+	for _, declaration := range parseProductionFile(t, "objects.go").Decls {
+		generic, ok := declaration.(*ast.GenDecl)
+		if !ok || generic.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range generic.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			named, ok := value.Type.(*ast.Ident)
+			if !ok || named.Name != "ObjectKind" {
+				continue
+			}
+			for i, literal := range value.Values {
+				basic, ok := literal.(*ast.BasicLit)
+				if !ok || basic.Kind != token.STRING {
+					t.Fatalf("an ObjectKind constant is not a string literal: %v", literal)
+				}
+				text, err := strconv.Unquote(basic.Value)
+				if err != nil {
+					t.Fatalf("unquote: %v", err)
+				}
+				kinds[value.Names[i].Name] = ObjectKind(text)
+			}
+		}
+	}
+	return kinds
+}
+
+// acceptedObjectKinds returns the constant names ObjectKind.valid() accepts,
+// read out of its case clause.
+//
+// It reads the SWITCH rather than probing valid() with candidate values,
+// because probing can only ask about kinds the prober already thought of —
+// which is how "a kind valid() accepts that nothing declares" slipped past the
+// first version of this guard. A case expression that is not a plain constant
+// name is reported here rather than silently skipped: a literal
+// ObjectKind("widget") in that list is exactly the shape being excluded.
+func acceptedObjectKinds(t *testing.T) map[string]bool {
+	t.Helper()
+	accepted := map[string]bool{}
+	for _, declaration := range parseProductionFile(t, "objects.go").Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "valid" || function.Recv == nil {
+			continue
+		}
+		receiver, ok := function.Recv.List[0].Type.(*ast.Ident)
+		if !ok || receiver.Name != "ObjectKind" {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			clause, ok := node.(*ast.CaseClause)
+			if !ok {
+				return true
+			}
+			for _, expression := range clause.List {
+				name, ok := expression.(*ast.Ident)
+				if !ok {
+					t.Errorf("ObjectKind.valid() accepts an expression that is not a declared constant: %#v", expression)
+					continue
+				}
+				accepted[name.Name] = true
+			}
+			return true
+		})
+	}
+	return accepted
+}
+
+func parseProductionFile(t *testing.T, filename string) *ast.File {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), filename, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", filename, err)
+	}
+	return file
+}
+
+// TestAllObjectKindsIsTheDeclaredSet guards the walk the cross product above
+// depends on, in both directions.
+//
+// The two sets it compares are independent statements of the same fact, each
+// read from the source: the const block says which kinds EXIST, and
+// ObjectKind.valid()'s case clause says which ones a reference may name. A
+// disagreement is a real defect wherever it comes from.
+//
+// Both directions are load-bearing and neither is decoration. A walk that
+// returned nothing satisfies "every derived kind is valid" completely, and the
+// first version of the reverse direction was a HAND-WRITTEN list of the ten
+// kinds its author knew — which is the very defect this test exists to prevent,
+// and which let a kind made valid without being declared survive. Reading
+// valid()'s own case clause is what closes that.
+func TestAllObjectKindsIsTheDeclaredSet(t *testing.T) {
+	t.Parallel()
+
+	declared := declaredObjectKinds(t)
+	accepted := acceptedObjectKinds(t)
+	if len(declared) < 10 {
+		t.Fatalf("found %d declared object kinds (%v); the scan is not reaching the const block", len(declared), declared)
+	}
+	if len(accepted) < 10 {
+		t.Fatalf("found %d accepted object kinds (%v); the scan is not reaching valid()", len(accepted), accepted)
+	}
+	for name, kind := range declared {
+		if !accepted[name] {
+			t.Errorf("objects.go declares %s (%q) and ObjectKind.valid() does not accept it", name, kind)
+		}
+		if !kind.valid() {
+			t.Errorf("%s (%q) is declared and the compiled valid() refuses it", name, kind)
+		}
+	}
+	for name := range accepted {
+		if _, ok := declared[name]; !ok {
+			t.Errorf("ObjectKind.valid() accepts %s, which the const block does not declare", name)
+		}
+	}
+
+	values := map[ObjectKind]string{}
+	for name, kind := range declared {
+		if other, ok := values[kind]; ok {
+			t.Errorf("%s and %s are both %q", other, name, kind)
+		}
+		values[kind] = name
+	}
+
+	// And the roles this file's cross product is built from must all be
+	// reachable in the derived set, or the "for every object kind" claim is
+	// about a set that does not contain the one kind each role requires.
+	for _, role := range sessionPointerKinds() {
+		object, ok := role.targetObjectKind()
+		if !ok || values[object] == "" {
+			t.Errorf("the role %s requires the object kind %q, which the scan did not find", role, object)
+		}
 	}
 }
 
@@ -1921,5 +2151,60 @@ func TestTwoHostsRaceForOnePointer(t *testing.T) {
 	}
 	if !survived {
 		t.Fatalf("the stored pointer %+v was never returned to any writer", final.Pointer)
+	}
+}
+
+// TestAnUnmappableRoleIsRefusedWithoutWriting drives what the three kernel
+// operations actually do with a role that has no object-kind mapping.
+//
+// It exists because the answers are NOT the same and a comment said they were.
+// A set is refused as invalid, by the encoder, before any provider work. A read
+// and a clear report not_found, because they read first and a row of an
+// unmappable role can never exist — the set that would have created one is
+// refused. All three are fail-closed and none of them writes, which is the
+// property that matters and the one asserted here.
+//
+// The case is unreachable through the public surface: the role is the METHOD's,
+// not the caller's. It is driven through the kernel for exactly that reason —
+// what a later kind added without a mapping would meet is otherwise untested.
+func TestAnUnmappableRoleIsRefusedWithoutWriting(t *testing.T) {
+	t.Parallel()
+
+	const unmappable = SessionPointerKind("invented")
+	if _, ok := unmappable.targetObjectKind(); ok {
+		t.Fatal("the fixture role is mapped; this case proves nothing")
+	}
+
+	base := memstore.New()
+	recorder := &recordingOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = recorder
+	store, _ := pointerFixture(t, base)
+	// A real pointer of a real role exists, so the session is bound and any
+	// refusal below is about the role rather than about the session.
+	ops := pointerOperationMatrix()[1]
+	ops.mustSet(t, store, ops.testSetRequest(t, pointerEpoch, pointerSequence, 1))
+	recorder.reset()
+
+	_, err := store.setPointer(context.Background(), unmappable, ops.testSetRequest(t, pointerEpoch, pointerSequence, 1))
+	assertPointerField(PointerErrorInvalid, "kind")(t, err)
+	// A set is refused by the encoder, so it reaches no provider at all.
+	if calls := recorder.snapshot(); len(calls) != 0 {
+		t.Fatalf("a set of an unmappable role reached the provider: %+v", calls)
+	}
+
+	_, err = store.getPointer(context.Background(), unmappable, testGetPointerRequest())
+	assertPointerField(PointerErrorNotFound, "record")(t, err)
+	_, err = store.clearPointer(context.Background(), unmappable, testClearPointerRequest(pointerEpoch))
+	assertPointerField(PointerErrorNotFound, "record")(t, err)
+
+	// The read and the clear read, and that is all they do: no create, no
+	// update, and nothing of the real pointer disturbed.
+	for _, call := range recorder.snapshot() {
+		if call.op != "get" {
+			t.Fatalf("an unmappable role reached a %q; only reads are allowed to happen", call.op)
+		}
+	}
+	if entry := ops.mustGet(t, store); entry.Pointer.LeaseEpoch != pointerEpoch {
+		t.Fatalf("an unmappable role disturbed a real pointer: %+v", entry.Pointer)
 	}
 }
