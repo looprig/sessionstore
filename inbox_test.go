@@ -721,6 +721,7 @@ func TestOrderedNamespacesAreDistinct(t *testing.T) {
 		"gates":    gateNamespace,
 		"inbox":    inboxNamespace,
 		"registry": registryNamespace,
+		"targets":  hostTargetNamespace,
 	}
 	seen := map[string]string{}
 	for kind, namespace := range namespaces {

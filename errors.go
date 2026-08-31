@@ -587,6 +587,112 @@ func registryRecordFailure(failure versionedRecordFailure, field string, cause e
 	}
 }
 
+// HostTargetErrorCode classifies a Host target directory failure.
+//
+// It is its own vocabulary rather than the registry's, and the reason is not
+// merely that they are separate aggregates. It is that a caller MUST NOT be
+// able to write one handler for both. A RegistryError is the public account of
+// who is running a session; a HostTargetError is the public account of who
+// might be able to take one. Sharing a type would let a caller branch on
+// "expired" without knowing which of those two questions it had just asked, and
+// the whole discipline of this record is that capacity is never authority.
+//
+// The codes are the ones the ordinary vocabulary supplies, with three that need
+// their reasons stated:
+//
+//   - Withdrawn — the row exists and offers no capacity. It is what a drain
+//     leaves and what the reconciler writes; it is not an error in a caller and
+//     it is not a claim about any session.
+//   - Generation — the caller named a Host generation BELOW the row's committed
+//     high-water mark, so the write comes from a superseded incarnation of that
+//     same Host. It is deliberately NOT called Epoch: RegistryErrorEpoch means
+//     a lease has provably lost a SESSION, and a code sharing that name would
+//     invite a reader to believe this record fences ownership. It does not. See
+//     HostTarget.
+//   - Cursor — a page token this store did not issue for this exact target. The
+//     walk restarts from the first page; nothing is wrong with the store.
+//
+// Conflict means a lost revision compare-and-swap and nothing else — re-read
+// and retry — which is the meaning it has for every other record kind here.
+type HostTargetErrorCode string
+
+const (
+	HostTargetErrorInvalid    HostTargetErrorCode = "invalid"
+	HostTargetErrorNotFound   HostTargetErrorCode = "not_found"
+	HostTargetErrorWithdrawn  HostTargetErrorCode = "withdrawn"
+	HostTargetErrorDeleted    HostTargetErrorCode = "deleted"
+	HostTargetErrorIdentity   HostTargetErrorCode = "identity"
+	HostTargetErrorGeneration HostTargetErrorCode = "generation"
+	HostTargetErrorConflict   HostTargetErrorCode = "conflict"
+	HostTargetErrorCursor     HostTargetErrorCode = "cursor"
+	HostTargetErrorUnknown    HostTargetErrorCode = "unknown"
+	HostTargetErrorBackend    HostTargetErrorCode = "backend"
+	HostTargetErrorMalformed  HostTargetErrorCode = "malformed"
+	HostTargetErrorVersion    HostTargetErrorCode = "version"
+	HostTargetErrorTooLarge   HostTargetErrorCode = "too_large"
+)
+
+// HostTargetError is a typed, redacted Host target directory failure. Field
+// names the offending input or stage and never carries a provider name, a key,
+// or a record payload.
+//
+// Revision is populated only for HostTargetErrorConflict, carrying the value
+// that is itself the answer, as the other record kinds do for that code.
+//
+// Generation is populated only for HostTargetErrorGeneration, carrying the
+// high-water mark that refused the write so a superseded incarnation learns it
+// has been superseded rather than retrying forever.
+//
+// There is deliberately no epoch member of any kind. A caller cannot obtain a
+// lease epoch from this type because there is no lease epoch in this record to
+// obtain.
+type HostTargetError struct {
+	Code       HostTargetErrorCode
+	Field      string
+	Generation uint64
+	Revision   uint64
+	Cause      error
+}
+
+func (e *HostTargetError) Error() string {
+	message := "sessionstore: host target " + string(e.Code)
+	if e.Field != "" {
+		message += " (" + e.Field + ")"
+	}
+	return message
+}
+
+func (e *HostTargetError) Unwrap() error { return e.Cause }
+
+func hostTargetErr(code HostTargetErrorCode, field string, cause error) error {
+	return &HostTargetError{Code: code, Field: field, Cause: cause}
+}
+
+// hostTargetInvalid is the directory's member-validation constructor, handed to
+// the shared validators so they report in this record's vocabulary.
+func hostTargetInvalid(field string, cause error) error {
+	return hostTargetErr(HostTargetErrorInvalid, field, cause)
+}
+
+// hostTargetIdentity is the directory's counterpart of the three identity
+// constructors below, and it exists for the same reason they do.
+func hostTargetIdentity(field string, cause error) error {
+	return hostTargetErr(HostTargetErrorIdentity, field, cause)
+}
+
+// hostTargetRecordFailure maps a shared versioned-record decode failure into
+// the directory vocabulary.
+func hostTargetRecordFailure(failure versionedRecordFailure, field string, cause error) error {
+	switch failure {
+	case versionedRecordTooLarge:
+		return hostTargetErr(HostTargetErrorTooLarge, field, cause)
+	case versionedRecordVersion:
+		return hostTargetErr(HostTargetErrorVersion, field, cause)
+	default:
+		return hostTargetErr(HostTargetErrorMalformed, field, cause)
+	}
+}
+
 // The three identity constructors below are what let checkFiledScope be shared.
 // They are separate from the Invalid constructors above them because the two
 // say different things: an Invalid names a value that is wrong, while an

@@ -464,3 +464,87 @@ residency against the routable residency that disappears with the route, and the
 desired runtime against the runtime the running Host actually loaded. The lease
 epoch appears on both because each record carries the epoch its OWN writes are
 fenced at; neither is derived from the other and they advance independently.
+
+## The Host target directory: derived capacity that rows leave
+
+`PublishHostTarget` advertises what one Host can currently take for one target:
+`(agent_id, runtime_compatibility_id, placement)` names the target, `host_id`
+completes the row's identity, and the offer itself is
+`(internal_endpoint, isolation_class, accepting, available_capacity)` plus the
+Host's observation instant and the instant it promises to heartbeat by. One Host
+serving several targets publishes one row per target; that is derived capacity,
+not a competing catalogue of what agents or runtimes exist.
+`HostTarget.Report` projects a row into Core's `HostLinkCapacityReport`, which
+is also the record's validator, exactly as the registry delegates to Core.
+
+**It is the opposite of the registry in almost every way, and deliberately so.**
+The registry is one permanent, unranked, never-due row per SESSION whose lease
+epoch is that session's ownership fence. This is one row per (target, host),
+ranked by free capacity, due at its own heartbeat expiry, and REMOVABLE — rows
+here must actually leave, or a crashed Host permanently occupies the front of
+every placement page.
+
+**A row never proves session ownership.** There is nowhere in it to say so: the
+record names no tenant, no session and no lease epoch, and neither does the
+projection a placement page publishes. `HostGeneration` is a write-ordering
+high-water mark over one row — `host_id` is part of the identity, so the only
+writers it can ever compare are incarnations of ONE Host — and what it prevents
+is a dead incarnation overwriting live capacity, which is a liveness fault. The
+error code for it is `generation` rather than `epoch` for exactly that reason.
+`TestHostTargetsCannotSpellSessionOwnership` reads the source and fails if any
+type in this record's family grows a tenant, session, or lease-epoch member.
+
+Both views are functions of the RECORD, in one function each. A row is ranked by
+`available_capacity` when its Host is accepting, and is UNRANKED when the Host
+has stopped accepting or when the row is withdrawn; it is due at its expiry when
+it is advertised, and NOT DUE when it is withdrawn. Withdrawal is one nil
+pointer rather than a set of cleared members, so "withdrawn" leaving both views
+is a property of the record's shape rather than a rule a writer has to remember.
+
+Three things remove a row from the placement page, and nothing else does:
+
+- **A graceful drain.** `DrainHostTarget` writes the withdrawn record, which
+  leaves both views in one compare-and-swap, at the instant a Host decides to
+  stop rather than when its promise runs out.
+- **The due reconciler.** `ReconcileHostTargets` is a SERVICE operation — it
+  names no tenant and no target and sweeps the whole directory's deadline view —
+  and it is the only thing that removes a CRASHED Host's row. A deployment that
+  never calls it accumulates ranked capacity that no longer exists.
+- Nothing else. In particular `ListCompatibleHosts` does not: it declines to
+  publish a lapsed row and counts it in `LapsedSkipped`, so a caller is never
+  handed an endpoint this store will not vouch for, but the row stays ranked. A
+  nonzero count means the directory is owed a sweep.
+
+Nothing here calls the provider's `Delete`, and it cannot: the ordered index
+promises an identity is never reusable after a tombstone, while a Host that
+drains at shutdown and advertises again at startup reuses this identity as a
+matter of course. A withdrawn row is therefore retained and REUSED, which is
+what makes a restart work.
+
+The reconciler revalidates each row's own stored expiry before writing anything
+and compare-and-swaps onto the revision the due page reported. The due view is
+weakly consistent, so a Host may have heartbeated since the page was read; the
+two checks together mean such a Host either presents an unlapsed expiry, in
+which case the sweep leaves it alone, or has already advanced the revision, in
+which case the write loses. A sweep that trusted the page alone would withdraw
+the capacity of a Host that is alive, and `StillLive` counts the rows the
+revalidation saved.
+
+The sweep takes ONE clock reading for both the due bound and the revalidation,
+which is required rather than tidy: a due cursor binds to the exact bound that
+issued it, so a re-read bound could not page at all. It is bounded by pages as
+well as by page size, and that budget is the head-of-line answer: a row the
+sweep cannot decode stays due and therefore sits at the head of every later
+ascending due page, so the sweep uses the provider's continuation to STEP OVER
+it and reach the rows behind. Such a row is counted in `Unreadable` and is
+deliberately NOT rewritten — a row this sweep cannot read may be one a NEWER
+writer produced, and un-ranking that during a rolling upgrade would take live
+capacity out of service on every pass. The count is the operator's signal.
+
+`ListCompatibleHosts` is one ranked provider query per page: the target is the
+ranking scope, so the restriction and the capacity order are both inside the
+query. It deliberately does not verify the target's collision witness, which the
+writes bind — a listing names no row, and a target nothing has ever advertised
+has no witness to prove, so requiring one would answer "no capacity" with a
+failure. Cross-target safety comes from below instead: every row a page returns
+is held to the target its own bytes claim.
