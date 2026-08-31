@@ -23,7 +23,7 @@ import (
 // three mechanisms that already hold with no claim in sight. This record only
 // makes them cheaper to rely on.
 //
-// That distinction is enforced structurally rather than documented, in three
+// That distinction is enforced structurally rather than documented, in two
 // ways a later change has to break on purpose:
 //
 //  1. The record CANNOT NAME ownership. There is no lease epoch, no HostID, no
@@ -36,8 +36,11 @@ import (
 //     there is nothing for it to be mistaken for. That is a property of the
 //     package rather than of this file, and a test parses every other
 //     production file to keep it one.
-//  3. A claim is not required to do the work. A replica that ignores this
-//     record entirely produces correct results and merely duplicates effort.
+//
+// A replica that ignores this record entirely still produces correct results
+// and merely duplicates effort. That is a CONSEQUENCE of the second mechanism
+// rather than a third one standing beside it: nothing reads a claim, so nothing
+// can require one.
 //
 // The record's SHAPE follows the Host registry's, and for the same reasons: one
 // row per session, filed in the session namespace, unranked, never due, read

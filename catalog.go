@@ -1099,9 +1099,9 @@ func validateOpaque(value, field string, fail func(field string, cause error) er
 // record's filing that every session-scoped record kind files identically: the
 // ordering scope, the ranking scope, and the due state.
 //
-// Three records need exactly this, for exactly the same reasons, and had three
-// byte-identical copies of it differing only in the error constructor. What
-// each copy was free to do was drift — to drop the ranking scope, or to compare
+// Every session-scoped record kind needs exactly this, for exactly the same
+// reasons, and each held its own byte-identical copy of it differing only in
+// the error constructor. What each copy was free to do was drift — to drop the ranking scope, or to compare
 // the due state's milliseconds instead of the whole value — on the one path
 // that only runs when a provider is already misbehaving and where a weakened
 // check therefore looks exactly like a passing one.

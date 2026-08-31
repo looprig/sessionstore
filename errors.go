@@ -688,7 +688,7 @@ func hostTargetInvalid(field string, cause error) error {
 	return hostTargetErr(HostTargetErrorInvalid, field, cause)
 }
 
-// hostTargetIdentity is the directory's counterpart of the three identity
+// hostTargetIdentity is the directory's counterpart of the identity
 // constructors below, and it exists for the same reason they do.
 func hostTargetIdentity(field string, cause error) error {
 	return hostTargetErr(HostTargetErrorIdentity, field, cause)
@@ -922,7 +922,8 @@ func pointerRecordFailure(failure versionedRecordFailure, field string, cause er
 	}
 }
 
-// The three identity constructors below are what let checkFiledScope be shared.
+// The identity constructors in this file are what let checkFiledScope be
+// shared, one per session-scoped record kind.
 // They are separate from the Invalid constructors above them because the two
 // say different things: an Invalid names a value that is wrong, while an
 // Identity names a stored record that disagrees with the identity it was filed
