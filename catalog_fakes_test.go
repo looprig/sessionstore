@@ -131,6 +131,10 @@ func (k *keysCountingKV) Keys(ctx context.Context, prefix string) ([]string, err
 // test arms it once its fixture is in place. Arming beats swapping Store.backend
 // after Open: a test that reaches into store internals is testing a state the
 // production lifecycle never produces.
+//
+// It is the package's ONE non-conforming provider, pointed at whichever method
+// a test needs: reads, the ranked and due views, and creates. A second fake for
+// creates would have been a second name for that one idea.
 type hostileOrdered struct {
 	storage.OrderedIndex
 
@@ -140,6 +144,47 @@ type hostileOrdered struct {
 	rewrite      func([]byte) []byte
 	ranked       func(storage.RankedPage, error) (storage.RankedPage, error)
 	due          func(storage.DuePage, error) (storage.DuePage, error)
+	createErr    error
+	createRefile func(storage.OrderedRecord) storage.OrderedRecord
+}
+
+// failCreates makes every later Create return err.
+func (o *hostileOrdered) failCreates(err error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.createErr = err
+}
+
+// refileCreates rewrites the record every later Create RETURNS, leaving what
+// was stored alone. That is exactly the shape of the fault it stands for — a
+// provider whose reply does not describe what it filed — and it is the only way
+// to reach the filing checks, because a conforming provider's reply always
+// agrees with the request.
+func (o *hostileOrdered) refileCreates(rewrite func(storage.OrderedRecord) storage.OrderedRecord) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.createRefile = rewrite
+}
+
+func (o *hostileOrdered) Create(
+	ctx context.Context,
+	id storage.OrderedID,
+	rankingScope string,
+	value []byte,
+	rank storage.Rank,
+	due storage.Due,
+) (storage.OrderedRecord, bool, error) {
+	o.mu.Lock()
+	createErr, refile := o.createErr, o.createRefile
+	o.mu.Unlock()
+	if createErr != nil {
+		return storage.OrderedRecord{}, false, createErr
+	}
+	record, created, err := o.OrderedIndex.Create(ctx, id, rankingScope, value, rank, due)
+	if err != nil || refile == nil {
+		return record, created, err
+	}
+	return refile(record), created, nil
 }
 
 // failGets makes every later Get return err.

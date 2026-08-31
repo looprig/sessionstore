@@ -304,11 +304,23 @@ func journalErr(code JournalErrorCode, field string, cause error) error {
 // catalog's type to learn that its command was not stored, and the command
 // lifecycle's later states need failures the catalog has no business naming.
 //
-// Conflict and Unknown are deliberately distinct. Conflict is definite and
-// caller-caused: one command id was reused for a DIFFERENT command, and the
-// stored command is untouched. Unknown means the mutation's outcome could not
-// be resolved at all, so the caller learns nothing about what is stored and
-// must retry the same identity to find out.
+// CommandMismatch is definite and caller-caused: one command id was reused for
+// a DIFFERENT command, and the stored command is untouched. No retry helps —
+// the caller must mint a new id or send the command it originally sent.
+//
+// It is deliberately NOT called "conflict", and the omission is the point.
+// CatalogErrorConflict, twenty lines up in this same file, means a lost
+// revision compare-and-swap: recoverable, provider-caused, carrying the actual
+// revision, and explicitly inviting a re-read and a retry. That is the
+// OPPOSITE recovery advice, and one spelling for two opposite meanings in one
+// package is a trap for anyone who learns the vocabulary from either half of
+// it. InboxErrorConflict is therefore left undefined and RESERVED for the
+// revision-CAS meaning its neighbour already has, which is what the command
+// transition machine will need when it compare-and-swaps this record.
+//
+// Unknown means the mutation's outcome could not be resolved at all, so the
+// caller learns nothing about what is stored and must retry the same identity
+// to find out.
 //
 // Identity means a stored record disagreed with the identity it was filed
 // under or asked for. It is not a caller error and not a conflict: it means the
@@ -316,15 +328,15 @@ func journalErr(code JournalErrorCode, field string, cause error) error {
 type InboxErrorCode string
 
 const (
-	InboxErrorInvalid   InboxErrorCode = "invalid"
-	InboxErrorConflict  InboxErrorCode = "conflict"
-	InboxErrorDeleted   InboxErrorCode = "deleted"
-	InboxErrorIdentity  InboxErrorCode = "identity"
-	InboxErrorUnknown   InboxErrorCode = "unknown"
-	InboxErrorBackend   InboxErrorCode = "backend"
-	InboxErrorMalformed InboxErrorCode = "malformed"
-	InboxErrorVersion   InboxErrorCode = "version"
-	InboxErrorTooLarge  InboxErrorCode = "too_large"
+	InboxErrorInvalid         InboxErrorCode = "invalid"
+	InboxErrorCommandMismatch InboxErrorCode = "command_mismatch"
+	InboxErrorDeleted         InboxErrorCode = "deleted"
+	InboxErrorIdentity        InboxErrorCode = "identity"
+	InboxErrorUnknown         InboxErrorCode = "unknown"
+	InboxErrorBackend         InboxErrorCode = "backend"
+	InboxErrorMalformed       InboxErrorCode = "malformed"
+	InboxErrorVersion         InboxErrorCode = "version"
+	InboxErrorTooLarge        InboxErrorCode = "too_large"
 )
 
 // InboxError is a typed, redacted command failure. Field names the offending

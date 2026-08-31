@@ -3,7 +3,6 @@ package sessionstore
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"go/ast"
@@ -130,144 +129,13 @@ func assertNoSessionWitnesses(t *testing.T, store *Store, req AdmitCommandReques
 	}
 }
 
-// refilingOrdered presents SessionStore with Create outcomes a conforming
-// provider never produces: a record filed under a different identity, scope,
-// due state, or order than the one it was asked for, or a chosen failure.
-//
-// It rewrites the RETURNED record rather than the stored one, which is exactly
-// the shape of the fault it stands for — a provider whose reply does not
-// describe what it filed — and it is the only way to reach the filing checks,
-// because a conforming provider's reply always agrees with the request.
-type refilingOrdered struct {
-	storage.OrderedIndex
-
-	mu        sync.Mutex
-	createErr error
-	rewrite   func(storage.OrderedRecord) storage.OrderedRecord
-}
-
-func (o *refilingOrdered) failCreate(err error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.createErr = err
-}
-
-func (o *refilingOrdered) refile(rewrite func(storage.OrderedRecord) storage.OrderedRecord) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	o.rewrite = rewrite
-}
-
-func (o *refilingOrdered) Create(
-	ctx context.Context,
-	id storage.OrderedID,
-	rankingScope string,
-	value []byte,
-	rank storage.Rank,
-	due storage.Due,
-) (storage.OrderedRecord, bool, error) {
-	o.mu.Lock()
-	createErr, rewrite := o.createErr, o.rewrite
-	o.mu.Unlock()
-	if createErr != nil {
-		return storage.OrderedRecord{}, false, createErr
-	}
-	record, created, err := o.OrderedIndex.Create(ctx, id, rankingScope, value, rank, due)
-	if err != nil || rewrite == nil {
-		return record, created, err
-	}
-	return rewrite(record), created, nil
-}
-
-var _ storage.OrderedIndex = (*refilingOrdered)(nil)
-
-// writeWatch records every byte string this package hands a provider, so a
-// test can ask where a private payload ended up rather than assuming.
-type writeWatch struct {
-	mu     sync.Mutex
-	writes []watchedWrite
-}
-
-type watchedWrite struct {
-	primitive string
-	value     []byte
-}
-
-func (w *writeWatch) add(primitive string, value []byte) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.writes = append(w.writes, watchedWrite{primitive: primitive, value: bytes.Clone(value)})
-}
-
-// carrying returns every write that carries needle in any spelling this
-// package can write it in. Both are checked rather than only the one the inbox
-// happens to use, because the question is where the payload ENDED UP, and a
-// leak into a record that spells bytes differently is exactly the leak this
-// would otherwise miss.
-func (w *writeWatch) carrying(needle []byte) []watchedWrite {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	encoded := []byte(base64.StdEncoding.EncodeToString(needle))
-	var found []watchedWrite
-	for _, write := range w.writes {
-		if bytes.Contains(write.value, needle) || bytes.Contains(write.value, encoded) {
-			found = append(found, write)
-		}
-	}
-	return found
-}
-
-type watchingOrdered struct {
-	storage.OrderedIndex
-	watch *writeWatch
-}
-
-func (o *watchingOrdered) Create(
-	ctx context.Context,
-	id storage.OrderedID,
-	rankingScope string,
-	value []byte,
-	rank storage.Rank,
-	due storage.Due,
-) (storage.OrderedRecord, bool, error) {
-	o.watch.add("ordered:"+id.Namespace, value)
-	return o.OrderedIndex.Create(ctx, id, rankingScope, value, rank, due)
-}
-
-func (o *watchingOrdered) Update(
-	ctx context.Context,
-	id storage.OrderedID,
-	expectedRevision uint64,
-	value []byte,
-	rank storage.Rank,
-	due storage.Due,
-) (storage.OrderedRecord, error) {
-	o.watch.add("ordered:"+id.Namespace, value)
-	return o.OrderedIndex.Update(ctx, id, expectedRevision, value, rank, due)
-}
-
-type watchingKV struct {
-	storage.KV
-	watch *writeWatch
-}
-
-func (k *watchingKV) Put(ctx context.Context, key string, expectedRev uint64, val []byte) (uint64, error) {
-	k.watch.add("kv", val)
-	return k.KV.Put(ctx, key, expectedRev, val)
-}
-
-var (
-	_ storage.OrderedIndex = (*watchingOrdered)(nil)
-	_ storage.KV           = (*watchingKV)(nil)
-)
-
 // --- the stored record's codec --------------------------------------------
 
 func TestInboxRecordRoundTripsThroughStoredBytes(t *testing.T) {
 	t.Parallel()
 
 	record := testInboxRecord()
-	encoded, err := encodeInboxRecord(record)
+	encoded, _, err := encodeInboxRecord(record)
 	if err != nil {
 		t.Fatalf("encodeInboxRecord: %v", err)
 	}
@@ -275,7 +143,7 @@ func TestInboxRecordRoundTripsThroughStoredBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodeInboxRecord: %v", err)
 	}
-	again, err := encodeInboxRecord(decoded)
+	again, _, err := encodeInboxRecord(decoded)
 	if err != nil {
 		t.Fatalf("re-encode: %v", err)
 	}
@@ -308,7 +176,7 @@ func TestInboxRecordRoundTripsARejection(t *testing.T) {
 		Message:   "no compatible runtime before the apply deadline",
 		Retryable: false,
 	}
-	encoded, err := encodeInboxRecord(record)
+	encoded, _, err := encodeInboxRecord(record)
 	if err != nil {
 		t.Fatalf("encodeInboxRecord: %v", err)
 	}
@@ -322,7 +190,7 @@ func TestInboxRecordRoundTripsARejection(t *testing.T) {
 	if *decoded.Rejection != *record.Rejection {
 		t.Fatalf("rejection = %+v, want %+v", *decoded.Rejection, *record.Rejection)
 	}
-	again, err := encodeInboxRecord(decoded)
+	again, _, err := encodeInboxRecord(decoded)
 	if err != nil {
 		t.Fatalf("re-encode: %v", err)
 	}
@@ -337,7 +205,7 @@ func TestInboxRecordRoundTripsAnObjectReferencedPayload(t *testing.T) {
 	record := testInboxRecord()
 	record.Payload = nil
 	record.PayloadRef = sessionwire.ObjectReference{ObjectID: "object-a"}
-	encoded, err := encodeInboxRecord(record)
+	encoded, _, err := encodeInboxRecord(record)
 	if err != nil {
 		t.Fatalf("encodeInboxRecord: %v", err)
 	}
@@ -372,11 +240,11 @@ func TestInboxRecordCanonicalizesEveryTimestampToUTC(t *testing.T) {
 	zoned.Claim.ExpiresAt = zoned.Claim.ExpiresAt.In(zone)
 	zoned.Result.CompletedAt = zoned.Result.CompletedAt.In(zone)
 
-	zonedBytes, err := encodeInboxRecord(zoned)
+	zonedBytes, _, err := encodeInboxRecord(zoned)
 	if err != nil {
 		t.Fatalf("encodeInboxRecord(zoned): %v", err)
 	}
-	utcBytes, err := encodeInboxRecord(testInboxRecord())
+	utcBytes, _, err := encodeInboxRecord(testInboxRecord())
 	if err != nil {
 		t.Fatalf("encodeInboxRecord(utc): %v", err)
 	}
@@ -397,6 +265,45 @@ func TestInboxRecordCanonicalizesEveryTimestampToUTC(t *testing.T) {
 		if instant.Location() != time.UTC {
 			t.Fatalf("%s decoded in %v, want UTC", name, instant.Location())
 		}
+	}
+}
+
+// TestEncodeInboxRecordReturnsTheCanonicalRecord makes the second return value
+// load-bearing. Admission compares a candidate against a STORED record, which
+// is always canonical because it comes back through the decoder; comparing the
+// caller's raw request instead would compare two different normal forms, and
+// today that is invisible only because the one content normalization is
+// nil-versus-empty payload. This pins that what encode hands back is the form
+// the stored bytes are in, so the comparison cannot drift when a second
+// normalization is added.
+func TestEncodeInboxRecordReturnsTheCanonicalRecord(t *testing.T) {
+	t.Parallel()
+
+	zone := time.FixedZone("elsewhere", -(11*3600 + 30*60))
+	raw := testInboxRecord()
+	raw.Payload = []byte{}
+	raw.AcceptedAt = raw.AcceptedAt.In(zone)
+	raw.ApplyDeadline = raw.ApplyDeadline.In(zone)
+
+	encoded, canonical, err := encodeInboxRecord(raw)
+	if err != nil {
+		t.Fatalf("encodeInboxRecord: %v", err)
+	}
+	if canonical.Payload != nil {
+		t.Fatalf("canonical payload = %q, want nil: an empty inline body has one spelling", canonical.Payload)
+	}
+	if canonical.AcceptedAt.Location() != time.UTC || canonical.ApplyDeadline.Location() != time.UTC {
+		t.Fatalf("canonical timestamps are in %v/%v, want UTC",
+			canonical.AcceptedAt.Location(), canonical.ApplyDeadline.Location())
+	}
+	// The decisive property: what encode returns is what a decode of its bytes
+	// produces, so a comparison against either reaches the same answer.
+	decoded, err := decodeInboxRecord(encoded)
+	if err != nil {
+		t.Fatalf("decodeInboxRecord: %v", err)
+	}
+	if !decoded.sameCommandAs(canonical) || !decoded.AcceptedAt.Equal(canonical.AcceptedAt) {
+		t.Fatalf("encode returned a record a decode of its own bytes disagrees with:\n%+v\n%+v", canonical, decoded)
 	}
 }
 
@@ -460,7 +367,7 @@ func TestInboxRecordRejectsInvalidMembers(t *testing.T) {
 
 			record := testInboxRecord()
 			test.mutate(&record)
-			encoded, err := encodeInboxRecord(record)
+			encoded, _, err := encodeInboxRecord(record)
 			if encoded != nil {
 				t.Fatalf("encoded an invalid record: %s", encoded)
 			}
@@ -475,7 +382,7 @@ func TestInboxRecordRejectsInvalidMembers(t *testing.T) {
 func TestInboxRecordDecodeFailsClosed(t *testing.T) {
 	t.Parallel()
 
-	valid, err := encodeInboxRecord(testInboxRecord())
+	valid, _, err := encodeInboxRecord(testInboxRecord())
 	if err != nil {
 		t.Fatalf("encodeInboxRecord: %v", err)
 	}
@@ -543,7 +450,7 @@ func TestInboxRecordAtItsPayloadCeilingEncodes(t *testing.T) {
 
 	record := testInboxRecord()
 	record.Payload = bytes.Repeat([]byte{'x'}, MaxInboxPayloadBytes)
-	encoded, err := encodeInboxRecord(record)
+	encoded, _, err := encodeInboxRecord(record)
 	if err != nil {
 		t.Fatalf("a record at the payload ceiling does not encode: %v", err)
 	}
@@ -572,7 +479,7 @@ func TestInboxRecordRefusesARecordAboveTheStoredBound(t *testing.T) {
 		Code:    sessionwire.ErrorCodeCommandRejected,
 		Message: strings.Repeat("m", MaxInboxRecordBytes),
 	}
-	encoded, err := encodeInboxRecord(record)
+	encoded, _, err := encodeInboxRecord(record)
 	if encoded != nil {
 		t.Fatal("encoded a record above the stored bound")
 	}
@@ -730,7 +637,7 @@ func TestAdmitCommandRejectsADuplicateWithDifferentCommandData(t *testing.T) {
 			if entry.Record.CommandID != "" {
 				t.Fatalf("a refused admission returned a record: %+v", entry.Record)
 			}
-			assertInboxCode(t, err, InboxErrorConflict)
+			assertInboxCode(t, err, InboxErrorCommandMismatch)
 
 			// The stored command is the winner's, untouched.
 			stored, created, err := store.AdmitCommand(context.Background(), testAdmitRequest())
@@ -764,7 +671,7 @@ func TestAdmitCommandRejectsADuplicateWithADifferentPayloadReference(t *testing.
 	if created {
 		t.Fatal("a command id reused for another object body reported a fresh acceptance")
 	}
-	assertInboxCode(t, err, InboxErrorConflict)
+	assertInboxCode(t, err, InboxErrorCommandMismatch)
 
 	// And the same reference is a plain retry.
 	entry, created, err := store.AdmitCommand(context.Background(), referenced)
@@ -839,7 +746,7 @@ func TestAdmitCommandDuplicateSucceedsAfterTheCommandProgressed(t *testing.T) {
 	applied := first.Record
 	applied.State = InboxStateApplied
 	applied.Result = CommandResult{CompletedAt: inboxAcceptedAt, EventID: "event-9", JournalSeq: 9}
-	value, err := encodeInboxRecord(applied)
+	value, _, err := encodeInboxRecord(applied)
 	if err != nil {
 		t.Fatalf("encodeInboxRecord: %v", err)
 	}
@@ -916,13 +823,13 @@ func TestAdmitCommandReportsSparseProviderOrdersVerbatim(t *testing.T) {
 	t.Parallel()
 
 	base := memstore.New()
-	refiling := &refilingOrdered{OrderedIndex: base.OrderedIndex}
-	base.OrderedIndex = refiling
+	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = hostile
 	store := openStore(t, base)
 
 	orders := []uint64{5_000, 9_223_372_036_854_775_807}
 	next := 0
-	refiling.refile(func(record storage.OrderedRecord) storage.OrderedRecord {
+	hostile.refileCreates(func(record storage.OrderedRecord) storage.OrderedRecord {
 		if next < len(orders) {
 			record.Order = orders[next]
 			next++
@@ -1115,7 +1022,7 @@ func TestAdmitCommandKeepsThePayloadPrivate(t *testing.T) {
 	conflicting := req
 	conflicting.Payload = []byte("other")
 	_, _, err := store.AdmitCommand(context.Background(), conflicting)
-	assertInboxCode(t, err, InboxErrorConflict)
+	assertInboxCode(t, err, InboxErrorCommandMismatch)
 	if strings.Contains(err.Error(), string(secret)) || strings.Contains(err.Error(), "other") {
 		t.Fatalf("an inbox failure quoted a private payload: %v", err)
 	}
@@ -1399,10 +1306,7 @@ func TestAdmitCommandHoldsTheProviderToTheRecordsOwnFiling(t *testing.T) {
 				// says otherwise.
 				record := testInboxRecord()
 				record.SessionID = "session-elsewhere"
-				record.State = InboxStatePending
-				record.Claim = CommandClaim{}
-				record.Result = CommandResult{}
-				value, err := encodeInboxRecord(record)
+				value, _, err := encodeInboxRecord(record)
 				if err != nil {
 					panic(err)
 				}
@@ -1417,10 +1321,24 @@ func TestAdmitCommandHoldsTheProviderToTheRecordsOwnFiling(t *testing.T) {
 			t.Parallel()
 
 			base := memstore.New()
-			refiling := &refilingOrdered{OrderedIndex: base.OrderedIndex}
-			base.OrderedIndex = refiling
+			hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+			base.OrderedIndex = hostile
 			store := openStore(t, base)
-			refiling.refile(test.refile)
+
+			// The command is admitted for real first, so every case runs on the
+			// RETRY path. That is deliberate on two counts. It is the only
+			// contract-legal route to the tombstone case — Create returns an
+			// existing or tombstoned identity as a RECORD with created false,
+			// never as a created one, so a created tombstone is a reply no
+			// conforming provider can produce and a subtest resting on it would
+			// exercise an unreachable state. And it is the path where a
+			// misfiled reply is most consequential: the bytes are the WINNER's
+			// record rather than ours, so these checks are the only thing
+			// between a retrying caller and another session's command handed
+			// back under its own key. The created path has its own, stronger
+			// check — see TestAdmitCommandHoldsACreatedReplyToTheBytesItSent.
+			mustAdmit(t, store, testAdmitRequest())
+			hostile.refileCreates(test.refile)
 
 			_, created, err := store.AdmitCommand(context.Background(), testAdmitRequest())
 			if created {
@@ -1434,24 +1352,16 @@ func TestAdmitCommandHoldsTheProviderToTheRecordsOwnFiling(t *testing.T) {
 	}
 }
 
-// TestAdmitCommandHoldsACreatedReplyToTheBytesItSent closes the created path,
-// which every other filing check leaves open. Those checks hold the reply's
-// IDENTITY, scope, due state and order to the record's own bytes — but the
-// bytes themselves are only ever compared on the duplicate path, where the
-// answer is the winner's and content is all that can be compared.
-//
-// On the created path the provider is asserting something stronger: that it
-// stored the bytes THIS call handed it. Nothing checked that, so a provider
-// could answer created=true with another command's content and a caller would
-// be handed a runtime mapping it never proposed, labelled as its own fresh
-// acceptance — exactly the outcome the winner rule exists to prevent, arriving
-// from the one direction that was unchecked.
+// TestAdmitCommandHoldsACreatedReplyToTheBytesItSent catches what no filing
+// check can: a reply that satisfies every identity, scope, due and order check
+// because it carries our identity, and carries somebody else's CONTENT under
+// created=true. The reasoning is on AdmitCommand's created branch.
 func TestAdmitCommandHoldsACreatedReplyToTheBytesItSent(t *testing.T) {
 	t.Parallel()
 
 	base := memstore.New()
-	refiling := &refilingOrdered{OrderedIndex: base.OrderedIndex}
-	base.OrderedIndex = refiling
+	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = hostile
 	store := openStore(t, base)
 
 	// Same identity, same timestamps, same pending state — so every identity,
@@ -1467,11 +1377,11 @@ func TestAdmitCommandHoldsACreatedReplyToTheBytesItSent(t *testing.T) {
 		ApplyDeadline:    inboxDeadline,
 		State:            InboxStatePending,
 	}
-	value, err := encodeInboxRecord(substitute)
+	value, _, err := encodeInboxRecord(substitute)
 	if err != nil {
 		t.Fatalf("encodeInboxRecord: %v", err)
 	}
-	refiling.refile(func(r storage.OrderedRecord) storage.OrderedRecord {
+	hostile.refileCreates(func(r storage.OrderedRecord) storage.OrderedRecord {
 		r.Value = value
 		return r
 	})
@@ -1491,8 +1401,8 @@ func TestAdmitCommandAcceptsATerminalRecordFiledNotDue(t *testing.T) {
 	t.Parallel()
 
 	base := memstore.New()
-	refiling := &refilingOrdered{OrderedIndex: base.OrderedIndex}
-	base.OrderedIndex = refiling
+	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = hostile
 	store := openStore(t, base)
 
 	// The command is admitted for real first, so what follows is the RETRY
@@ -1504,11 +1414,11 @@ func TestAdmitCommandAcceptsATerminalRecordFiledNotDue(t *testing.T) {
 	mustAdmit(t, store, testAdmitRequest())
 
 	terminal := testInboxRecord()
-	value, err := encodeInboxRecord(terminal)
+	value, _, err := encodeInboxRecord(terminal)
 	if err != nil {
 		t.Fatalf("encodeInboxRecord: %v", err)
 	}
-	refiling.refile(func(r storage.OrderedRecord) storage.OrderedRecord {
+	hostile.refileCreates(func(r storage.OrderedRecord) storage.OrderedRecord {
 		r.Value = value
 		r.Due = storage.Due{}
 		return r
@@ -1543,10 +1453,10 @@ func TestAdmitCommandClassifiesProviderFailures(t *testing.T) {
 			t.Parallel()
 
 			base := memstore.New()
-			refiling := &refilingOrdered{OrderedIndex: base.OrderedIndex}
-			base.OrderedIndex = refiling
+			hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+			base.OrderedIndex = hostile
 			store := openStore(t, base)
-			refiling.failCreate(test.err)
+			hostile.failCreates(test.err)
 
 			_, created, err := store.AdmitCommand(context.Background(), testAdmitRequest())
 			if created {

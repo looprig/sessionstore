@@ -282,8 +282,12 @@ func (s *Store) AdmitCommand(ctx context.Context, req AdmitCommandRequest) (Inbo
 		State:            InboxStatePending,
 	}
 	// Encoding validates, so an invalid request is refused before any provider
-	// work — including before the session's witnesses are bound.
-	value, err := encodeInboxRecord(record)
+	// work — including before the session's witnesses are bound. Everything
+	// after this point uses the CANONICAL record it returns rather than the
+	// request-shaped one built above: the due state filed and the content
+	// compared against a stored record must both be derived from the same
+	// normal form the stored bytes are in.
+	value, candidate, err := encodeInboxRecord(record)
 	if err != nil {
 		return InboxEntry{}, false, err
 	}
@@ -301,7 +305,7 @@ func (s *Store) AdmitCommand(ctx context.Context, req AdmitCommandRequest) (Inbo
 		return InboxEntry{}, false, err
 	}
 	stored, created, err := s.backend.OrderedIndex.Create(
-		opCtx, inboxID(scope, req.CommandID), scope.SessionNamespace, value, storage.Rank{}, inboxDue(record))
+		opCtx, inboxID(scope, req.CommandID), scope.SessionNamespace, value, storage.Rank{}, inboxDue(candidate))
 	if err != nil {
 		return InboxEntry{}, false, classifyInboxOrderedError(err, "create")
 	}
@@ -334,8 +338,8 @@ func (s *Store) AdmitCommand(ctx context.Context, req AdmitCommandRequest) (Inbo
 		}
 		return entry, true, nil
 	}
-	if !entry.Record.sameCommandAs(record) {
-		return InboxEntry{}, false, inboxErr(InboxErrorConflict, "command", nil)
+	if !entry.Record.sameCommandAs(candidate) {
+		return InboxEntry{}, false, inboxErr(InboxErrorCommandMismatch, "command", nil)
 	}
 	return entry, false, nil
 }
@@ -348,7 +352,22 @@ func (s *Store) AdmitCommand(ctx context.Context, req AdmitCommandRequest) (Inbo
 //
 // bytes.Equal treats a nil payload and an empty one as equal, which is the same
 // normalization canonicalInboxRecord applies, so a caller cannot make two
-// spellings of "no inline body" look like a conflict.
+// spellings of "no inline body" look like a mismatch.
+//
+// CARRY-FORWARD CONTRACT, the dual of AdmitCommand's exclusion list: THE
+// MEMBERS COMPARED HERE ARE IMMUTABLE FOR THE LIFE OF THE RECORD. A retry
+// arrives with the command the caller originally sent, and it is compared
+// against whatever the record holds NOW, so clearing or rewriting Kind, Payload
+// or PayloadRef after acceptance makes every subsequent retry a permanent
+// InboxErrorCommandMismatch — telling a caller, incorrectly and forever, that
+// it reused a command id for a different command.
+//
+// This file supplies the motive to break it: MaxInboxPayloadBytes calls the
+// inbox a control record rather than a blob store, which makes emptying an
+// applied command's 64 KiB body the obvious housekeeping move. It is not
+// available. A body that needs reclaiming has to be behind a PayloadRef whose
+// VALUE stays stable while the object it names is collected, so the compared
+// member never changes even though the bytes it points at are gone.
 func (r InboxRecord) sameCommandAs(other InboxRecord) bool {
 	return r.Kind == other.Kind &&
 		bytes.Equal(r.Payload, other.Payload) &&
@@ -393,6 +412,21 @@ func inboxID(scope sessionScope, command sessionwire.CommandID) storage.OrderedI
 // holds a stored row to its own bytes needs the same derivation, and a terminal
 // record filed not-due by a later task's CAS would otherwise be reported as
 // misfiled by every retry that met it.
+//
+// CARRY-FORWARD CONTRACT for every later writer: FILE Due EXACTLY AS THIS
+// FUNCTION DERIVES IT FROM THE RECORD. That is not a style rule. inboxEntryFor
+// compares the stored due state against this derivation on every read, so a due
+// state that is a function of the OPERATION rather than of the record makes
+// every concurrent retry of that command fail with InboxErrorIdentity("due") —
+// a code documented as one no retry of the caller's can fix, handed to a caller
+// doing the one thing the retry contract exists for.
+//
+// The trap is specific and it is the natural design: reclaiming an abandoned
+// claim wants the command due at its CLAIM EXPIRY rather than at its apply
+// deadline, and filing it that way is a permanent blinding rather than a bug
+// that shows up under load. A reclaim horizon must therefore be carried in the
+// record's own members and FOLDED INTO this derivation — so that a reader can
+// still rebuild the due state from the bytes alone — never filed beside it.
 func inboxDue(record InboxRecord) storage.Due {
 	if record.State.terminal() {
 		return storage.Due{}
@@ -533,10 +567,19 @@ type commandResultWire struct {
 // encodeInboxRecord validates and encodes one command record. It refuses a
 // record above the inbox bound here rather than letting the provider refuse it,
 // so a record this package accepted can always be rewritten.
-func encodeInboxRecord(record InboxRecord) ([]byte, error) {
+//
+// It returns the CANONICAL record beside the bytes, and callers that go on to
+// compare a candidate against a stored record must use it. A stored record is
+// always canonical — it comes back through the decoder, which ends in the same
+// canonicalization — so comparing a stored record against a caller's raw
+// request would be comparing two different normal forms. That is safe today
+// only because the one content normalization is nil-versus-empty payload, which
+// bytes.Equal absorbs; returning the canonical form makes the coupling
+// impossible to break rather than merely currently unbroken.
+func encodeInboxRecord(record InboxRecord) ([]byte, InboxRecord, error) {
 	record, err := canonicalInboxRecord(record)
 	if err != nil {
-		return nil, err
+		return nil, InboxRecord{}, err
 	}
 	wire := inboxWire{
 		RecordVersion:    InboxRecordVersion,
@@ -567,12 +610,12 @@ func encodeInboxRecord(record InboxRecord) ([]byte, error) {
 	}
 	encoded, err := json.Marshal(wire)
 	if err != nil {
-		return nil, inboxErr(InboxErrorInvalid, "record", err)
+		return nil, InboxRecord{}, inboxErr(InboxErrorInvalid, "record", err)
 	}
 	if len(encoded) > MaxInboxRecordBytes {
-		return nil, inboxErr(InboxErrorTooLarge, "record", nil)
+		return nil, InboxRecord{}, inboxErr(InboxErrorTooLarge, "record", nil)
 	}
-	return encoded, nil
+	return encoded, record, nil
 }
 
 // decodeInboxRecord strictly decodes one stored command record. It checks the

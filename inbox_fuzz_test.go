@@ -25,7 +25,7 @@ import (
 // terminal one must be due at no time at all.
 func FuzzInboxRecordCodec(f *testing.F) {
 	seed := func(record InboxRecord) []byte {
-		encoded, err := encodeInboxRecord(record)
+		encoded, _, err := encodeInboxRecord(record)
 		if err != nil {
 			f.Fatalf("seed does not encode: %v", err)
 		}
@@ -109,7 +109,7 @@ func FuzzInboxRecordCodec(f *testing.F) {
 		if err != nil {
 			return
 		}
-		encoded, err := encodeInboxRecord(record)
+		encoded, _, err := encodeInboxRecord(record)
 		if err != nil {
 			t.Fatalf("accepted a record that does not re-encode: %v", err)
 		}
@@ -126,7 +126,7 @@ func FuzzInboxRecordCodec(f *testing.F) {
 		if err != nil {
 			t.Fatalf("canonical form does not decode: %v", err)
 		}
-		reencoded, err := encodeInboxRecord(again)
+		reencoded, _, err := encodeInboxRecord(again)
 		if err != nil {
 			t.Fatalf("canonical form does not re-encode: %v", err)
 		}
