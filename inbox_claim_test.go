@@ -1269,6 +1269,18 @@ func TestTransitionRefusesAnUnknownIdentity(t *testing.T) {
 		t.Fatalf("error = %T %v, want *InvalidIdentityError", err, err)
 	}
 	assertInboxUnchanged(t, store, admitted)
+
+	// The correlation query derives the same scope and must answer the same
+	// way. It is driven here rather than in the malformed-request table because
+	// the failure belongs to the shared derivation and carries its type, not
+	// the inbox's.
+	_, err := store.FindCommandApplication(context.Background(), FindCommandApplicationRequest{
+		TenantID:  admitted.Record.TenantID,
+		CommandID: admitted.Record.CommandID,
+	})
+	if !errors.As(err, new(*InvalidIdentityError)) {
+		t.Fatalf("error = %T %v, want *InvalidIdentityError", err, err)
+	}
 }
 
 // --- reading, and what a missing record says -------------------------------

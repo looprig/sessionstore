@@ -241,14 +241,18 @@ func (o CommandApplicationOutcome) precedence() int {
 // stream; the epochs are session lease epochs.
 //
 // CapturedTip is the tip the correlation was taken at, and it exists to say how
-// long the answer is good for. The answer is: NO OUTCOME IS STABLE ACROSS TIPS.
-// Every one of the five can be superseded by a record written after the walk,
-// and the transitions are ordinary rather than exotic — absent becomes
-// committed when the applier commits its prefix and effect a moment later,
-// abandoned becomes committed when a later lease retries the application to
-// completion, and committed becomes conflicted when a prefix breaking the
-// mapping appears anywhere later in the stream. Two of the three are what this
+// long the answer is good for. The answer is: FOUR OF THE FIVE OUTCOMES ARE NOT
+// STABLE ACROSS TIPS, and the transitions are ordinary rather than exotic —
+// absent becomes committed when the applier commits its prefix and effect a
+// moment later, abandoned becomes committed when a later lease retries the
+// application to completion, unresolved becomes either as soon as one more
+// record lands, and committed becomes conflicted when a prefix breaking the
+// mapping appears anywhere later in the stream. Two of those are what this
 // package's own tests do on purpose.
+//
+// Only CONFLICTED cannot be superseded, because nothing outranks a broken
+// mapping in precedence, which is also why it is the one finding an operator
+// can act on without re-reading.
 //
 // What IS monotone is not an outcome but a pair of NEGATIVE facts, and they are
 // exactly the two a settlement rests on:
@@ -454,6 +458,7 @@ func (s *Store) scanCommandApplication(
 
 	var pending *correlatedPrefix
 	prefixBefore := false
+	last := uint64(0)
 	for {
 		stored, err := cursor.Next(ctx)
 		if errors.Is(err, io.EOF) {
@@ -462,13 +467,18 @@ func (s *Store) scanCommandApplication(
 		if err != nil {
 			return CommandApplication{}, journalErr(JournalErrorBackend, "read", err)
 		}
-		// The walk stops at the tip it captured, so a record committed while
-		// it was walking is not evidence: the answer is true of a snapshot the
-		// caller is told the boundary of. Without it a correlation could report
-		// an effect that landed after the decision it is feeding was made.
+		// The walk stops at the tip it captured, so a record committed while it
+		// was walking is not evidence: the answer is true of a snapshot the
+		// caller is told the boundary of. Without this a correlation could
+		// report an effect that landed after the decision it is feeding was
+		// made, or — from a provider that skips a sequence — one at a position
+		// the captured journal does not contain. Both are wrong POSITIVES,
+		// which is why the record is refused before it is looked at rather
+		// than after.
 		if stored.Seq > tip {
 			break
 		}
+		last = stored.Seq
 		env, err := DecodeEnvelope(stored.Payload)
 		if err != nil {
 			return CommandApplication{}, journalErr(JournalErrorIntegrity, "record", err)
@@ -504,6 +514,31 @@ func (s *Store) scanCommandApplication(
 		if stored.Seq == tip {
 			break
 		}
+	}
+	// The walk must have REACHED its bound, which together with the refusal
+	// above is one invariant: THE WALK OBSERVED EVERY SEQUENCE THROUGH THE TIP
+	// IT CAPTURED, and anything else is a stream this store cannot draw a
+	// conclusion from.
+	//
+	// The two halves catch opposite errors and this one matters more. A record
+	// past the tip is a wrong POSITIVE — an effect attributed at a position the
+	// captured journal does not contain — and refusing it leaves the walk short
+	// of its bound, so it arrives here too. A stream that ends EARLY is a wrong
+	// NEGATIVE: the walk finds no prefix and reports ABSENT, the single outcome
+	// that admits a rejection, so a command whose effect is durable is settled
+	// over. It is also the fault that announces itself as success, since a
+	// drained cursor is how every honest walk finishes, and nothing else in
+	// this function would notice it.
+	//
+	// Like its mirror it is unreachable through a conforming provider — storage
+	// documents sequences as dense and a cursor as observing the tip as of
+	// Read, which is taken after the tip above — and that is exactly why it is
+	// stated rather than assumed. The condition is on the TAIL rather than on a
+	// count or on the first sequence seen, so it stays correct if the ledger
+	// ever gains front trimming: what a decision needs is every record up to
+	// the tip it captured, not every record that ever existed.
+	if last < tip {
+		return CommandApplication{}, journalErr(JournalErrorIntegrity, "read", nil)
 	}
 	// A prefix at the tip has no record after it to say what became of it, and
 	// its writer may be about to append one.

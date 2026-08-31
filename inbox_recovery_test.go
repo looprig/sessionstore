@@ -5,6 +5,7 @@ package sessionstore
 import (
 	"context"
 	"errors"
+	"io"
 	"slices"
 	"strings"
 	"sync"
@@ -1106,21 +1107,49 @@ func TestCorrelationFailsClosedOnAProviderFault(t *testing.T) {
 	t.Parallel()
 
 	faulty := errors.New("provider is unwell")
-	tests := map[string]func(scripted *scriptedLedger){
-		"the tip cannot be read": func(scripted *scriptedLedger) {
-			scripted.tipErr = faulty
+	tests := map[string]struct {
+		script func(scripted *scriptedLedger)
+		want   JournalErrorCode
+		// cause is the provider failure the answer must still carry, and is nil
+		// for a fault the store DETECTS rather than one it is handed.
+		cause error
+	}{
+		"the tip cannot be read": {
+			script: func(scripted *scriptedLedger) { scripted.tipErr = faulty },
+			want:   JournalErrorBackend, cause: faulty,
 		},
-		"the stream cannot be opened": func(scripted *scriptedLedger) {
-			scripted.readFn = func(uint64) (bool, storage.Cursor, error) { return true, nil, faulty }
+		"the stream cannot be opened": {
+			script: func(scripted *scriptedLedger) {
+				scripted.readFn = func(uint64) (bool, storage.Cursor, error) { return true, nil, faulty }
+			},
+			want: JournalErrorBackend, cause: faulty,
 		},
-		"the walk fails partway": func(scripted *scriptedLedger) {
-			scripted.onCursor = func(cursor storage.Cursor) storage.Cursor {
-				return &scriptedCursor{Cursor: cursor, fail: faulty}
-			}
+		"the walk fails partway": {
+			script: func(scripted *scriptedLedger) {
+				scripted.onCursor = func(cursor storage.Cursor) storage.Cursor {
+					return &scriptedCursor{Cursor: cursor, fail: faulty}
+				}
+			},
+			want: JournalErrorBackend, cause: faulty,
+		},
+		// The stream ENDS EARLY, which is the fault that announces itself as
+		// success: a drained cursor is how every honest walk finishes, so a
+		// truncated one produces a well-formed correlation over a prefix of the
+		// journal. The direction it fails in is what makes it the worst of the
+		// four — a partial walk finds no prefix and reports ABSENT, the single
+		// outcome that admits a rejection, so a command whose effect is durable
+		// would be settled over.
+		"the stream ends before the captured tip": {
+			script: func(scripted *scriptedLedger) {
+				scripted.onCursor = func(cursor storage.Cursor) storage.Cursor {
+					return &scriptedCursor{Cursor: cursor, fail: io.EOF}
+				}
+			},
+			want: JournalErrorIntegrity,
 		},
 	}
 
-	for name, script := range tests {
+	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 
@@ -1128,8 +1157,15 @@ func TestCorrelationFailsClosedOnAProviderFault(t *testing.T) {
 			scripted := &scriptedLedger{Ledger: base.Ledger}
 			base.Ledger = scripted
 			store, _, admitted := inboxFixture(t, base)
-			craftJournal(t, store, openingFence(5))
-			script(scripted)
+			// The journal holds a COMMITTED application, so every row here is a
+			// case where the honest answer is "this command was applied" and
+			// the faulty one must not be "nothing was".
+			craftJournal(t, store,
+				openingFence(5),
+				stampedPrefix(5, inboxCommand, inboxRuntime, inboxKind),
+				publicEvent("event-effect", `{"applied":true}`),
+			)
+			test.script(scripted)
 
 			request := FindCommandApplicationRequest{
 				TenantID:  admitted.Record.TenantID,
@@ -1138,18 +1174,18 @@ func TestCorrelationFailsClosedOnAProviderFault(t *testing.T) {
 			}
 			_, err := store.FindCommandApplication(context.Background(), request)
 			var journal *JournalError
-			if !errors.As(err, &journal) || journal.Code != JournalErrorBackend {
-				t.Fatalf("FindCommandApplication = %v, want a journal backend failure", err)
+			if !errors.As(err, &journal) || journal.Code != test.want {
+				t.Fatalf("FindCommandApplication = %v, want a journal %s failure", err, test.want)
 			}
-			if !errors.Is(err, faulty) {
+			if test.cause != nil && !errors.Is(err, test.cause) {
 				t.Fatalf("the provider cause was not preserved: %v", err)
 			}
 
 			// And the settlement it gates refuses with it rather than
 			// proceeding on an answer nobody produced.
 			_, err = store.RejectCommand(context.Background(), testRejectRequest(admitted, 0))
-			if !errors.As(err, &journal) || journal.Code != JournalErrorBackend {
-				t.Fatalf("RejectCommand = %v, want a journal backend failure", err)
+			if !errors.As(err, &journal) || journal.Code != test.want {
+				t.Fatalf("RejectCommand = %v, want a journal %s failure", err, test.want)
 			}
 			assertInboxUnchanged(t, store, admitted)
 		})
@@ -1179,9 +1215,15 @@ func TestCorrelationReportsAnUnknownCommand(t *testing.T) {
 // other side. Stopping AT the tip means a conforming ledger never offers a
 // record past it, so the refusal above that stop can only be reached by a
 // provider that hands one back anyway — a gap in a stream storage documents as
-// dense. The refusal is what keeps the walk's own snapshot authoritative: a
-// reader that took the record would attribute an effect to this command at a
-// sequence its captured journal does not contain.
+// dense.
+//
+// The refusal is what keeps the walk's own snapshot authoritative, and the
+// answer it produces is the same INTEGRITY failure a truncated stream produces,
+// because a provider that skipped a sequence has also failed to deliver the
+// records the decision needs. That single answer is the point: without the
+// refusal the walk would take the displaced record and report COMMITTED with an
+// effect at a sequence the captured journal does not contain, which is a wrong
+// positive dressed as evidence.
 func TestCorrelationRefusesARecordBeyondTheCapturedTip(t *testing.T) {
 	t.Parallel()
 
@@ -1215,13 +1257,26 @@ func TestCorrelationRefusesARecordBeyondTheCapturedTip(t *testing.T) {
 	}
 
 	displace.Store(true)
-	app := mustFindApplication(t, store, admitted)
-	if app.Outcome != CommandApplicationUnresolved {
-		t.Fatalf("outcome = %q, want %q: a record past the captured tip was taken as evidence", app.Outcome, CommandApplicationUnresolved)
+	got, err := store.FindCommandApplication(context.Background(), FindCommandApplicationRequest{
+		TenantID:  admitted.Record.TenantID,
+		SessionID: admitted.Record.SessionID,
+		CommandID: admitted.Record.CommandID,
+	})
+	var journal *JournalError
+	if !errors.As(err, &journal) || journal.Code != JournalErrorIntegrity {
+		t.Fatalf("correlation = %+v, %v; want a journal integrity failure", got, err)
 	}
-	if app.EffectSeq != 0 {
-		t.Fatalf("effect seq = %d, which the captured journal does not contain", app.EffectSeq)
+	if got.Outcome != "" {
+		t.Fatalf("a refused walk still reported %q", got.Outcome)
 	}
+
+	// And the settlement it gates refuses with it rather than acting on a
+	// snapshot the walk could not read through.
+	_, err = store.RejectCommand(context.Background(), testRejectRequest(admitted, 0))
+	if !errors.As(err, &journal) || journal.Code != JournalErrorIntegrity {
+		t.Fatalf("RejectCommand = %v, want a journal integrity failure", err)
+	}
+	assertInboxUnchanged(t, store, admitted)
 }
 
 // TestCorrelationStopsAtTheTipItCaptured is the snapshot boundary. A record
