@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,35 +17,6 @@ import (
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
-
-// loggingOrdered records the ordered-index calls one operation makes into the
-// SAME log the ledger records into. Two logs could not answer the question this
-// file asks — whether the journal was consulted before or after the record was
-// written — because interleaving two independent sequences is exactly what a
-// single log is for.
-type loggingOrdered struct {
-	storage.OrderedIndex
-	log *callLog
-}
-
-func (o *loggingOrdered) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
-	o.log.add("ordered:get")
-	return o.OrderedIndex.Get(ctx, id)
-}
-
-func (o *loggingOrdered) Update(
-	ctx context.Context,
-	id storage.OrderedID,
-	expectedRevision uint64,
-	value []byte,
-	rank storage.Rank,
-	due storage.Due,
-) (storage.OrderedRecord, error) {
-	o.log.add("ordered:update")
-	return o.OrderedIndex.Update(ctx, id, expectedRevision, value, rank, due)
-}
-
-var _ storage.OrderedIndex = (*loggingOrdered)(nil)
 
 // --- fixtures --------------------------------------------------------------
 
@@ -115,27 +87,27 @@ func mustFindApplication(t *testing.T, store *Store, entry InboxEntry) CommandAp
 // session's stream, because the claim epoch and the journal grant epoch are the
 // same lease.
 type applyingCommand struct {
-	store   *Store
-	clock   *movableClock
-	entry   InboxEntry
-	writer  *JournalWriter
-	epoch   uint64
-	backend *storage.Composite
+	store  *Store
+	clock  *movableClock
+	entry  InboxEntry
+	writer *JournalWriter
+	epoch  uint64
 }
 
 func startApplying(t *testing.T, backend *storage.Composite) *applyingCommand {
 	t.Helper()
 	store, clock, admitted := inboxFixture(t, backend)
+	return continueApplying(t, store, clock, admitted)
+}
+
+// continueApplying is startApplying over a store a test has already touched,
+// which is what lets one take a journal grant of its own first so the applying
+// claim sits above a real, superseded epoch rather than above zero.
+func continueApplying(t *testing.T, store *Store, clock *movableClock, admitted InboxEntry) *applyingCommand {
+	t.Helper()
 	writer := openRecoveryJournal(t, store)
 	applying := mustBeginApplying(t, store, mustClaim(t, store, admitted, writer.Epoch()), writer.Epoch())
-	return &applyingCommand{
-		store:   store,
-		clock:   clock,
-		entry:   applying,
-		writer:  writer,
-		epoch:   writer.Epoch(),
-		backend: backend,
-	}
+	return &applyingCommand{store: store, clock: clock, entry: applying, writer: writer, epoch: writer.Epoch()}
 }
 
 // supersede closes the applying writer and opens the next one, which commits an
@@ -798,6 +770,55 @@ func TestAMappingThatIsNotARuntimeUUIDCorrelatesWithNothing(t *testing.T) {
 	}
 }
 
+// TestAPrefixIsACommitmentToAppendTheEffect walks the window a Host lands in
+// when its prefix commits and its EFFECT APPEND THEN FAILS, which is the one
+// case where the store refuses the safe answer and accepts the unsafe one.
+//
+// The refusal is correct in isolation — a prefix with nothing after it is
+// UNRESOLVED, and the writer may still be about to append — but the caller
+// meeting it is the one writer that knows it will not. It cannot say so, and
+// nothing checks a SAME-EPOCH result against the journal, so the move the store
+// leaves easiest is the one that must not be made: completing over a fabricated
+// event. This test pins the expensive route that is correct instead, because
+// prose describing an escape route nobody has driven is prose.
+func TestAPrefixIsACommitmentToAppendTheEffect(t *testing.T) {
+	t.Parallel()
+
+	fixture := startApplying(t, memstore.New())
+	mustAppend(t, fixture.writer, applicationPrefix(inboxCommand, inboxRuntime, inboxKind))
+
+	// The effect append failed. The claim is live and the prefix is durable, so
+	// the writer that knows the application is dead cannot say so.
+	_, err := fixture.rejectAs(fixture.epoch)
+	if got := assertInboxCode(t, err, InboxErrorEvidence); got.Field != "application" {
+		t.Fatalf("field = %q, want %q", got.Field, "application")
+	}
+
+	// Dropping the grant and reopening writes the fence at prefix+1, which
+	// turns its own unfinished application into ABANDONED.
+	successor := fixture.supersede(t)
+	app := mustFindApplication(t, fixture.store, fixture.entry)
+	if app.Outcome != CommandApplicationAbandoned {
+		t.Fatalf("outcome = %q, want %q", app.Outcome, CommandApplicationAbandoned)
+	}
+
+	// That is still not enough. The claim this writer took when it entered
+	// applying is live and cannot be renewed or shortened, so the successor is
+	// held off until it lapses — the wait is that claim's own expiry, which
+	// BeginApplyingCommand fixed irreversibly and MaxCommandClaimTTL bounds.
+	_, err = fixture.rejectAs(successor)
+	assertInboxCode(t, err, InboxErrorClaimHeld)
+
+	fixture.clock.set(inboxClaimLapsed)
+	rejected, err := fixture.rejectAs(successor)
+	if err != nil {
+		t.Fatalf("the documented route out of a failed effect append does not work: %v", err)
+	}
+	if rejected.Record.State != InboxStateRejected {
+		t.Fatalf("state = %q, want %q", rejected.Record.State, InboxStateRejected)
+	}
+}
+
 // TestASuccessorCannotResumeAnAbandonedApplication pins the mitigation the
 // writer obligation rests on: the store offers a re-attached Host no route back
 // into an application its predecessor started. It may finish one on evidence or
@@ -806,23 +827,57 @@ func TestAMappingThatIsNotARuntimeUUIDCorrelatesWithNothing(t *testing.T) {
 func TestASuccessorCannotResumeAnAbandonedApplication(t *testing.T) {
 	t.Parallel()
 
-	fixture := startApplying(t, memstore.New())
-	successor := fixture.supersede(t)
-	fixture.clock.set(inboxClaimLapsed)
+	// Every epoch class is driven, because the claim is not "a successor is
+	// refused" but "the STATE gate decides, before any epoch rule runs". One
+	// row would pass just as well if the answer came from the claim fence, and
+	// would keep passing if the two guards were reordered.
+	// Each row builds its own fixture, because a SUPERSEDED epoch has to be a
+	// real one below the claim's and the first grant a leaser issues is 1: a
+	// zero epoch is refused as a malformed request long before either gate, so
+	// that row would pass without reaching the machine at all.
+	epochs := map[string]func(t *testing.T) (*applyingCommand, uint64){
+		"a superseded epoch": func(t *testing.T) (*applyingCommand, uint64) {
+			store, clock, admitted := inboxFixture(t, memstore.New())
+			burnt := openRecoveryJournal(t, store)
+			superseded := burnt.Epoch()
+			mustClose(t, burnt)
+			fixture := continueApplying(t, store, clock, admitted)
+			fixture.supersede(t)
+			return fixture, superseded
+		},
+		"the claim's own epoch": func(t *testing.T) (*applyingCommand, uint64) {
+			fixture := startApplying(t, memstore.New())
+			fixture.supersede(t)
+			return fixture, fixture.epoch
+		},
+		"a successor epoch": func(t *testing.T) (*applyingCommand, uint64) {
+			fixture := startApplying(t, memstore.New())
+			return fixture, fixture.supersede(t)
+		},
+	}
 
-	// Applying is not re-enterable at any epoch, so the successor cannot get
-	// back in through the front door...
-	request := testBeginApplyingRequest(fixture.entry, successor)
-	request.ClaimExpiresAt = inboxDeadline
-	_, err := fixture.store.BeginApplyingCommand(context.Background(), request)
-	assertInboxCode(t, err, InboxErrorState)
+	for name, build := range epochs {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
 
-	// ...nor through a fresh claim, which applying refuses as well.
-	claim := testClaimRequest(fixture.entry, successor)
-	claim.ClaimExpiresAt = inboxDeadline
-	_, err = fixture.store.ClaimCommand(context.Background(), claim)
-	assertInboxCode(t, err, InboxErrorState)
-	assertInboxUnchanged(t, fixture.store, fixture.entry)
+			fixture, epoch := build(t)
+			fixture.clock.set(inboxClaimLapsed)
+
+			// Applying is not re-enterable, so no epoch gets back in through
+			// the front door...
+			request := testBeginApplyingRequest(fixture.entry, epoch)
+			request.ClaimExpiresAt = inboxDeadline
+			_, err := fixture.store.BeginApplyingCommand(context.Background(), request)
+			assertInboxCode(t, err, InboxErrorState)
+
+			// ...nor through a fresh claim, which applying refuses as well.
+			claim := testClaimRequest(fixture.entry, epoch)
+			claim.ClaimExpiresAt = inboxDeadline
+			_, err = fixture.store.ClaimCommand(context.Background(), claim)
+			assertInboxCode(t, err, InboxErrorState)
+			assertInboxUnchanged(t, fixture.store, fixture.entry)
+		})
+	}
 }
 
 // TestARuntimeMappingCorrelatesByVALUENotBySpelling is the assertion that keeps
@@ -1012,6 +1067,163 @@ func TestCorrelationDoesNotReadAnEmptyStream(t *testing.T) {
 	}
 }
 
+// TestCorrelationStopsWithoutOverrunningTheTip pins where the walk stops, not
+// only what it concludes. Both bounds produce the same correlation, so the
+// difference is invisible in every other test in this file: one asks the
+// provider for a record past the end and discards it, the other does not ask.
+// On the recovery path that is a round trip per rejection, and the divergence
+// from walkJournal — which stops at the tip for the same reason — would be
+// gratuitous rather than deliberate.
+func TestCorrelationStopsWithoutOverrunningTheTip(t *testing.T) {
+	t.Parallel()
+
+	base := memstore.New()
+	var reads int64
+	base.Ledger = &scriptedLedger{
+		Ledger:   base.Ledger,
+		onCursor: func(cursor storage.Cursor) storage.Cursor { return &scriptedCursor{Cursor: cursor, next: &reads} },
+	}
+
+	fixture := startApplying(t, base)
+	mustAppend(t, fixture.writer, applicationPrefix(inboxCommand, inboxRuntime, inboxKind))
+	tip := mustAppend(t, fixture.writer, publicEvent("event-effect", `{"applied":true}`))
+
+	app := mustFindApplication(t, fixture.store, fixture.entry)
+	if app.Outcome != CommandApplicationCommitted || app.CapturedTip != tip {
+		t.Fatalf("correlation = %+v, want committed at tip %d", app, tip)
+	}
+	if got := atomic.LoadInt64(&reads); got != int64(tip) {
+		t.Fatalf("the walk made %d Next calls over a journal of %d records", got, tip)
+	}
+}
+
+// TestCorrelationFailsClosedOnAProviderFault drives every arm where the walk
+// cannot finish reading. None of them may report a correlation: an evidence
+// answer built from a stream the store could not read is indistinguishable, to
+// both settlements, from one it read and found empty — and ABSENT is the value
+// that admits a rejection.
+func TestCorrelationFailsClosedOnAProviderFault(t *testing.T) {
+	t.Parallel()
+
+	faulty := errors.New("provider is unwell")
+	tests := map[string]func(scripted *scriptedLedger){
+		"the tip cannot be read": func(scripted *scriptedLedger) {
+			scripted.tipErr = faulty
+		},
+		"the stream cannot be opened": func(scripted *scriptedLedger) {
+			scripted.readFn = func(uint64) (bool, storage.Cursor, error) { return true, nil, faulty }
+		},
+		"the walk fails partway": func(scripted *scriptedLedger) {
+			scripted.onCursor = func(cursor storage.Cursor) storage.Cursor {
+				return &scriptedCursor{Cursor: cursor, fail: faulty}
+			}
+		},
+	}
+
+	for name, script := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			base := memstore.New()
+			scripted := &scriptedLedger{Ledger: base.Ledger}
+			base.Ledger = scripted
+			store, _, admitted := inboxFixture(t, base)
+			craftJournal(t, store, openingFence(5))
+			script(scripted)
+
+			request := FindCommandApplicationRequest{
+				TenantID:  admitted.Record.TenantID,
+				SessionID: admitted.Record.SessionID,
+				CommandID: admitted.Record.CommandID,
+			}
+			_, err := store.FindCommandApplication(context.Background(), request)
+			var journal *JournalError
+			if !errors.As(err, &journal) || journal.Code != JournalErrorBackend {
+				t.Fatalf("FindCommandApplication = %v, want a journal backend failure", err)
+			}
+			if !errors.Is(err, faulty) {
+				t.Fatalf("the provider cause was not preserved: %v", err)
+			}
+
+			// And the settlement it gates refuses with it rather than
+			// proceeding on an answer nobody produced.
+			_, err = store.RejectCommand(context.Background(), testRejectRequest(admitted, 0))
+			if !errors.As(err, &journal) || journal.Code != JournalErrorBackend {
+				t.Fatalf("RejectCommand = %v, want a journal backend failure", err)
+			}
+			assertInboxUnchanged(t, store, admitted)
+		})
+	}
+}
+
+// TestCorrelationReportsAnUnknownCommand keeps the query's subject the DURABLE
+// RECORD. A command that was never admitted has no mapping to correlate
+// against, so there is nothing to answer rather than nothing to find — an
+// absent correlation for an absent command would let a caller ask about an
+// identity the store never accepted and read it as evidence.
+func TestCorrelationReportsAnUnknownCommand(t *testing.T) {
+	t.Parallel()
+
+	store, _, admitted := inboxFixture(t, memstore.New())
+	_, err := store.FindCommandApplication(context.Background(), FindCommandApplicationRequest{
+		TenantID:  admitted.Record.TenantID,
+		SessionID: admitted.Record.SessionID,
+		CommandID: "command-elsewhere",
+	})
+	if got := assertInboxCode(t, err, InboxErrorNotFound); got.Field != "get" {
+		t.Fatalf("field = %q, want %q", got.Field, "get")
+	}
+}
+
+// TestCorrelationRefusesARecordBeyondTheCapturedTip drives the bound from the
+// other side. Stopping AT the tip means a conforming ledger never offers a
+// record past it, so the refusal above that stop can only be reached by a
+// provider that hands one back anyway — a gap in a stream storage documents as
+// dense. The refusal is what keeps the walk's own snapshot authoritative: a
+// reader that took the record would attribute an effect to this command at a
+// sequence its captured journal does not contain.
+func TestCorrelationRefusesARecordBeyondTheCapturedTip(t *testing.T) {
+	t.Parallel()
+
+	base := memstore.New()
+	real := base.Ledger
+	var displace atomic.Bool
+	base.Ledger = &scriptedLedger{
+		Ledger: real,
+		onCursor: func(cursor storage.Cursor) storage.Cursor {
+			return &scriptedCursor{Cursor: cursor, rewrite: func(record storage.Record) storage.Record {
+				// The effect is handed back one sequence beyond where it lives,
+				// which puts it past the tip the walk captured.
+				if displace.Load() && record.Seq == 3 {
+					record.Seq = 4
+				}
+				return record
+			}}
+		},
+	}
+
+	store, _, admitted := inboxFixture(t, base)
+	craftJournal(t, store,
+		openingFence(5),
+		stampedPrefix(5, inboxCommand, inboxRuntime, inboxKind),
+		publicEvent("event-effect", `{"applied":true}`),
+	)
+	// Undisplaced, the same journal correlates: the case is the displacement
+	// and not the fixture.
+	if app := mustFindApplication(t, store, admitted); app.Outcome != CommandApplicationCommitted || app.EffectSeq != 3 {
+		t.Fatalf("baseline correlation = %+v, want committed at 3", app)
+	}
+
+	displace.Store(true)
+	app := mustFindApplication(t, store, admitted)
+	if app.Outcome != CommandApplicationUnresolved {
+		t.Fatalf("outcome = %q, want %q: a record past the captured tip was taken as evidence", app.Outcome, CommandApplicationUnresolved)
+	}
+	if app.EffectSeq != 0 {
+		t.Fatalf("effect seq = %d, which the captured journal does not contain", app.EffectSeq)
+	}
+}
+
 // TestCorrelationStopsAtTheTipItCaptured is the snapshot boundary. A record
 // committed while the walk is in progress is not evidence for a decision that
 // was already being made, and CapturedTip is what tells a caller which journal
@@ -1057,7 +1269,7 @@ func TestRecoveryReadsTheRecordThenTheJournalThenWrites(t *testing.T) {
 	base := memstore.New()
 	log := &callLog{}
 	base.Ledger = &scriptedLedger{Ledger: base.Ledger, log: log}
-	base.OrderedIndex = &loggingOrdered{OrderedIndex: base.OrderedIndex, log: log}
+	base.OrderedIndex = &recordingOrdered{OrderedIndex: base.OrderedIndex, log: log}
 
 	fixture := startApplying(t, base)
 	mustAppend(t, fixture.writer, applicationPrefix(inboxCommand, inboxRuntime, inboxKind))

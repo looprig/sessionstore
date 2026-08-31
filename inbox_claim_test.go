@@ -1028,10 +1028,14 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name  string
-		call  func(store *Store, entry InboxEntry) error
-		want  InboxErrorCode
-		field string
+		name string
+		call func(store *Store, entry InboxEntry) error
+		// operation is the public Store method the case drives, which is what
+		// makes the completeness check below a cross product rather than a
+		// hand-written list.
+		operation string
+		want      InboxErrorCode
+		field     string
 	}{
 		{
 			name: "claim without a revision",
@@ -1041,7 +1045,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.ClaimCommand(context.Background(), request)
 				return err
 			},
-			want: InboxErrorInvalid, field: "expected_revision",
+			operation: "ClaimCommand",
+			want:      InboxErrorInvalid, field: "expected_revision",
 		},
 		{
 			name: "claim without a lease epoch",
@@ -1049,7 +1054,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.ClaimCommand(context.Background(), testClaimRequest(entry, 0))
 				return err
 			},
-			want: InboxErrorInvalid, field: "lease_epoch",
+			operation: "ClaimCommand",
+			want:      InboxErrorInvalid, field: "lease_epoch",
 		},
 		{
 			name: "claim with an unstorable expiry",
@@ -1059,7 +1065,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.ClaimCommand(context.Background(), request)
 				return err
 			},
-			want: InboxErrorInvalid, field: "claim",
+			operation: "ClaimCommand",
+			want:      InboxErrorInvalid, field: "claim",
 		},
 		{
 			name: "claim that has already lapsed",
@@ -1069,7 +1076,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.ClaimCommand(context.Background(), request)
 				return err
 			},
-			want: InboxErrorInvalid, field: "claim_expires_at",
+			operation: "ClaimCommand",
+			want:      InboxErrorInvalid, field: "claim_expires_at",
 		},
 		{
 			name: "claim of an unnamed command",
@@ -1079,7 +1087,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.ClaimCommand(context.Background(), request)
 				return err
 			},
-			want: InboxErrorInvalid, field: "command_id",
+			operation: "ClaimCommand",
+			want:      InboxErrorInvalid, field: "command_id",
 		},
 		{
 			name: "begin applying without a lease epoch",
@@ -1087,7 +1096,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.BeginApplyingCommand(context.Background(), testBeginApplyingRequest(entry, 0))
 				return err
 			},
-			want: InboxErrorInvalid, field: "lease_epoch",
+			operation: "BeginApplyingCommand",
+			want:      InboxErrorInvalid, field: "lease_epoch",
 		},
 		{
 			name: "begin applying with a lapsed claim",
@@ -1097,7 +1107,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.BeginApplyingCommand(context.Background(), request)
 				return err
 			},
-			want: InboxErrorInvalid, field: "claim_expires_at",
+			operation: "BeginApplyingCommand",
+			want:      InboxErrorInvalid, field: "claim_expires_at",
 		},
 		{
 			name: "complete with no result",
@@ -1107,7 +1118,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.CompleteCommand(context.Background(), request)
 				return err
 			},
-			want: InboxErrorInvalid, field: "result",
+			operation: "CompleteCommand",
+			want:      InboxErrorInvalid, field: "result",
 		},
 		{
 			name: "complete with a result naming no event",
@@ -1117,7 +1129,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.CompleteCommand(context.Background(), request)
 				return err
 			},
-			want: InboxErrorInvalid, field: "result",
+			operation: "CompleteCommand",
+			want:      InboxErrorInvalid, field: "result",
 		},
 		{
 			name: "complete without a lease epoch",
@@ -1125,7 +1138,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.CompleteCommand(context.Background(), testCompleteRequest(entry, 0))
 				return err
 			},
-			want: InboxErrorInvalid, field: "lease_epoch",
+			operation: "CompleteCommand",
+			want:      InboxErrorInvalid, field: "lease_epoch",
 		},
 		{
 			name: "reject with no reason",
@@ -1135,7 +1149,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.RejectCommand(context.Background(), request)
 				return err
 			},
-			want: InboxErrorInvalid, field: "rejection",
+			operation: "RejectCommand",
+			want:      InboxErrorInvalid, field: "rejection",
 		},
 		{
 			name: "reject with reason text that is not text",
@@ -1145,7 +1160,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.RejectCommand(context.Background(), request)
 				return err
 			},
-			want: InboxErrorInvalid, field: "rejection.message",
+			operation: "RejectCommand",
+			want:      InboxErrorInvalid, field: "rejection.message",
 		},
 		{
 			name: "reject without a revision",
@@ -1155,7 +1171,8 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				_, err := store.RejectCommand(context.Background(), request)
 				return err
 			},
-			want: InboxErrorInvalid, field: "expected_revision",
+			operation: "RejectCommand",
+			want:      InboxErrorInvalid, field: "expected_revision",
 		},
 		{
 			name: "get an unnamed command",
@@ -1166,8 +1183,49 @@ func TestTransitionRefusesAnInvalidRequestBeforeAdmission(t *testing.T) {
 				})
 				return err
 			},
-			want: InboxErrorInvalid, field: "command_id",
+			operation: "GetCommand",
+			want:      InboxErrorInvalid, field: "command_id",
 		},
+		{
+			name: "correlate an unnamed command",
+			call: func(store *Store, entry InboxEntry) error {
+				_, err := store.FindCommandApplication(context.Background(), FindCommandApplicationRequest{
+					TenantID:  entry.Record.TenantID,
+					SessionID: entry.Record.SessionID,
+				})
+				return err
+			},
+			operation: "FindCommandApplication",
+			want:      InboxErrorInvalid, field: "command_id",
+		},
+	}
+
+	// The table is held to covering every public operation the two inbox
+	// transition files declare, for the reason the Close tables are: an
+	// operation added without a row here silently stops being held to
+	// validating its request before the store admits it, and the ordering that
+	// costs — an invalid request answered with "the store is closing" — is
+	// invisible until a caller meets it.
+	declared := map[string]bool{}
+	for _, file := range []string{"inbox_claim.go", "inbox_recovery.go"} {
+		for name := range declaredStoreOperations(t, file) {
+			declared[name] = true
+		}
+	}
+	covered := map[string]bool{}
+	for _, test := range tests {
+		if test.operation == "" {
+			t.Fatalf("the case %q names no operation, so it cannot be counted towards coverage", test.name)
+		}
+		if !declared[test.operation] {
+			t.Errorf("the case %q drives %s, which no inbox transition file declares", test.name, test.operation)
+		}
+		covered[test.operation] = true
+	}
+	for name := range declared {
+		if !covered[name] {
+			t.Errorf("%s takes a request and no case here gives it a malformed one", name)
+		}
 	}
 
 	for _, test := range tests {

@@ -35,16 +35,27 @@ type orderedCall struct {
 // recordingOrdered logs every OrderedIndex call and can run a side effect
 // immediately before an Update reaches the provider, which is the only place a
 // test can interleave two compare-and-swap writers deterministically.
+//
+// log is optional and is the one thing its own call list cannot provide: an
+// ORDER RELATIVE TO ANOTHER PRIMITIVE. A test asking whether the journal was
+// consulted before or after the record was written needs both sequences
+// interleaved into one, which is what the shared callLog is for, and a second
+// wrapper existing only to write into that log would be a third spelling of
+// this type.
 type recordingOrdered struct {
 	storage.OrderedIndex
 
 	beforeUpdate func()
+	log          *callLog
 
 	mu    sync.Mutex
 	calls []orderedCall
 }
 
 func (o *recordingOrdered) add(call orderedCall) {
+	if o.log != nil {
+		o.log.add("ordered:" + call.op)
+	}
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.calls = append(o.calls, call)

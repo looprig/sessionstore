@@ -108,6 +108,26 @@ import (
 //     session. Violating this makes the command UNRESOLVED permanently: the
 //     record at prefix+1 is durable and will never become the effect or the
 //     fence the correlation needs.
+//
+//     A PREFIX IS THEREFORE A COMMITMENT TO APPEND THE EFFECT NEXT, and the
+//     obligation bites hardest exactly where it is least expected: when the
+//     EFFECT APPEND FAILS. The prefix is already durable, so the correlation
+//     reads UNRESOLVED, and rejection is refused under the very claim that
+//     wrote it — correctly, because a prefix with nothing after it does not
+//     prove the applier has given up, and no writer can prove that about
+//     itself. The route out is real and it is expensive: drop the journal
+//     grant, reopen (which commits the fence at prefix+1 and makes the
+//     correlation ABANDONED), wait out the applying claim's own expiry, which
+//     BeginApplyingCommand fixed irreversibly and MaxCommandClaimTTL bounds,
+//     and reject at the higher epoch.
+//
+//     DO NOT COMPLETE OVER IT. Nothing checks a SAME-EPOCH result against the
+//     journal — that is S4.2's contract, that the lease which committed the
+//     effect is the authority on it, and this file deliberately did not widen
+//     it — so a fabricated event id is ACCEPTED and becomes the command's
+//     durable outcome, pointing at a journal record that does not exist. The
+//     store cannot stop it; only this obligation can. TestAPrefixIsACommitment-
+//     ToAppendTheEffect drives the whole window, including the route out.
 //  2. Every runtime-visible effect of a command gets a prefix. An effect
 //     without one is invisible here and can be rejected over.
 //  3. A HOST MUST NOT APPEND AN APPLICATION PREFIX FOR A COMMAND WHOSE CLAIM
@@ -220,10 +240,34 @@ func (o CommandApplicationOutcome) precedence() int {
 // about a caller. The sequences are journal sequences in the session's own
 // stream; the epochs are session lease epochs.
 //
-// CapturedTip is the tip the correlation was taken at, so a caller can say what
-// its answer was true of. An UNRESOLVED answer taken at one tip may be readable
-// at a later one; ABSENT, COMMITTED and ABANDONED do not change, because the
-// journal does not rewrite and the fence that settled them cannot be undone.
+// CapturedTip is the tip the correlation was taken at, and it exists to say how
+// long the answer is good for. The answer is: NO OUTCOME IS STABLE ACROSS TIPS.
+// Every one of the five can be superseded by a record written after the walk,
+// and the transitions are ordinary rather than exotic — absent becomes
+// committed when the applier commits its prefix and effect a moment later,
+// abandoned becomes committed when a later lease retries the application to
+// completion, and committed becomes conflicted when a prefix breaking the
+// mapping appears anywhere later in the stream. Two of the three are what this
+// package's own tests do on purpose.
+//
+// What IS monotone is not an outcome but a pair of NEGATIVE facts, and they are
+// exactly the two a settlement rests on:
+//
+//   - no effect for this command had committed by CapturedTip, and
+//   - the writer at a given epoch was already fenced out by CapturedTip.
+//
+// Both are properties of a PREFIX OF THE STREAM, and the journal only appends,
+// so no later record undoes either. That is the whole of why the settlements
+// are safe, and it is also why they RE-SCAN rather than accept a correlation a
+// caller took earlier: a caller's older answer still carries true negative
+// facts, but the store cannot tell from the value alone which tip they were
+// true of relative to the record it is about to write.
+//
+// A caller may therefore hold a correlation to decide WHAT TO DO — finish or
+// settle — and must not hold one as a licence. Caching an ABSENT answer and
+// rejecting on it later is precisely the overwrite this file exists to prevent:
+// absence is the least stable finding there is, because every application
+// starts from it.
 type CommandApplication struct {
 	CommandID        sessionwire.CommandID
 	RuntimeCommandID RuntimeCommandID
@@ -240,9 +284,18 @@ type CommandApplication struct {
 	EffectSeq     uint64
 	EffectEventID sessionwire.EventID
 
-	// SupersedingEpoch is the highest opening-fence epoch in the journal, which
-	// is the highest lease that has ever owned the stream. Every writer below
-	// it is provably fenced out.
+	// SupersedingEpoch is the highest opening-fence epoch THE WALK OBSERVED,
+	// and a writer at or below it is provably fenced out of the stream.
+	//
+	// It is deliberately not described as the highest lease that ever owned the
+	// session, which is what a walk from sequence one happens to find today.
+	// The two come apart the moment the walk is bounded — the admission-tip
+	// bound above is the obvious way, and it would leave every fence written
+	// before the command was accepted unobserved — and the predicate this
+	// member exists for stays correct under that, because a fence observed
+	// LATER than some other fence is still a fence. Promising the maximum over
+	// the whole journal would make a bound that is otherwise fine look like a
+	// breaking change.
 	SupersedingEpoch uint64
 
 	CapturedTip uint64
@@ -442,6 +495,15 @@ func (s *Store) scanCommandApplication(
 			}
 		}
 		prefixBefore = env.Kind == EnvelopeKindApplicationPrefix
+		// Stop AT the tip rather than by overrunning it, which is walkJournal's
+		// shape and saves the walk one provider round trip per correlation. The
+		// guard above is still the one that decides: a cursor observes the tip
+		// as of Read, which storage documents as possibly later than the Tip
+		// call above, so a record beyond the captured tip can be handed back
+		// and must be refused rather than merely not asked for.
+		if stored.Seq == tip {
+			break
+		}
 	}
 	// A prefix at the tip has no record after it to say what became of it, and
 	// its writer may be about to append one.

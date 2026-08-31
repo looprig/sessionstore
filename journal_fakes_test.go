@@ -5,6 +5,7 @@ package sessionstore
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/looprig/storage"
 )
@@ -15,11 +16,19 @@ type scriptedLedger struct {
 	storage.Ledger
 	log      *callLog
 	onTip    func(name string)
+	tipErr   error
 	appendFn func(expected uint64, payload []byte) (bool, error)
 	readFn   func(from uint64) (bool, storage.Cursor, error)
+	// onCursor wraps the cursor a real read returned. readFn cannot serve: it
+	// REPLACES the read, so a test wanting to observe the real one would have
+	// to reissue it, and reissuing needs the ledger name this hook is not given.
+	onCursor func(storage.Cursor) storage.Cursor
 }
 
 func (l *scriptedLedger) Tip(ctx context.Context, name string) (uint64, error) {
+	if l.tipErr != nil {
+		return 0, l.tipErr
+	}
 	tip, err := l.Ledger.Tip(ctx, name)
 	if l.log != nil {
 		l.log.add("tip")
@@ -51,7 +60,45 @@ func (l *scriptedLedger) Read(ctx context.Context, name string, from uint64) (st
 			return cur, err
 		}
 	}
-	return l.Ledger.Read(ctx, name, from)
+	cursor, err := l.Ledger.Read(ctx, name, from)
+	if err != nil || l.onCursor == nil {
+		return cursor, err
+	}
+	return l.onCursor(cursor), nil
+}
+
+// scriptedCursor observes and, where a test needs a provider that breaks its
+// contract, rewrites what a real cursor hands back.
+//
+// next counts Next calls, which is the only way to observe where a walk STOPPED
+// as opposed to what it concluded: a walk that overruns its bound reaches the
+// same answer by asking for a record it did not need, and nothing about the
+// answer says so.
+//
+// rewrite produces the cursor a CONFORMING ledger never would. Sequences are
+// dense and bounded by the tip observed at Read, so a reader's own bound is
+// unreachable while the provider behaves; a reader that trusted the cursor
+// instead of its own bound would only be wrong when the provider was, which is
+// exactly when it matters and exactly what cannot otherwise be driven.
+type scriptedCursor struct {
+	storage.Cursor
+	next    *int64
+	rewrite func(storage.Record) storage.Record
+	fail    error
+}
+
+func (c *scriptedCursor) Next(ctx context.Context) (storage.Record, error) {
+	if c.next != nil {
+		atomic.AddInt64(c.next, 1)
+	}
+	if c.fail != nil {
+		return storage.Record{}, c.fail
+	}
+	record, err := c.Cursor.Next(ctx)
+	if err != nil || c.rewrite == nil {
+		return record, err
+	}
+	return c.rewrite(record), nil
 }
 
 // permissiveLeaser grants an independent, strictly increasing epoch on every

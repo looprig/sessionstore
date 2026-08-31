@@ -360,7 +360,14 @@ writer-contract violation, bounded by nothing at all, because the record at
 
 Three obligations fall on a Host and none of them can be checked here, so
 `inbox_recovery.go` states them where an author will look. A prefix is committed
-immediately before its effect, one application at a time. Every runtime-visible
+immediately before its effect, one application at a time — so a prefix is a
+COMMITMENT to append the effect next. If that append fails, the prefix is
+already durable and the command reads `unresolved`, so it can no longer be
+rejected under the claim that wrote it; the only route out is to drop the
+journal grant, reopen (which fences the prefix into `abandoned`), wait out the
+applying claim's own expiry, and reject at the higher epoch. Do NOT complete
+over it: nothing checks a same-epoch result against the journal, so a fabricated
+event id is accepted and becomes the command's durable outcome. Every runtime-visible
 effect gets a prefix — an effect without one reads as `absent` and can be
 rejected over, which is the one part of the writer contract adjacency cannot
 enforce. And a Host must not append a prefix for a command whose claim epoch is
