@@ -309,14 +309,20 @@ func journalErr(code JournalErrorCode, field string, cause error) error {
 // the caller must mint a new id or send the command it originally sent.
 //
 // It is deliberately NOT called "conflict", and the omission is the point.
-// CatalogErrorConflict, twenty lines up in this same file, means a lost
-// revision compare-and-swap: recoverable, provider-caused, carrying the actual
-// revision, and explicitly inviting a re-read and a retry. That is the
-// OPPOSITE recovery advice, and one spelling for two opposite meanings in one
-// package is a trap for anyone who learns the vocabulary from either half of
-// it. InboxErrorConflict is therefore left undefined and RESERVED for the
-// revision-CAS meaning its neighbour already has, which is what the command
-// transition machine will need when it compare-and-swaps this record.
+// This file already spells "conflict" two ways. CatalogErrorConflict means a
+// lost revision compare-and-swap: recoverable, provider-caused, carrying the
+// actual revision, and explicitly inviting a re-read and a retry.
+// ObjectErrorConflict means a key already holding DIFFERENT CONTENT, which is
+// the near-twin of what a reused command id is — so a reader who met that one
+// first would reasonably expect "conflict" here and get the catalog's
+// recovery advice instead.
+//
+// The tie goes to the catalog's meaning because of what this record IS: an
+// OrderedIndex row has a Revision, so the command transition machine will
+// compare-and-swap it and will need a name for losing that race. The object
+// aggregate never will. InboxErrorConflict is therefore left undefined and
+// RESERVED for the revision-CAS meaning, and the caller-caused case takes a
+// name that cannot be mistaken for either neighbour.
 //
 // Unknown means the mutation's outcome could not be resolved at all, so the
 // caller learns nothing about what is stored and must retry the same identity

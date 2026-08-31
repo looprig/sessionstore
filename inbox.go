@@ -154,7 +154,9 @@ func (r CommandResult) isZero() bool {
 // never part of a public projection, and no failure this package returns
 // carries either of them. At most one of the two is set — an inline body up to
 // MaxInboxPayloadBytes, or a reference to an object persisted first — and
-// neither is set for a command that has no body.
+// neither is set for a command that has no body. They are also IMMUTABLE for
+// the life of the record, as Kind is: emptying or rewriting one turns every
+// later retry of the command into a permanent mismatch — see sameCommandAs.
 //
 // The acceptance order is deliberately NOT a member here. It is allocated by
 // the provider at Create and is therefore not part of the bytes this record
@@ -222,7 +224,7 @@ type InboxEntry struct {
 // timestamp this package stores is. They belong to the WINNER: a duplicate
 // returns the accepted instant and deadline that were durably committed, not
 // the ones it just sent, and they take no part in deciding whether a duplicate
-// conflicts — see AdmitCommand.
+// mismatches — see AdmitCommand.
 type AdmitCommandRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
@@ -247,7 +249,7 @@ type AdmitCommandRequest struct {
 // false, carrying the winning runtime mapping and the immutable acceptance
 // order.
 //
-// What makes a duplicate a CONFLICT rather than a retry, and why:
+// What makes a duplicate a MISMATCH rather than a retry, and why:
 //
 //   - Kind, Payload, and PayloadRef must match. Reusing one command id for a
 //     DIFFERENT command must fail closed; silently returning the first
@@ -259,7 +261,7 @@ type AdmitCommandRequest struct {
 //   - AcceptedAt and ApplyDeadline are deliberately excluded. A retry carries a
 //     fresh clock reading — a caller that computes an absolute deadline from
 //     "now" produces a different one on every attempt — so comparing them would
-//     turn every real retry into a conflict.
+//     turn every real retry into a mismatch.
 //   - State, Claim, Result, and Rejection are deliberately excluded. By the
 //     time a retry arrives the command may already be claimed, applied, or
 //     rejected; that progress is not evidence that this retry differs, and a
@@ -282,12 +284,10 @@ func (s *Store) AdmitCommand(ctx context.Context, req AdmitCommandRequest) (Inbo
 		State:            InboxStatePending,
 	}
 	// Encoding validates, so an invalid request is refused before any provider
-	// work — including before the session's witnesses are bound. Everything
-	// after this point uses the CANONICAL record it returns rather than the
-	// request-shaped one built above: the due state filed and the content
-	// compared against a stored record must both be derived from the same
-	// normal form the stored bytes are in.
-	value, candidate, err := encodeInboxRecord(record)
+	// work — including before the session's witnesses are bound. It returns the
+	// CANONICAL record over the request-shaped one built above, so nothing
+	// below can reach a form the stored bytes are not in.
+	value, record, err := encodeInboxRecord(record)
 	if err != nil {
 		return InboxEntry{}, false, err
 	}
@@ -305,7 +305,7 @@ func (s *Store) AdmitCommand(ctx context.Context, req AdmitCommandRequest) (Inbo
 		return InboxEntry{}, false, err
 	}
 	stored, created, err := s.backend.OrderedIndex.Create(
-		opCtx, inboxID(scope, req.CommandID), scope.SessionNamespace, value, storage.Rank{}, inboxDue(candidate))
+		opCtx, inboxID(scope, req.CommandID), scope.SessionNamespace, value, storage.Rank{}, inboxDue(record))
 	if err != nil {
 		return InboxEntry{}, false, classifyInboxOrderedError(err, "create")
 	}
@@ -338,7 +338,7 @@ func (s *Store) AdmitCommand(ctx context.Context, req AdmitCommandRequest) (Inbo
 		}
 		return entry, true, nil
 	}
-	if !entry.Record.sameCommandAs(candidate) {
+	if !entry.Record.sameCommandAs(record) {
 		return InboxEntry{}, false, inboxErr(InboxErrorCommandMismatch, "command", nil)
 	}
 	return entry, false, nil
@@ -568,14 +568,18 @@ type commandResultWire struct {
 // record above the inbox bound here rather than letting the provider refuse it,
 // so a record this package accepted can always be rewritten.
 //
-// It returns the CANONICAL record beside the bytes, and callers that go on to
-// compare a candidate against a stored record must use it. A stored record is
-// always canonical — it comes back through the decoder, which ends in the same
-// canonicalization — so comparing a stored record against a caller's raw
-// request would be comparing two different normal forms. That is safe today
-// only because the one content normalization is nil-versus-empty payload, which
-// bytes.Equal absorbs; returning the canonical form makes the coupling
-// impossible to break rather than merely currently unbroken.
+// It returns the CANONICAL record beside the bytes, and a caller that goes on
+// to compare against a stored record must use it. A stored record is always
+// canonical — it comes back through the decoder, which ends in the same
+// canonicalization — so comparing one against a caller's raw request would be
+// comparing two different normal forms. That is safe today only because the
+// one content normalization is nil-versus-empty payload, which bytes.Equal
+// absorbs.
+//
+// AdmitCommand does not merely obey that: it REBINDS its record variable to
+// this return value, so the request-shaped form has no name for the rest of the
+// function and the wrong comparison cannot be written. A rule that cannot be
+// expressed needs no test to defend it, which is why there is none.
 func encodeInboxRecord(record InboxRecord) ([]byte, InboxRecord, error) {
 	record, err := canonicalInboxRecord(record)
 	if err != nil {

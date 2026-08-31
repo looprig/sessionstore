@@ -226,13 +226,13 @@ legitimately propose different values, and only the winner's is stored, returned
 and used.
 
 A duplicate whose command CONTENT differs — kind, inline payload, or referenced
-payload object — fails closed with `InboxErrorConflict`, because silently
+payload object — fails closed with `InboxErrorCommandMismatch`, because silently
 returning the first command's record would tell a caller its command was
 accepted when nothing of the kind happened. Everything else is deliberately
 excluded from that comparison. The proposed runtime id is excluded because
 disagreeing about it is the expected outcome of a race. The accepted instant and
 apply deadline are excluded because a retry carries a fresh clock reading, so
-comparing them would turn every real retry into a conflict. The state, claim,
+comparing them would turn every real retry into a mismatch. The state, claim,
 result and rejection are excluded because by the time a retry arrives the
 command may already be applied or rejected, and that progress is not evidence
 that this retry differs.
@@ -241,6 +241,13 @@ For the same reason there is no "the deadline must be in the future" check: a
 retry of an unknown outcome may arrive after the original deadline has passed
 and must still be able to learn the mapping that was durably accepted. The
 deadline is validated as an instant and nothing more.
+
+`InboxErrorCommandMismatch` is deliberately not called `InboxErrorConflict`. This package spells
+"conflict" two ways already — `CatalogErrorConflict` is a lost revision CAS
+(recoverable, retry after a re-read) and `ObjectErrorConflict` is a key holding
+different content — so the spelling is reserved for the revision-CAS meaning
+the command transition machine will need when it compare-and-swaps this record,
+and the caller-caused case takes a name that cannot be mistaken for either.
 
 `InboxEntry.AcceptedOrder` is the provider's immutable acceptance order, and it
 is exposed here where `CatalogEntry`'s deliberately is not: consumers sort a
