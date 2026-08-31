@@ -62,24 +62,67 @@ import (
 //     applier's very next append slot was taken by its successor, so it never
 //     wrote anything after the prefix and never will. Anything else — another
 //     prefix, a control record, or nothing at all yet — is UNRESOLVED, and both
-//     settlements refuse. That is the writer contract enforced by failing
-//     closed rather than assumed: a Host that interleaves two applications in
-//     one stream, or that separates a prefix from its effect, parks both
-//     commands instead of letting one adopt the other's event.
+//     settlements refuse. Two thirds of the writer contract are enforced by
+//     that rather than assumed: a Host that interleaves two applications in one
+//     stream, or that separates a prefix from its effect, parks both commands
+//     instead of letting one adopt the other's event.
+//
+//     OMISSION is the third and cannot be enforced here. An effect committed
+//     with NO prefix in front of it reads as ABSENT, which is settleable as
+//     rejected — over a durable effect. No reading of the stream could catch
+//     it: most public events are not command applications, so a store that
+//     treated an uncorrelated event as evidence would have to attribute every
+//     event in the session to some command. The prefix is the only thing that
+//     makes an event attributable, so a Host that omits one has withheld the
+//     evidence this file exists to read.
 //
 //   - FENCING. A journal grant's epochs are strictly increasing per name and an
 //     opening fence is committed by compare-and-swap at the tip, so a fence at
-//     epoch F proves every writer granted below F has lost the stream
-//     permanently: its next append targets the sequence the fence took. An
-//     applying record can therefore be settled as unfinished only once the
-//     journal carries a fence above the epoch that claimed it. Until then the
-//     applier may still commit the effect this settlement would orphan, and no
-//     epoch the CALLER names can rule that out — a superseding epoch is a claim
-//     about the world, while the fence is the world.
+//     epoch F proves every GRANT below F has lost the stream permanently: its
+//     next append targets the sequence the fence took. An applying record can
+//     therefore be settled as unfinished only once the journal carries a fence
+//     above the epoch that claimed it. Until then the applier may still commit
+//     the effect this settlement would orphan, and no epoch the CALLER names
+//     can rule that out — a superseding epoch is a claim about the world, and
+//     the fence is durable state.
+//
+//     Be precise about WHAT it binds, because the obvious over-reading is the
+//     dangerous one: it kills the GRANT the record's claim epoch names, not the
+//     Host process that held it. A Host that loses its grant, re-attaches under
+//     a higher one, and carries on applying writes — with its own OpenJournal —
+//     the very fence that makes its own unfinished application look settleable.
+//     Nothing in this package can stop that, which is why it appears as a
+//     stated obligation below rather than as a guarantee here.
 //
 // The two are separate questions and are asked separately: adjacency is about
 // the prefix's own writer, fencing is about the lease that holds the record's
 // claim, and those are not always the same epoch.
+//
+// # WRITER OBLIGATIONS
+//
+// A Host is held to three things this package cannot check, each of which costs
+// a command its recoverability silently rather than failing anything:
+//
+//  1. An application prefix is committed IMMEDIATELY BEFORE its effect, with no
+//     record of any kind between them, and one application at a time per
+//     session. Violating this makes the command UNRESOLVED permanently: the
+//     record at prefix+1 is durable and will never become the effect or the
+//     fence the correlation needs.
+//  2. Every runtime-visible effect of a command gets a prefix. An effect
+//     without one is invisible here and can be rejected over.
+//  3. A HOST MUST NOT APPEND AN APPLICATION PREFIX FOR A COMMAND WHOSE CLAIM
+//     EPOCH IS BELOW ITS CURRENT GRANT. Losing the lease ABANDONS every
+//     in-flight application; re-attaching does not resume one. That is not a
+//     stylistic rule. The store admits no route back: an applying record is not
+//     re-enterable at ANY epoch (BeginApplyingCommand takes only a claimed
+//     one), and a claimed record admits only the claim's own epoch, so a
+//     re-attached Host cannot legally resume. But nothing gates the PREFIX
+//     WRITE itself, and this
+//     file's new "a later epoch finishes an application" rule reads invitingly
+//     like "re-attach and carry on". It is not. The two moves a re-attached
+//     Host has for a command its predecessor was applying are the two below:
+//     finish it if the evidence says it committed, reject it if the evidence
+//     says it did not.
 //
 // # What this costs, and the accumulation it settles
 //
@@ -88,8 +131,23 @@ import (
 // recovering a session it has just attached to — and it is deliberately walked
 // in full rather than sampled or cached: a shortcut here is a check the slow
 // path performs and the fast path does not, on the one question where being
-// wrong overwrites a committed effect. A later task that gives the journal a
-// per-command index may bound it; nothing may make it conditional.
+// wrong overwrites a committed effect.
+//
+// The cost is real and does not decay. It is the whole stream, decoded frame by
+// frame, once per rejection, on a journal that only grows, and it is paid again
+// by a caller that then loses the compare-and-swap.
+//
+// CARRY-FORWARD CONTRACT for whoever pays it down: BOUND THE WALK, NEVER MAKE
+// IT CONDITIONAL. Two bounds are legitimate. A per-command journal index is the
+// general answer. Cheaper and available today: a prefix cannot precede its
+// command's admission, so recording the journal tip in the inbox record AT
+// ADMISSION bounds every later walk to the records written since — a durable
+// member of the record, derived by the store, which is why it does not reopen
+// FindCommandApplicationRequest's refusal of caller-supplied positioning. What
+// is NOT legitimate is skipping the walk for states that "cannot" have
+// evidence: that is the check the slow path performs and the fast path does
+// not, and the state it would trust is the state the evidence exists to
+// second-guess.
 //
 // It repays that by closing the head-of-line hazard RejectCommand documents. An
 // expired applying record used to be settleable by nobody, forever. It is now
@@ -327,10 +385,11 @@ func (s *Store) scanCommandApplication(
 		return CommandApplication{}, journalErr(JournalErrorBackend, "tip", err)
 	}
 	app.CapturedTip = tip
-	// A session that has never been written has no evidence to read, and asking
-	// the provider to read from a sequence past the end of an empty stream is
-	// not a question the Ledger contract answers. walkJournal declines the same
-	// read for the same reason.
+	// A session that has never been written has no evidence to read. This is a
+	// pure OPTIMISATION and is documented as one rather than as a precondition:
+	// storage v0.6.0 states that an absent ledger behaves as empty and that any
+	// read beyond the tip yields a drained cursor, so removing it would cost a
+	// round trip and change no answer.
 	if tip == 0 {
 		return app, nil
 	}

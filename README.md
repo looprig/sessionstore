@@ -346,14 +346,28 @@ stream from its first record on every rejection; that cost is deliberate and
 unconditional, because a check the slow path performs and the fast path skips is
 how a committed effect gets overwritten.
 
-That closes the head-of-line hazard the previous section used to leave open: an
-expired `applying` record was settleable by nobody, forever, and is now settled
-by the next lease holder — whose own `OpenJournal` writes the fence that makes
-its evidence conclusive, so the row clears when the session is next attached.
-Two sources of unactionable due rows remain and a due-command reader should size
-its examined-versus-returned signal for both: a live claim outliving the
-deadline, bounded by `MaxCommandClaimTTL`, and an `unresolved` correlation —
-the crash window between a prefix and its effect — bounded by re-attachment.
+That narrows the head-of-line hazard the previous section used to leave open: an
+expired `applying` record was settleable by nobody, forever, and a conforming
+one is now settled by the next lease holder — whose own `OpenJournal` writes the
+fence that makes its evidence conclusive, so the row clears when the session is
+next attached. The permanent hazard was RELOCATED rather than eliminated. A
+due-command reader should size its examined-versus-returned signal for three
+sources: a live claim outliving the deadline, bounded by `MaxCommandClaimTTL`;
+an `unresolved` correlation in the crash window between a prefix and its effect,
+bounded by re-attachment; and an `unresolved` correlation caused by a
+writer-contract violation, bounded by nothing at all, because the record at
+`prefix+1` is already durable and will never become the effect or the fence.
+
+Three obligations fall on a Host and none of them can be checked here, so
+`inbox_recovery.go` states them where an author will look. A prefix is committed
+immediately before its effect, one application at a time. Every runtime-visible
+effect gets a prefix — an effect without one reads as `absent` and can be
+rejected over, which is the one part of the writer contract adjacency cannot
+enforce. And a Host must not append a prefix for a command whose claim epoch is
+below its current grant: losing the lease abandons in-flight applications, and
+re-attaching does not resume one. The fence proves a GRANT is dead, not that a
+Host stopped writing, so a Host that re-attaches and carries on applying commits
+the very fence that makes its own unfinished work look settleable.
 
 A command's due state is derived from the record rather than from the operation
 writing it. A non-terminal command is due at the earliest instant something must

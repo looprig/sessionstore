@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -651,6 +652,15 @@ func TestStackedPrefixesAreNotCorrelatable(t *testing.T) {
 // contract: a record between a prefix and its effect breaks the correlation
 // rather than being skipped over, because skipping is what would let an
 // unrelated later event be adopted as this command's.
+//
+// The fixture supersedes the writer before asking, which is the load-bearing
+// part: re-attachment is what resolves the CONFORMING crash window, and it does
+// not resolve this one. The record at prefix+1 is already durable and will
+// never become either the effect or a fence, so a contract violation is an
+// unsettleable command FOREVER. That is the permanent head-of-line row
+// RejectCommand's carry-forward note now attributes to writers rather than to
+// crashes, and TestStackedPrefixesAreNotCorrelatable supersedes for the same
+// reason.
 func TestASeparatedPrefixIsNotCorrelatable(t *testing.T) {
 	t.Parallel()
 
@@ -785,6 +795,73 @@ func TestAMappingThatIsNotARuntimeUUIDCorrelatesWithNothing(t *testing.T) {
 	app := mustFindApplication(t, store, admitted)
 	if app.Outcome != CommandApplicationConflicted {
 		t.Fatalf("outcome = %q, want %q", app.Outcome, CommandApplicationConflicted)
+	}
+}
+
+// TestASuccessorCannotResumeAnAbandonedApplication pins the mitigation the
+// writer obligation rests on: the store offers a re-attached Host no route back
+// into an application its predecessor started. It may finish one on evidence or
+// settle one on evidence, and it may not resume one — so a prefix written after
+// re-attachment is a Host acting outside every transition this package admits.
+func TestASuccessorCannotResumeAnAbandonedApplication(t *testing.T) {
+	t.Parallel()
+
+	fixture := startApplying(t, memstore.New())
+	successor := fixture.supersede(t)
+	fixture.clock.set(inboxClaimLapsed)
+
+	// Applying is not re-enterable at any epoch, so the successor cannot get
+	// back in through the front door...
+	request := testBeginApplyingRequest(fixture.entry, successor)
+	request.ClaimExpiresAt = inboxDeadline
+	_, err := fixture.store.BeginApplyingCommand(context.Background(), request)
+	assertInboxCode(t, err, InboxErrorState)
+
+	// ...nor through a fresh claim, which applying refuses as well.
+	claim := testClaimRequest(fixture.entry, successor)
+	claim.ClaimExpiresAt = inboxDeadline
+	_, err = fixture.store.ClaimCommand(context.Background(), claim)
+	assertInboxCode(t, err, InboxErrorState)
+	assertInboxUnchanged(t, fixture.store, fixture.entry)
+}
+
+// TestARuntimeMappingCorrelatesByVALUENotBySpelling is the assertion that keeps
+// the decoded comparison from being a comment.
+//
+// The inbox stores the runtime identity as the opaque string it was given,
+// because it does not own that grammar; the envelope stores a UUID. Comparing
+// the two as TEXT passes every other case in this file and is wrong in exactly
+// one: a mapping accepted in upper case would correlate with nothing, so a
+// command whose effect is durably in the journal would report a broken mapping
+// and become permanently unsettleable — neither finishable nor rejectable.
+// Parsing the stored mapping and comparing VALUES is what makes the spelling
+// the caller happened to send irrelevant to the evidence.
+func TestARuntimeMappingCorrelatesByVALUENotBySpelling(t *testing.T) {
+	t.Parallel()
+
+	store, _, _ := inboxFixture(t, memstore.New())
+	request := testAdmitRequest()
+	request.CommandID = otherCommand
+	request.ProposedRuntimeCommandID = RuntimeCommandID(strings.ToUpper(string(inboxRuntime)))
+	admitted := mustAdmit(t, store, request)
+	if admitted.Record.RuntimeCommandID == inboxRuntime {
+		t.Fatal("the store normalized the mapping, so this case no longer distinguishes the two comparisons")
+	}
+
+	// The prefix carries the same identity in the canonical lower-case form a
+	// writer emits.
+	craftJournal(t, store,
+		openingFence(5),
+		stampedPrefix(5, otherCommand, inboxRuntime, inboxKind),
+		publicEvent("event-effect", `{"applied":true}`),
+	)
+
+	app := mustFindApplication(t, store, admitted)
+	if app.Outcome != CommandApplicationCommitted {
+		t.Fatalf("outcome = %q, want %q: the correlation compared spellings rather than values", app.Outcome, CommandApplicationCommitted)
+	}
+	if app.EffectEventID != "event-effect" {
+		t.Fatalf("effect = %q, want %q", app.EffectEventID, "event-effect")
 	}
 }
 

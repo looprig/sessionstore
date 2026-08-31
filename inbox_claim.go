@@ -469,16 +469,25 @@ func (s *Store) CompleteCommand(ctx context.Context, req CompleteCommandRequest)
 // settleable by nobody, forever, and is now settled when the session is next
 // attached.
 //
-// The OTHER source of unactionable due rows is unchanged and a reader sizing
-// that signal still needs it. A live claim occupies a due place it cannot be
-// settled from for as long as it lasts, and a claim may lapse after the apply
-// deadline by design. That one is bounded — MaxCommandClaimTTL is exactly the
-// bound, and it exists for this — and it is ordinary operation rather than a
-// crash: every command claimed close to its deadline contributes. So does an
-// UNRESOLVED correlation, which is the crash window between a prefix and its
-// effect: bounded by the same re-attachment as above, but only by it. Expect a
-// due page to contain rows that will clear on their own and rows that need a
-// lease to appear before they can.
+// THE PERMANENT HAZARD WAS RELOCATED, NOT ELIMINATED, and a reader sizing that
+// signal needs all three sources rather than the one this paragraph used to
+// name:
+//
+//   - A live claim that outlives the apply deadline occupies a due place it
+//     cannot be settled from. Bounded by MaxCommandClaimTTL, which exists for
+//     exactly this, and it is ordinary operation rather than a crash: every
+//     command claimed close to its deadline contributes.
+//   - An UNRESOLVED correlation in the conforming crash window — a prefix at
+//     the tip, its writer gone — is bounded by re-attachment: the successor's
+//     opening fence lands at prefix+1 and the correlation becomes abandoned.
+//   - An UNRESOLVED correlation from a WRITER-CONTRACT VIOLATION is bounded by
+//     nothing. If the record at prefix+1 is already something that is neither
+//     the effect nor a fence — a stacked prefix, an interleaved control record —
+//     it is durable and no later event changes it, so the command is
+//     unsettleable forever. That is the same permanent row this file used to
+//     hand every crashed applier, now confined to writers that broke the
+//     adjacency rule inbox_recovery.go states. It is smaller and it is not
+//     gone; a due-command reader must still expect rows that never clear.
 //
 // Nothing is starved TODAY, because this package exposes no due command reader
 // for anything to be starved out of; the hazard arrives with the reader.

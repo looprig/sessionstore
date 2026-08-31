@@ -184,7 +184,15 @@ func (w *JournalWriter) Sequence() uint64 {
 //
 // The writer owns the fields that carry ownership: an opening fence may not be
 // appended by a caller at all, and an application prefix must leave LeaseEpoch
-// zero for the writer to stamp. A body above the overflow threshold is uploaded
+// zero for the writer to stamp.
+//
+// Stamping the epoch is ALL this file checks about a prefix. What a prefix may
+// be appended for — which command, in what position relative to its effect, and
+// never for a command claimed under a lower grant than this writer's — is the
+// writer obligation stated in inbox_recovery.go, and it is unenforceable here:
+// this writer has no view of the inbox. A prefix appended against it does not
+// fail, it makes its command unrecoverable, so read that list before emitting
+// one. A body above the overflow threshold is uploaded
 // as an immutable object and verified before its reference is appended; if the
 // append then fails the verified object is deliberately left behind as an
 // orphan for garbage collection rather than deleted against a provider that has
