@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"math"
 	"reflect"
 	"strings"
 	"sync"
@@ -853,34 +854,39 @@ func TestReconcileHostTargetsRevalidatesTheStoredExpiry(t *testing.T) {
 		}
 	})
 
-	t.Run("a heartbeat lands between the page and the compare-and-swap", func(t *testing.T) {
+	t.Run("a heartbeat lands between the due page and the compare-and-swap", func(t *testing.T) {
 		t.Parallel()
 
 		base := memstore.New()
-		recorder := &recordingOrdered{OrderedIndex: base.OrderedIndex}
-		base.OrderedIndex = recorder
+		hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+		base.OrderedIndex = hostile
 		store, clock := hostTargetFixture(t, base)
 		publishCapacity(t, store, targetHost, 9, targetExpiresAt)
-
 		clock.set(targetLapsedAt)
-		// The hook re-enters on the heartbeat's own write, so it is guarded by a
-		// plain flag rather than a sync.Once: Once deadlocks when its function
-		// re-enters it, which is a property of Once and not of the code here.
-		// The whole interleaving runs on the sweep's goroutine.
+
+		// The interleaving point is the DUE PAGE, not the sweep's own write,
+		// and the difference is the whole claim under test. A heartbeat run
+		// from a hook on the sweep's Update lands after every read the sweep
+		// could make, so a sweep that re-read the row and compare-and-swapped
+		// on the FRESH revision would pass such a test while still withdrawing
+		// a Host that is alive. Publishing from the ListDue reply puts the
+		// heartbeat strictly between the page and the write, which is the only
+		// position that holds the sweep to the revision the PAGE reported.
 		beaten := false
-		recorder.beforeUpdate = func() {
-			if beaten {
-				return
+		hostile.answerDue(func(page storage.DuePage, err error) (storage.DuePage, error) {
+			if err != nil || beaten {
+				return page, err
 			}
 			beaten = true
 			beat := testPublishRequest(targetGeneration)
 			beat.ObservedAt = targetLapsedAt
 			beat.Advertisement.ExpiresAt = targetLapsedAt.Add(time.Minute)
 			mustPublish(t, store, beat)
-		}
+			return page, nil
+		})
 		result := mustReconcile(t, store, ReconcileHostTargetsRequest{})
 		if result.Scanned != 1 || result.Contended != 1 || result.Withdrawn != 0 {
-			t.Fatalf("sweep = %+v, want the write refused by the revision it read", result)
+			t.Fatalf("sweep = %+v, want the write refused by the revision the page reported", result)
 		}
 		if page := mustListCompatible(t, store, ListCompatibleHostsRequest{Key: testHostTargetKey()}); len(page.Hosts) != 1 {
 			t.Fatalf("the sweep withdrew a Host that heartbeated under it: %+v", page)
@@ -1110,6 +1116,16 @@ func TestHostTargetOperationsValidateBeforeAdmission(t *testing.T) {
 			call: func(store *Store) error {
 				_, err := store.ListCompatibleHosts(context.Background(), ListCompatibleHostsRequest{
 					Key: testHostTargetKey(), Limit: storage.MaxOrderedPageLimit + 1})
+				return err
+			},
+			assert: assertHostTargetField(HostTargetErrorInvalid, "limit"),
+		},
+		{
+			name:      "sweep with a page larger than any provider serves",
+			operation: "ReconcileHostTargets",
+			call: func(store *Store) error {
+				_, err := store.ReconcileHostTargets(context.Background(), ReconcileHostTargetsRequest{
+					Limit: storage.MaxOrderedPageLimit + 1})
 				return err
 			},
 			assert: assertHostTargetField(HostTargetErrorInvalid, "limit"),
@@ -1557,6 +1573,27 @@ func TestDecodeHostTargetFailsClosed(t *testing.T) {
 			want:  HostTargetErrorInvalid,
 		},
 		{
+			// The instant bounds are this package's own on both paths, and the
+			// decode path is where they are the ONLY guard: on a publish an
+			// out-of-range expiry is also outside MaxHostTargetTTL, so the
+			// bounded-expiry check would mask this one.
+			//
+			// The observation is moved EARLIER rather than later, and that is
+			// what makes the case pin what it claims to. A far-future
+			// observation is refused by Core's rule that the expiry must fall
+			// after it, so this case passed with the instant bound deleted; an
+			// observation before the representable range leaves Core's ordering
+			// satisfied and rankableTime as the only thing that can refuse it.
+			name:  "an observation whose UnixNano is undefined",
+			value: bytes.Replace(live, []byte(`"2026-08-30T14:00:00Z"`), []byte(`"1000-01-01T00:00:00Z"`), 1),
+			want:  HostTargetErrorInvalid,
+		},
+		{
+			name:  "a promise whose UnixMilli would be undefined",
+			value: bytes.Replace(live, []byte(`"2026-08-30T14:01:00Z"`), []byte(`"3000-01-01T00:00:00Z"`), 1),
+			want:  HostTargetErrorInvalid,
+		},
+		{
 			name:  "a dedicated row claiming more than its one seat",
 			value: bytes.Replace(live, []byte(`"placement":"pooled"`), []byte(`"placement":"dedicated"`), 1),
 			want:  HostTargetErrorInvalid,
@@ -1853,4 +1890,401 @@ func FuzzHostTargetCodec(f *testing.F) {
 			t.Fatalf("an accepted advertisement cannot be projected: %v", err)
 		}
 	})
+}
+
+// --- rows this reader cannot read -------------------------------------------
+
+// corruptStoredHostTarget overwrites one row's value in place, keeping the rank
+// and due the conforming write filed. That is what a NEWER WRITER's row looks
+// like to this reader: correctly filed, correctly ranked, correctly due, and
+// carrying a record version this build does not know.
+func corruptStoredHostTarget(t *testing.T, backend *storage.Composite, store *Store, key HostTargetKey, host sessionwire.HostID, value []byte) {
+	t.Helper()
+	scope, err := store.deriveHostTargetScope(key)
+	if err != nil {
+		t.Fatalf("deriveHostTargetScope: %v", err)
+	}
+	id := hostTargetID(scope, host)
+	stored, err := backend.OrderedIndex.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if _, err := backend.OrderedIndex.Update(
+		context.Background(), id, stored.Revision, value, stored.Rank, stored.Due); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+}
+
+// TestListCompatibleHostsSkipsARowItCannotRead is the wedge this reader must
+// not have. A row this build cannot decode — the newer writer's row that the
+// reconciler deliberately refuses to rewrite — stays ranked forever, so a
+// reader that failed the whole page on it would take EVERY Host serving that
+// target out of service permanently, with no automatic recovery anywhere in the
+// system. Skipping and counting removes the wedge while keeping the newer
+// writer's row untouched: it starts being published the moment a reader that
+// understands it asks.
+func TestListCompatibleHostsSkipsARowItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	base := memstore.New()
+	store, clock := hostTargetFixture(t, base)
+	publishCapacity(t, store, "host-a", 9, targetExpiresAt)
+	publishCapacity(t, store, "host-b", 1, targetExpiresAt)
+	corruptStoredHostTarget(t, base, store, testHostTargetKey(), "host-a",
+		[]byte(`{"record_version":2,"agent_id":"agent-a"}`))
+
+	page := mustListCompatible(t, store, ListCompatibleHostsRequest{Key: testHostTargetKey()})
+	if len(page.Hosts) != 1 || page.Hosts[0].HostID != "host-b" {
+		t.Fatalf("hosts = %+v, want the one readable Host", page.Hosts)
+	}
+	if page.UnreadableSkipped != 1 {
+		t.Fatalf("unreadable = %d, want 1", page.UnreadableSkipped)
+	}
+	if page.LapsedSkipped != 0 {
+		t.Fatalf("unreadable rows must not be counted as lapsed: %+v", page)
+	}
+
+	// And it stays that way across a sweep, because a sweep deliberately does
+	// not rewrite a row it cannot read either.
+	clock.set(targetLapsedAt)
+	mustReconcile(t, store, ReconcileHostTargetsRequest{})
+	after := mustListCompatible(t, store, ListCompatibleHostsRequest{Key: testHostTargetKey()})
+	if after.UnreadableSkipped != 1 {
+		t.Fatalf("unreadable = %d after a sweep, want 1", after.UnreadableSkipped)
+	}
+}
+
+// TestListCompatibleHostsSkipsAMisfiledRowRatherThanFailingThePage reaches the
+// filing checks through the READ PATH rather than through a direct call, which
+// is the only way to prove they are wired into it — and, with the skip above,
+// that one misfiled row cannot take a whole target's capacity out of service.
+func TestListCompatibleHostsSkipsAMisfiledRowRatherThanFailingThePage(t *testing.T) {
+	t.Parallel()
+
+	base := memstore.New()
+	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = hostile
+	store, _ := hostTargetFixture(t, base)
+	publishCapacity(t, store, "host-a", 9, targetExpiresAt)
+	publishCapacity(t, store, "host-b", 1, targetExpiresAt)
+
+	hostile.answerRanked(func(page storage.RankedPage, err error) (storage.RankedPage, error) {
+		if err != nil {
+			return page, err
+		}
+		for i := range page.Records {
+			if page.Records[i].ID.StableKey == "host-a" {
+				page.Records[i].ID.OrderingScope += "/elsewhere"
+			}
+		}
+		return page, nil
+	})
+	page := mustListCompatible(t, store, ListCompatibleHostsRequest{Key: testHostTargetKey()})
+	if len(page.Hosts) != 1 || page.Hosts[0].HostID != "host-b" {
+		t.Fatalf("hosts = %+v, want the one correctly filed Host", page.Hosts)
+	}
+	if page.UnreadableSkipped != 1 {
+		t.Fatalf("unreadable = %d, want 1", page.UnreadableSkipped)
+	}
+}
+
+// TestReconcileHostTargetsResumesPastAnExhaustedBudget is the boundary case,
+// not the mechanism. A row this sweep cannot read stays due forever, so it
+// heads every later ascending due page; once the unreadable population reaches
+// the page budget, a sweep that always restarted at the head would reach
+// NOTHING behind them, ever, and the population only grows. The continuation is
+// what makes the cost bounded rather than the progress zero.
+func TestReconcileHostTargetsResumesPastAnExhaustedBudget(t *testing.T) {
+	t.Parallel()
+
+	base := memstore.New()
+	store, clock := hostTargetFixture(t, base)
+	for _, host := range []sessionwire.HostID{"host-a", "host-b", "host-c", "host-d"} {
+		publishCapacity(t, store, host, 1, targetExpiresAt)
+	}
+	// Ascending (due_at, stable_key) puts the three unreadable rows in front of
+	// the genuinely crashed one.
+	for _, host := range []sessionwire.HostID{"host-a", "host-b", "host-c"} {
+		corruptStoredHostTarget(t, base, store, testHostTargetKey(), host,
+			[]byte(`{"record_version":2,"agent_id":"agent-a"}`))
+	}
+	clock.set(targetLapsedAt)
+
+	// The whole budget goes to rows the sweep cannot handle.
+	first := mustReconcile(t, store, ReconcileHostTargetsRequest{Limit: 1, MaxPages: 2})
+	if first.Unreadable != 2 || first.Withdrawn != 0 || first.Exhausted {
+		t.Fatalf("first sweep = %+v, want a budget spent entirely on unreadable rows", first)
+	}
+	if first.NextCursor == "" {
+		t.Fatal("a sweep that ran out of budget must offer a continuation, or its progress is zero forever")
+	}
+
+	// Restarting from the head makes exactly the same non-progress, which is
+	// the state this continuation exists to escape.
+	repeat := mustReconcile(t, store, ReconcileHostTargetsRequest{Limit: 1, MaxPages: 2})
+	if repeat.Withdrawn != 0 || repeat.Unreadable != 2 {
+		t.Fatalf("a cursorless re-sweep = %+v, want the identical non-progress", repeat)
+	}
+
+	// Resuming reaches the row behind them and withdraws it. The budget is
+	// deliberately too small to reach the victim from the HEAD, and the clock
+	// has moved on, so a sweep that ignored the continuation would report two
+	// unreadable rows and no withdrawal, and one that kept the position but
+	// recomputed the due bound would present a token for a query the provider
+	// never issued. Neither is distinguishable from a real resume without both.
+	clock.set(targetLapsedAt.Add(time.Second))
+	resumed := mustReconcile(t, store, ReconcileHostTargetsRequest{
+		Limit: 1, MaxPages: 2, Cursor: first.NextCursor})
+	if resumed.Withdrawn != 1 || resumed.Unreadable != 1 {
+		t.Fatalf("resumed sweep = %+v, want one unreadable row stepped over and the crashed Host withdrawn", resumed)
+	}
+	if !resumed.Exhausted {
+		t.Fatalf("resumed sweep = %+v, want the view exhausted", resumed)
+	}
+	if resumed.NextCursor != "" {
+		t.Fatalf("an exhausted sweep issued a continuation: %+v", resumed)
+	}
+	stored := storedHostTargetRow(t, store, testHostTargetKey(), "host-d")
+	if stored.Due != (storage.Due{}) || stored.Rank != (storage.Rank{}) {
+		t.Fatalf("the row behind the unreadable ones is still in a view: %+v %+v", stored.Due, stored.Rank)
+	}
+}
+
+// TestReconcileHostTargetsRefusesAForeignContinuation holds the sweep's
+// continuation to its own cursor kind. A placement token and a sweep token are
+// both this package's, both opaque, and both handed back by a caller; nothing
+// but the kind tag stops one being presented as the other.
+func TestReconcileHostTargetsRefusesAForeignContinuation(t *testing.T) {
+	t.Parallel()
+
+	store, clock := hostTargetFixture(t, memstore.New())
+	publishCapacity(t, store, "host-a", 1, targetExpiresAt)
+	publishCapacity(t, store, "host-b", 1, targetExpiresAt)
+
+	placement := mustListCompatible(t, store, ListCompatibleHostsRequest{Key: testHostTargetKey(), Limit: 1})
+	if placement.NextCursor == "" {
+		t.Fatal("the fixture did not produce a placement continuation")
+	}
+	clock.set(targetLapsedAt)
+	_, err := store.ReconcileHostTargets(context.Background(), ReconcileHostTargetsRequest{
+		Cursor: placement.NextCursor})
+	assertHostTargetField(HostTargetErrorCursor, "cursor")(t, err)
+
+	sweep := mustReconcile(t, store, ReconcileHostTargetsRequest{Limit: 1, MaxPages: 1})
+	if sweep.NextCursor == "" {
+		t.Fatal("the fixture did not produce a sweep continuation")
+	}
+	_, err = store.ListCompatibleHosts(context.Background(), ListCompatibleHostsRequest{
+		Key: testHostTargetKey(), Cursor: sweep.NextCursor})
+	assertHostTargetField(HostTargetErrorCursor, "cursor")(t, err)
+
+	_, err = store.ReconcileHostTargets(context.Background(), ReconcileHostTargetsRequest{Cursor: "not-a-cursor"})
+	assertHostTargetField(HostTargetErrorCursor, "cursor")(t, err)
+}
+
+// --- provenance of the instants each writer stores --------------------------
+
+// TestHostTargetInstantsComeFromTheRightClock pins WHICH clock each of the
+// three writers records, which is invisible while every fixture puts the Host
+// and the store at the same instant. A Host's own observation is the Host's to
+// report; a withdrawal is not an observation of anything and records that THIS
+// STORE wrote it.
+func TestHostTargetInstantsComeFromTheRightClock(t *testing.T) {
+	t.Parallel()
+
+	observed := targetObservedAt.Add(-10 * time.Second)
+
+	t.Run("a publish stores the Host's own observation", func(t *testing.T) {
+		t.Parallel()
+
+		store, _ := hostTargetFixture(t, memstore.New())
+		req := testPublishRequest(targetGeneration)
+		req.ObservedAt = observed
+		entry := mustPublish(t, store, req)
+		if !entry.Target.ObservedAt.Equal(observed) {
+			t.Fatalf("observed_at = %s, want the Host's %s (not the store's %s)",
+				entry.Target.ObservedAt, observed, targetObservedAt)
+		}
+	})
+
+	t.Run("a drain stores the store's own instant", func(t *testing.T) {
+		t.Parallel()
+
+		store, clock := hostTargetFixture(t, memstore.New())
+		req := testPublishRequest(targetGeneration)
+		req.ObservedAt = observed
+		mustPublish(t, store, req)
+
+		drained := targetObservedAt.Add(20 * time.Second)
+		clock.set(drained)
+		entry := mustDrain(t, store, testDrainRequest(targetGeneration))
+		if !entry.Target.ObservedAt.Equal(drained) {
+			t.Fatalf("observed_at = %s, want the store's %s (not the Host's %s)",
+				entry.Target.ObservedAt, drained, observed)
+		}
+	})
+
+	t.Run("a sweep stores the instant it swept at", func(t *testing.T) {
+		t.Parallel()
+
+		store, clock := hostTargetFixture(t, memstore.New())
+		req := testPublishRequest(targetGeneration)
+		req.ObservedAt = observed
+		mustPublish(t, store, req)
+
+		clock.set(targetLapsedAt)
+		mustReconcile(t, store, ReconcileHostTargetsRequest{})
+		stored := storedHostTargetRow(t, store, testHostTargetKey(), targetHost)
+		record, err := decodeHostTarget(stored.Value)
+		if err != nil {
+			t.Fatalf("decodeHostTarget: %v", err)
+		}
+		if !record.ObservedAt.Equal(targetLapsedAt) {
+			t.Fatalf("observed_at = %s, want the sweep's %s (not the crashed Host's %s)",
+				record.ObservedAt, targetLapsedAt, observed)
+		}
+	})
+}
+
+// TestPublishHostTargetReportsALostCreateAsAConflict covers the one outcome a
+// first publish has that no ordinary path reaches: another writer created the
+// same (target, host) row while this create was in flight. It is reported as a
+// lost race carrying the current revision rather than being turned into an
+// update here, because the row that arrived carries a generation this request
+// has never been compared against.
+func TestPublishHostTargetReportsALostCreateAsAConflict(t *testing.T) {
+	t.Parallel()
+
+	base := memstore.New()
+	recorder := &recordingOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = recorder
+	store, _ := hostTargetFixture(t, base)
+
+	raced := false
+	recorder.beforeCreate = func() {
+		if raced {
+			return
+		}
+		raced = true
+		competitor := testPublishRequest(targetGeneration + 1)
+		competitor.Advertisement.AvailableCapacity = 7
+		mustPublish(t, store, competitor)
+	}
+	_, err := store.PublishHostTarget(context.Background(), testPublishRequest(targetGeneration))
+	got := assertHostTargetCode(t, err, HostTargetErrorConflict)
+	if got.Field != "create" {
+		t.Fatalf("field = %q, want %q", got.Field, "create")
+	}
+	if got.Revision == 0 {
+		t.Fatal("a lost create disclosed no revision, so a caller cannot re-read against it")
+	}
+
+	// The competitor's row is intact: a lost create never overwrites.
+	stored := storedHostTargetRow(t, store, testHostTargetKey(), targetHost)
+	record, err := decodeHostTarget(stored.Value)
+	if err != nil {
+		t.Fatalf("decodeHostTarget: %v", err)
+	}
+	if record.Advertisement.AvailableCapacity != 7 {
+		t.Fatalf("the loser overwrote the winner: %+v", record.Advertisement)
+	}
+}
+
+// TestLargestAcceptableHostTargetFitsTheBound is why encodeHostTarget's size
+// refusal is a RELATIONSHIP rather than a live branch. Every member of this
+// record is bounded by Core's identity ceiling, so the largest record the
+// validators accept is a small multiple of it and the encode-path refusal
+// cannot be reached with an input this package would otherwise store. What the
+// bound must guarantee is that a record this package accepts can always be
+// REWRITTEN — and this row is rewritten on every heartbeat, so a record that
+// could be created and not updated would freeze at whatever it last reported.
+func TestLargestAcceptableHostTargetFitsTheBound(t *testing.T) {
+	t.Parallel()
+
+	fill := func(prefix string) string {
+		return prefix + strings.Repeat("x", sessionwire.MaxIDBytes-len(prefix))
+	}
+	largest := HostTarget{
+		Key: HostTargetKey{
+			AgentID:                sessionwire.AgentID(fill("agent-")),
+			RuntimeCompatibilityID: fill("runtime-"),
+			Placement:              sessionwire.HostPlacementPooled,
+		},
+		HostID:         sessionwire.HostID(fill("host-")),
+		HostGeneration: math.MaxUint64,
+		ObservedAt:     targetObservedAt,
+		Advertisement: &HostAdvertisement{
+			InternalEndpoint:  sessionwire.InternalEndpoint(fill("wss://h.internal/")),
+			IsolationClass:    sessionwire.HostIsolationClassTenantExclusive,
+			Accepting:         true,
+			AvailableCapacity: MaxHostTargetAvailableCapacity,
+			ExpiresAt:         targetExpiresAt,
+		},
+	}
+	encoded, _, err := encodeHostTarget(largest)
+	if err != nil {
+		t.Fatalf("the largest acceptable target does not encode: %v", err)
+	}
+	if len(encoded) >= MaxHostTargetRecordBytes {
+		t.Fatalf("the largest acceptable target is %d bytes, at or above the %d-byte bound",
+			len(encoded), MaxHostTargetRecordBytes)
+	}
+	if _, err := decodeHostTarget(encoded); err != nil {
+		t.Fatalf("the largest acceptable target does not decode: %v", err)
+	}
+}
+
+// TestCursorMagicsAreDistinct pins what a cursor magic IS: the KIND tag that
+// stops one query family's continuation being replayed into another's. It is
+// the direct analogue of TestOrderedNamespacesAreDistinct, and it is
+// defence-in-depth rather than the only barrier — the scope digests are framed
+// under different domains too — which is exactly why nothing else would notice
+// a duplicate.
+func TestCursorMagicsAreDistinct(t *testing.T) {
+	t.Parallel()
+
+	magics := map[string]string{
+		"catalog page":      catalogCursorMagic,
+		"placement page":    hostTargetCursorMagic,
+		"host target sweep": hostTargetSweepCursorMagic,
+	}
+	seen := map[string]string{}
+	for kind, magic := range magics {
+		if len(magic) != cursorMagicBytes {
+			t.Errorf("the %s magic %q is %d bytes, want %d", kind, magic, len(magic), cursorMagicBytes)
+		}
+		if other, ok := seen[magic]; ok {
+			t.Fatalf("%s and %s share the magic %q", other, kind, magic)
+		}
+		seen[magic] = kind
+	}
+}
+
+// TestReconcileHostTargetsRefusesAContinuationItCannotReissue holds the sweep's
+// payload ceiling on the ISSUE side, and here that is sharper than it is for a
+// placement page: a continuation this sweep cannot hand back is a sweep that
+// silently reverts to restarting at the head of the due view every pass, which
+// is exactly the zero-progress state the continuation exists to remove.
+func TestReconcileHostTargetsRefusesAContinuationItCannotReissue(t *testing.T) {
+	t.Parallel()
+
+	base := memstore.New()
+	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = hostile
+	store, clock := hostTargetFixture(t, base)
+	publishCapacity(t, store, targetHost, 1, targetExpiresAt)
+
+	hostile.answerDue(func(page storage.DuePage, err error) (storage.DuePage, error) {
+		if err != nil {
+			return page, err
+		}
+		page.NextCursor = storage.DueCursor(strings.Repeat("t", maxHostTargetCursorBytes))
+		return page, nil
+	})
+	clock.set(targetLapsedAt)
+	_, err := store.ReconcileHostTargets(context.Background(), ReconcileHostTargetsRequest{MaxPages: 1})
+	got := assertHostTargetCode(t, err, HostTargetErrorBackend)
+	if got.Field != "next_cursor" {
+		t.Fatalf("field = %q, want %q", got.Field, "next_cursor")
+	}
 }

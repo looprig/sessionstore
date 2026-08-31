@@ -3,9 +3,9 @@ package sessionstore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
-	"strconv"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -44,6 +44,16 @@ const (
 	// written but not rewritten. A heartbeat rewrites this row on a fixed
 	// cadence forever, so a row that could be created but not updated would be
 	// a row frozen at whatever capacity it last reported.
+	//
+	// On the ENCODE path the refusal is unreachable, and that is the point
+	// rather than a gap: every member is bounded by Core's identity ceiling, so
+	// the largest record the validators accept is a small multiple of it. What
+	// holds the relationship is therefore not a test that reaches the branch —
+	// none can — but the unsigned constant below, which fails to compile if the
+	// bound ever exceeds the provider's, and
+	// TestLargestAcceptableHostTargetFitsTheBound, which fails if the members
+	// ever grow into it. On the DECODE path it is live: those bytes are not
+	// this package's to bound.
 	MaxHostTargetRecordBytes = 8 << 10
 )
 
@@ -81,6 +91,19 @@ const MaxHostTargetAvailableCapacity uint64 = 1 << 20
 // that advertised generous capacity is the first row every placement page
 // returns. This ceiling bounds how long a single skewed clock reading can hold
 // that position before the row is even eligible to be reconciled away.
+//
+// THE COUNTER-ARGUMENT, recorded so the next reader sees both. The ceiling
+// binds only a Host whose clock is badly skewed — a healthy Host's promise is
+// its heartbeat interval, orders of magnitude below this — and for exactly that
+// population a Factory can be handed a dead endpoint on every placement attempt
+// at the target for the whole window. Five minutes was argued for on that basis
+// and is defensible. Fifteen is kept because the failure it trades against is
+// the opposite one: a ceiling below a real deployment's heartbeat interval
+// refuses HEALTHY Hosts, which removes capacity rather than merely mis-offering
+// it, and this package has no visibility into what that interval is. The choice
+// is a judgement call within a factor of three, it is pinned at both boundaries
+// by TestPublishHostTargetBoundsTheHeartbeatPromise, and it is cheap to change:
+// nothing derives from it and no stored record embeds it.
 const MaxHostTargetTTL = 15 * time.Minute
 
 // HostTargetKey is the target half of an advertisement's identity: the
@@ -980,21 +1003,34 @@ type ListCompatibleHostsRequest struct {
 // to the HOST that owns the row, through publish and drain, and a placement
 // reader has no business rewriting another process's advertisement.
 //
-// LapsedSkipped counts the rows this page passed over because their heartbeat
-// promise had already lapsed at the store's clock. It is NOT a diagnostic
-// afterthought: a lapsed row is still ranked, so it still occupies a position
-// in the provider's page, and a page that silently returned fewer entries would
+// TWO COUNTS say why a page is shorter than its limit, and neither is a
+// diagnostic afterthought. A page that silently returned fewer entries would
 // leave a caller unable to tell "this target has little capacity" from "this
-// target is full of dead Hosts". A nonzero count means the directory is owed a
-// ReconcileHostTargets pass.
+// target is full of rows I passed over", and the two causes want different
+// responses:
+//
+//   - LapsedSkipped counts rows whose heartbeat promise had already lapsed at
+//     the store's clock. Such a row is still RANKED, so it still occupies a
+//     position in every later page; a nonzero count means the directory is owed
+//     a ReconcileHostTargets pass, which is the only thing that clears it.
+//   - UnreadableSkipped counts rows this build could not decode, or that
+//     disagreed with the filing they were found under. Such a row is skipped
+//     rather than FAILING THE PAGE, and that is load-bearing rather than
+//     lenient. Nothing in this package ever rewrites a row it cannot read — a
+//     newer writer may have produced it — so a reader that failed the page on
+//     one would take every Host serving that target out of service permanently,
+//     with no recovery path anywhere in the system. Skipping keeps the newer
+//     writer's row untouched and starts publishing it the instant a reader that
+//     understands it asks, while the count keeps the condition visible.
 //
 // A page may therefore contain fewer than Limit entries while still issuing a
 // continuation. A caller that wants a specific number of candidates pages until
 // NextCursor is empty; it must not treat a short page as the end of the target.
 type HostTargetPage struct {
-	Hosts         []sessionwire.HostLinkCapacityReport
-	LapsedSkipped int
-	NextCursor    sessionwire.Cursor
+	Hosts             []sessionwire.HostLinkCapacityReport
+	LapsedSkipped     int
+	UnreadableSkipped int
+	NextCursor        sessionwire.Cursor
 }
 
 // hostTargetLiveness is the one statement of what makes a stored row a
@@ -1003,12 +1039,13 @@ type HostTargetPage struct {
 // what is lapsed — so the two can never drift into different ideas of when an
 // advertisement has run out.
 //
-// The order is load-bearing. A withdrawn row is refused on its STRUCTURE,
-// before any instant is compared, so a withdrawal holds under every clock a
-// caller can configure — including one reading before the row was written,
-// under which an expiry comparison alone would have nothing to compare. Nothing
-// validates what a Clock returns; routableAt and claimLive state the same
-// reasoning for the same reason.
+// The order is load-bearing, and what enforces it is stronger than this
+// comment: a withdrawn row HAS no expiry to compare, so the two arms cannot be
+// swapped — reversing them dereferences a nil advertisement rather than
+// silently accepting a withdrawal as live. The wrong order is unrepresentable,
+// which is why no test drives it and none pretends to. routableAt states the
+// clock-shaped version of this argument because a released registration does
+// carry timestamps and therefore needs one; this record does not.
 //
 // The interval is half-open — an advertisement holds up to but not including
 // its expiry — which is the convention every deadline in this package uses.
@@ -1061,6 +1098,15 @@ const (
 // It is emphatically not this package's answer to stale rows accumulating: the
 // row is still ranked and still occupies a position in every later page, and
 // ReconcileHostTargets is what removes it. The count says so out loud.
+//
+// NO SINGLE ROW CAN FAIL A PAGE. Every per-row refusal is counted and stepped
+// over, and that is the strongest rule in this file, because the alternative is
+// unrecoverable: nothing in this package ever rewrites a row it cannot read, so
+// a page that failed on one would take every Host serving that target out of
+// service for as long as the row existed, which is forever. The two counts on
+// HostTargetPage are what keep that from being silent. A failure returned from
+// here is therefore always about the QUERY — a bad limit, a foreign cursor, a
+// provider that could not answer — and never about one row.
 func (s *Store) ListCompatibleHosts(ctx context.Context, req ListCompatibleHostsRequest) (HostTargetPage, error) {
 	limit, ok := s.pageLimit(req.Limit)
 	if !ok {
@@ -1088,17 +1134,12 @@ func (s *Store) ListCompatibleHosts(ctx context.Context, req ListCompatibleHosts
 	}
 	now := s.clock.Now()
 	page := HostTargetPage{Hosts: make([]sessionwire.HostLinkCapacityReport, 0, len(ranked.Records))}
-	for index, stored := range ranked.Records {
-		// A failure here fails the WHOLE page, and it is located by position:
-		// one unreadable row otherwise makes a target permanently unlistable
-		// with an error naming no row, so an operator has nothing to repair.
-		// The position is a coordinate in this response, not a provider key or
-		// any of the record's bytes.
-		position := "hosts[" + strconv.Itoa(index) + "]"
+	for _, stored := range ranked.Records {
 		entry, err := hostTargetEntryFor(
 			stored, scope.TargetScope, req.Key, sessionwire.HostID(stored.ID.StableKey))
 		if err != nil {
-			return HostTargetPage{}, locateHostTargetError(err, position)
+			page.UnreadableSkipped++
+			continue
 		}
 		if hostTargetLiveness(entry.Target, now) != hostTargetLive {
 			// A withdrawn row cannot reach here — it is unranked, so the ranked
@@ -1110,7 +1151,12 @@ func (s *Store) ListCompatibleHosts(ctx context.Context, req ListCompatibleHosts
 		}
 		report, err := entry.Target.Report()
 		if err != nil {
-			return HostTargetPage{}, locateHostTargetError(err, position)
+			// Unreachable through canonicalHostTarget, which projects every
+			// advertised record it accepts. Counted rather than returned so
+			// that no future relaxation of that rule can reintroduce a row that
+			// fails a whole target's page.
+			page.UnreadableSkipped++
+			continue
 		}
 		page.Hosts = append(page.Hosts, report)
 	}
@@ -1122,19 +1168,6 @@ func (s *Store) ListCompatibleHosts(ctx context.Context, req ListCompatibleHosts
 		page.NextCursor = next
 	}
 	return page, nil
-}
-
-// locateHostTargetError attaches a page position to a row failure without
-// changing what the failure IS, so a caller still branches on the same code and
-// an operator learns which row to look at.
-func locateHostTargetError(err error, position string) error {
-	var failure *HostTargetError
-	if !errors.As(err, &failure) {
-		return err
-	}
-	located := *failure
-	located.Field = position + "." + failure.Field
-	return &located
 }
 
 // The placement page cursor. Its payload is the provider's own ranked cursor,
@@ -1295,21 +1328,47 @@ func (s *Store) DrainHostTarget(ctx context.Context, req DrainHostTargetRequest)
 //
 // A sweep is bounded by pages as well as by page size because it must be able
 // to STEP OVER a row it cannot handle. A row this sweep cannot decode stays
-// due, so it sits at the head of every later ascending due page; a
-// single-page sweep would spend every pass on that row and never reach the
-// rows behind it, which is the head-of-line failure the deadline view exists
-// not to have. The budget is what converts that from starvation into a bounded
-// cost, and HostTargetReconcileResult.Unreadable is what makes the cost visible.
+// due, so it sits at the head of every later ascending due page; a single-page
+// sweep would spend every pass on that row and never reach the rows behind it.
+//
+// THE BUDGET ALONE IS NOT THE ANSWER, and believing it was is how this record
+// nearly shipped with the head-of-line failure its own deadline view exists not
+// to have. A budget bounds the work ONE PASS does; it does nothing about
+// progress, because every pass restarts at the head of the same ascending view
+// and nothing ever removes an unreadable row, so that population is
+// monotonically non-decreasing. Once it reaches MaxPages x Limit rows, every
+// later pass spends its whole budget on them and withdraws nothing, forever.
+//
+// What actually supplies progress is the CONTINUATION on the result: a sweep
+// that runs out of budget hands back where it stopped, and a caller that pages
+// until Exhausted reaches every row however many unreadable ones precede them.
+// The budget then means what it says — a bound on one call — and
+// HostTargetReconcileResult.Unreadable is what makes the cost of those rows
+// visible rather than merely survivable.
 const (
 	DefaultHostTargetReconcilePages = 16
 	MaxHostTargetReconcilePages     = 1024
 )
 
 // ReconcileHostTargetsRequest bounds one service-owned sweep of the directory's
-// deadline view. Zero means the default in both members.
+// deadline view. Zero means the default in Limit and MaxPages.
 type ReconcileHostTargetsRequest struct {
 	Limit    int
 	MaxPages int
+
+	// Cursor resumes a sweep that ran out of page budget. It is opaque: retain
+	// it and hand it back, but do not parse it. Possessing one authorizes
+	// nothing — this operation is service-owned and a caller must establish
+	// that on its own — and a token this store did not issue for a sweep is
+	// refused with HostTargetErrorCursor.
+	//
+	// Resuming is not an optimization. A row the sweep cannot handle stays due,
+	// so it heads every later ascending due page; once such rows fill the page
+	// budget, a sweep that always restarted at the head would reach nothing
+	// behind them, and because nothing removes an unreadable row that
+	// population never shrinks. The continuation is what makes the cost of
+	// those rows bounded rather than the progress zero.
+	Cursor sessionwire.Cursor
 }
 
 // HostTargetReconcileResult accounts for every row one sweep scanned. The four
@@ -1334,15 +1393,18 @@ type ReconcileHostTargetsRequest struct {
 //     transient.
 //
 // Exhausted reports whether the sweep reached the end of the due view within
-// its page budget. False means there is more to do and the caller should sweep
-// again.
+// its page budget. NextCursor is nonempty exactly when it did not, and a caller
+// that wants the whole view hands it back — see ReconcileHostTargetsRequest for
+// why that is a correctness property rather than a convenience.
 type HostTargetReconcileResult struct {
 	Scanned    int
 	Withdrawn  int
 	StillLive  int
 	Contended  int
 	Unreadable int
+
 	Exhausted  bool
+	NextCursor sessionwire.Cursor
 }
 
 // ReconcileHostTargets withdraws the advertisements of Hosts that stopped
@@ -1392,16 +1454,24 @@ func (s *Store) ReconcileHostTargets(
 		return HostTargetReconcileResult{}, hostTargetErr(HostTargetErrorInvalid, "max_pages", nil)
 	}
 
+	now := s.clock.Now()
+	bound := now.UnixMilli()
+	var after storage.DueCursor
+	if req.Cursor != "" {
+		resumedBound, resumedAfter, err := s.decodeHostTargetSweepCursor(req.Cursor)
+		if err != nil {
+			return HostTargetReconcileResult{}, err
+		}
+		bound, after = resumedBound, resumedAfter
+	}
+
 	opCtx, release, err := s.admitForeground(ctx)
 	if err != nil {
 		return HostTargetReconcileResult{}, err
 	}
 	defer release()
 
-	now := s.clock.Now()
-	bound := now.UnixMilli()
 	var result HostTargetReconcileResult
-	var after storage.DueCursor
 	for range pages {
 		due, err := s.backend.OrderedIndex.ListDue(opCtx, hostTargetNamespace, bound, after, limit)
 		if err != nil {
@@ -1420,10 +1490,78 @@ func (s *Store) ReconcileHostTargets(
 		after = due.NextCursor
 		if after == "" {
 			result.Exhausted = true
-			break
+			return result, nil
 		}
 	}
+	next, err := s.encodeHostTargetSweepCursor(bound, after)
+	if err != nil {
+		return result, err
+	}
+	result.NextCursor = next
 	return result, nil
+}
+
+// The sweep continuation. Its payload is the due bound this sweep is querying
+// at, followed by the provider's own due token carried verbatim.
+//
+// THE BOUND IS IN THE TOKEN because it has to be: the ordered index binds a due
+// cursor to the exact bound that issued it, so a resumed call that recomputed
+// the bound from its own clock would present a token for a different query and
+// be refused. Carrying it is what makes resuming possible at all.
+//
+// Carrying it costs nothing in safety, and that is worth stating rather than
+// assuming. The bound only selects WHICH rows a page contains; it decides
+// nothing about them. Every row is revalidated against its own stored expiry at
+// the sweep's current clock reading before anything is written, so a caller
+// presenting a bound this store never issued can at worst make the sweep look
+// at rows that are not lapsed, which the revalidation then declines to touch.
+// The envelope's kind tag and scope are what stop a placement token being
+// presented here; neither confers authority, as cursor.go states.
+const (
+	hostTargetSweepCursorMagic        = "LRHS"
+	hostTargetSweepCursorVersion byte = 1
+
+	hostTargetSweepBoundBytes = 8
+
+	// The ceiling is enforced on ISSUE as well as on presentation, so a token
+	// this store hands out is always one it will accept back — and here that is
+	// sharper than usual, because a continuation this sweep cannot reissue is a
+	// sweep that silently reverts to making no progress.
+	maxHostTargetSweepCursorPayload = maxHostTargetCursorBytes - cursorPayloadAt
+)
+
+// hostTargetSweepCursorScope binds the continuation to this cursor KIND and to
+// nothing else. A sweep names no tenant, no target and no host — that is what
+// makes it a service operation — so there is no identity to bind it to, and
+// inventing one would suggest a scoping this operation does not have.
+func (s *Store) hostTargetSweepCursorScope() [cursorScopeBytes]byte {
+	return s.keys.digest(digestFrame("looprig/sessionstore/hosttarget/sweep/cursor/v1"))
+}
+
+func (s *Store) encodeHostTargetSweepCursor(bound int64, after storage.DueCursor) (sessionwire.Cursor, error) {
+	payload := make([]byte, hostTargetSweepBoundBytes, hostTargetSweepBoundBytes+len(after))
+	binary.BigEndian.PutUint64(payload, uint64(bound)) // #nosec G115 -- a signed bound round-trips through the same width
+	payload = append(payload, after...)
+	if len(payload) > maxHostTargetSweepCursorPayload {
+		return "", hostTargetErr(HostTargetErrorBackend, "next_cursor", nil)
+	}
+	token := encodeCursorEnvelope(
+		hostTargetSweepCursorMagic, hostTargetSweepCursorVersion, s.hostTargetSweepCursorScope(), payload)
+	return sessionwire.Cursor(token), nil
+}
+
+// decodeHostTargetSweepCursor unwraps a continuation this store issued for a
+// sweep. A continuation this sweep issued always carries at least one provider
+// byte beyond the bound, because an exhausted view returns no cursor at all.
+func (s *Store) decodeHostTargetSweepCursor(cursor sessionwire.Cursor) (int64, storage.DueCursor, error) {
+	payload, ok := decodeCursorEnvelope(
+		hostTargetSweepCursorMagic, hostTargetSweepCursorVersion, s.hostTargetSweepCursorScope(),
+		string(cursor), hostTargetSweepBoundBytes+1, maxHostTargetSweepCursorPayload)
+	if !ok {
+		return 0, "", hostTargetErr(HostTargetErrorCursor, "cursor", nil)
+	}
+	bound := int64(binary.BigEndian.Uint64(payload[:hostTargetSweepBoundBytes])) // #nosec G115 -- the inverse of the encode above
+	return bound, storage.DueCursor(payload[hostTargetSweepBoundBytes:]), nil
 }
 
 // reconcileHostTargetRow handles one row of a due page, counting its outcome.

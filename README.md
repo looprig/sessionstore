@@ -515,6 +515,18 @@ Three things remove a row from the placement page, and nothing else does:
   handed an endpoint this store will not vouch for, but the row stays ranked. A
   nonzero count means the directory is owed a sweep.
 
+**No single row can fail a placement page.** Every per-row refusal is counted
+and stepped over — lapsed ones in `LapsedSkipped`, undecodable and misfiled ones
+in `UnreadableSkipped` — and that is the strongest rule in this record rather
+than leniency. Nothing here ever rewrites a row it cannot read, because a newer
+writer may have produced it; so a reader that failed the whole page on one would
+take *every* Host serving that target out of service for as long as the row
+existed, which is forever, with no recovery path anywhere in the system.
+Skipping leaves the newer writer's row untouched and starts publishing it the
+instant a reader that understands it asks. A failure returned from
+`ListCompatibleHosts` is therefore always about the query — a bad limit, a
+foreign cursor, a provider that could not answer — and never about one row.
+
 Nothing here calls the provider's `Delete`, and it cannot: the ordered index
 promises an identity is never reusable after a tombstone, while a Host that
 drains at shutdown and advertises again at startup reuses this identity as a
@@ -530,16 +542,27 @@ which case the write loses. A sweep that trusted the page alone would withdraw
 the capacity of a Host that is alive, and `StillLive` counts the rows the
 revalidation saved.
 
-The sweep takes ONE clock reading for both the due bound and the revalidation,
-which is required rather than tidy: a due cursor binds to the exact bound that
-issued it, so a re-read bound could not page at all. It is bounded by pages as
-well as by page size, and that budget is the head-of-line answer: a row the
-sweep cannot decode stays due and therefore sits at the head of every later
-ascending due page, so the sweep uses the provider's continuation to STEP OVER
-it and reach the rows behind. Such a row is counted in `Unreadable` and is
-deliberately NOT rewritten — a row this sweep cannot read may be one a NEWER
-writer produced, and un-ranking that during a rolling upgrade would take live
-capacity out of service on every pass. The count is the operator's signal.
+A sweep queries at one due bound for its whole length, which is required rather
+than tidy: a due cursor binds to the exact bound that issued it. That bound
+therefore travels in the sweep's own continuation, and carrying it costs nothing
+in safety — the bound only selects which rows a page contains, and every row is
+revalidated against its own stored expiry before anything is written, so a bound
+this store never issued can at worst make the sweep look at rows it then
+declines to touch.
+
+A row the sweep cannot decode stays due, so it heads every later ascending due
+page. It is counted in `Unreadable` and deliberately NOT rewritten: it may be a
+newer writer's row, and un-ranking that during a rolling upgrade would take live
+capacity out of service on every pass. **The page budget alone does not make
+that survivable, and believing it did is how this record nearly shipped with the
+head-of-line failure its deadline view exists not to have.** A budget bounds the
+work one pass does; it says nothing about progress, because every pass restarts
+at the head of the same view and nothing removes an unreadable row, so that
+population only grows — once it reaches `MaxPages × Limit`, every later pass
+spends its whole budget on those rows and withdraws nothing, forever. What
+supplies progress is the CONTINUATION on the result: a sweep that runs out of
+budget reports where it stopped, and a caller that pages until `Exhausted`
+reaches every row however many unreadable ones precede them.
 
 `ListCompatibleHosts` is one ranked provider query per page: the target is the
 ranking scope, so the restriction and the capacity order are both inside the
