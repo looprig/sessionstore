@@ -111,6 +111,25 @@ func assertNoInboxRecord(t *testing.T, store *Store, req AdmitCommandRequest) {
 	}
 }
 
+// assertNoSessionWitnesses fails unless the session's collision witnesses are
+// still unbound. Binding them is durable, observable KV state, so "the
+// rejection precedes the write" is a claim about the witnesses as much as about
+// the record: validation runs before admission touches the provider at all, and
+// nothing but the Create count would notice if it moved.
+func assertNoSessionWitnesses(t *testing.T, store *Store, req AdmitCommandRequest) {
+	t.Helper()
+	scope, err := store.deriveSessionScope(req.TenantID, req.SessionID)
+	if err != nil {
+		// An identity that has no derivable scope has no witness key either.
+		return
+	}
+	err = store.verifySessionScope(context.Background(), scope)
+	var keyspace *KeyspaceError
+	if !errors.As(err, &keyspace) || keyspace.Code != KeyspaceBindingNotFound {
+		t.Fatalf("a refused admission bound the session's witnesses: %v", err)
+	}
+}
+
 // refilingOrdered presents SessionStore with Create outcomes a conforming
 // provider never produces: a record filed under a different identity, scope,
 // due state, or order than the one it was asked for, or a chosen failure.
@@ -328,6 +347,56 @@ func TestInboxRecordRoundTripsAnObjectReferencedPayload(t *testing.T) {
 	}
 	if decoded.PayloadRef != record.PayloadRef || decoded.Payload != nil {
 		t.Fatalf("payload/ref = %q/%+v, want nil/%+v", decoded.Payload, decoded.PayloadRef, record.PayloadRef)
+	}
+}
+
+// TestInboxRecordCanonicalizesEveryTimestampToUTC pins the weaker half of the
+// canonicalization claim, which the fixed-point property cannot reach: JSON
+// round-trips a zone offset faithfully, so a record whose timestamps were never
+// normalized still re-encodes to itself. What is lost is ONE canonical
+// spelling — two callers submitting the same instant in different zones would
+// store different bytes for the same command, and a byte comparison of a
+// stored record against a re-encoding of it would then depend on where the
+// writer was.
+//
+// Comparison by .Equal cannot see this: it compares instants and is
+// zone-blind. The assertion is therefore on the encoded BYTES, and it covers
+// every timestamp the record carries rather than only the two admission sets.
+func TestInboxRecordCanonicalizesEveryTimestampToUTC(t *testing.T) {
+	t.Parallel()
+
+	zone := time.FixedZone("elsewhere", -(11*3600 + 30*60))
+	zoned := testInboxRecord()
+	zoned.AcceptedAt = inboxAcceptedAt.In(zone)
+	zoned.ApplyDeadline = inboxDeadline.In(zone)
+	zoned.Claim.ExpiresAt = zoned.Claim.ExpiresAt.In(zone)
+	zoned.Result.CompletedAt = zoned.Result.CompletedAt.In(zone)
+
+	zonedBytes, err := encodeInboxRecord(zoned)
+	if err != nil {
+		t.Fatalf("encodeInboxRecord(zoned): %v", err)
+	}
+	utcBytes, err := encodeInboxRecord(testInboxRecord())
+	if err != nil {
+		t.Fatalf("encodeInboxRecord(utc): %v", err)
+	}
+	if !bytes.Equal(zonedBytes, utcBytes) {
+		t.Fatalf("one instant has two stored spellings:\n%s\n%s", zonedBytes, utcBytes)
+	}
+
+	decoded, err := decodeInboxRecord(zonedBytes)
+	if err != nil {
+		t.Fatalf("decodeInboxRecord: %v", err)
+	}
+	for name, instant := range map[string]time.Time{
+		"accepted_at":         decoded.AcceptedAt,
+		"apply_deadline":      decoded.ApplyDeadline,
+		"claim.expires_at":    decoded.Claim.ExpiresAt,
+		"result.completed_at": decoded.Result.CompletedAt,
+	} {
+		if instant.Location() != time.UTC {
+			t.Fatalf("%s decoded in %v, want UTC", name, instant.Location())
+		}
 	}
 }
 
@@ -1176,7 +1245,43 @@ func TestAdmitCommandRejectsInvalidRequestsBeforeWriting(t *testing.T) {
 				t.Fatalf("a refused admission performed %d Create calls; the rejection must precede the write", got)
 			}
 			assertNoInboxRecord(t, store, req)
+			assertNoSessionWitnesses(t, store, req)
 		})
+	}
+}
+
+// TestAdmitCommandReportsAnInvalidRequestEvenWhenClosed makes the validation
+// ordering TOTAL, not merely "before the provider". A malformed request is a
+// caller mistake whatever the store is doing, so it is reported as one rather
+// than as whatever the store's lifecycle happened to be at the time; the
+// alternative tells a caller to retry later a request that can never succeed.
+//
+// It also pins the ordering the rest of the package uses: CreateCatalogEntry
+// validates before it admits too, and without this the two files would be free
+// to drift into disagreeing about which answer an invalid request gets.
+func TestAdmitCommandReportsAnInvalidRequestEvenWhenClosed(t *testing.T) {
+	t.Parallel()
+
+	store, err := Open(context.Background(), memstore.New())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := store.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	req := testAdmitRequest()
+	req.Kind = ""
+	_, created, err := store.AdmitCommand(context.Background(), req)
+	if created {
+		t.Fatal("a closed store admitted a command")
+	}
+	if errors.As(err, new(*StoreClosedError)) {
+		t.Fatalf("an invalid request was reported as a closed store: %v", err)
+	}
+	failure := assertInboxCode(t, err, InboxErrorInvalid)
+	if failure.Field != "kind" {
+		t.Fatalf("field = %q, want %q", failure.Field, "kind")
 	}
 }
 
@@ -1329,6 +1434,59 @@ func TestAdmitCommandHoldsTheProviderToTheRecordsOwnFiling(t *testing.T) {
 	}
 }
 
+// TestAdmitCommandHoldsACreatedReplyToTheBytesItSent closes the created path,
+// which every other filing check leaves open. Those checks hold the reply's
+// IDENTITY, scope, due state and order to the record's own bytes — but the
+// bytes themselves are only ever compared on the duplicate path, where the
+// answer is the winner's and content is all that can be compared.
+//
+// On the created path the provider is asserting something stronger: that it
+// stored the bytes THIS call handed it. Nothing checked that, so a provider
+// could answer created=true with another command's content and a caller would
+// be handed a runtime mapping it never proposed, labelled as its own fresh
+// acceptance — exactly the outcome the winner rule exists to prevent, arriving
+// from the one direction that was unchecked.
+func TestAdmitCommandHoldsACreatedReplyToTheBytesItSent(t *testing.T) {
+	t.Parallel()
+
+	base := memstore.New()
+	refiling := &refilingOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = refiling
+	store := openStore(t, base)
+
+	// Same identity, same timestamps, same pending state — so every identity,
+	// scope, due and order check passes — and different content.
+	substitute := InboxRecord{
+		TenantID:         catalogTenant,
+		SessionID:        catalogSession,
+		CommandID:        inboxCommand,
+		RuntimeCommandID: "SOMETHING-ELSE-ENTIRELY",
+		Kind:             "interrupt",
+		Payload:          []byte(`{"blocks":[]}`),
+		AcceptedAt:       inboxAcceptedAt,
+		ApplyDeadline:    inboxDeadline,
+		State:            InboxStatePending,
+	}
+	value, err := encodeInboxRecord(substitute)
+	if err != nil {
+		t.Fatalf("encodeInboxRecord: %v", err)
+	}
+	refiling.refile(func(r storage.OrderedRecord) storage.OrderedRecord {
+		r.Value = value
+		return r
+	})
+
+	entry, created, err := store.AdmitCommand(context.Background(), testAdmitRequest())
+	if created {
+		t.Fatalf("a substituted reply was reported as this caller's acceptance: runtime %q kind %q",
+			entry.Record.RuntimeCommandID, entry.Record.Kind)
+	}
+	failure := assertInboxCode(t, err, InboxErrorIdentity)
+	if failure.Field != "value" {
+		t.Fatalf("field = %q, want %q", failure.Field, "value")
+	}
+}
+
 func TestAdmitCommandAcceptsATerminalRecordFiledNotDue(t *testing.T) {
 	t.Parallel()
 
@@ -1337,10 +1495,14 @@ func TestAdmitCommandAcceptsATerminalRecordFiledNotDue(t *testing.T) {
 	base.OrderedIndex = refiling
 	store := openStore(t, base)
 
-	// A terminal command is filed not-due, so the due state a reader checks a
-	// record against is a function of the RECORD, not of the operation that
-	// happens to be reading it. Without that, every retry of a command a later
-	// task has already completed would be reported as misfiled.
+	// The command is admitted for real first, so what follows is the RETRY
+	// path — the only path on which a terminal record can be met. A terminal
+	// command is filed not-due, so the due state a reader checks a record
+	// against is a function of the RECORD, not of the operation that happens to
+	// be reading it. Without that, every retry of a command a later task has
+	// already completed would be reported as misfiled.
+	mustAdmit(t, store, testAdmitRequest())
+
 	terminal := testInboxRecord()
 	value, err := encodeInboxRecord(terminal)
 	if err != nil {
@@ -1352,9 +1514,12 @@ func TestAdmitCommandAcceptsATerminalRecordFiledNotDue(t *testing.T) {
 		return r
 	})
 
-	entry, _, err := store.AdmitCommand(context.Background(), testAdmitRequest())
+	entry, created, err := store.AdmitCommand(context.Background(), testAdmitRequest())
 	if err != nil {
 		t.Fatalf("a terminal command filed not-due was refused: %v", err)
+	}
+	if created {
+		t.Fatal("a retry reported a fresh acceptance")
 	}
 	if entry.Record.State != InboxStateApplied {
 		t.Fatalf("state = %q, want %q", entry.Record.State, InboxStateApplied)

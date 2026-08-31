@@ -252,6 +252,18 @@ allocate it from a JetStream stream sequence or a shared SQL sequence, so a
 session's first command can be order 5000 and its second 9000. Nothing may
 derive a count, a position, or "the next" order from it.
 
+`created == true` additionally holds the provider's reply to the bytes THIS
+call sent, which is the one claim the identity, scope, due and order checks
+cannot make: they hold a reply to the record's own bytes, and a substituted
+record satisfies them exactly as well as the real one. On a duplicate the
+stored bytes are the winner's and only the content is comparable, so the exact
+comparison is deliberately made on the created path alone.
+
+Deleting a command is not reclamation: its identity and acceptance order can
+never be reused, so a tombstone is a permanent answer to any caller still
+retrying it. Whoever adds retention or compaction must bound terminal-command
+retention below by the client retry window.
+
 The record carries the members the command lifecycle needs — state, claim epoch
 and expiry, terminal result, and a typed `sessionwire/v1.ErrorDetail` rejection
 — but this package does not yet move a command out of `pending`. The

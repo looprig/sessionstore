@@ -798,7 +798,7 @@ func encodeGateIntent(intent gateIntent) ([]byte, error) {
 func decodeGateIntent(value []byte) (gateIntent, error) {
 	wire, err := decodeVersionedRecord[gateIntentWire](
 		value, MaxGateIntentBytes, GateIntentRecordVersion,
-		versionedRecordFields{Record: "gate_intent", Version: "gate_intent.record_version", Fail: catalogRecordFailure})
+		versionedRecordFields{Record: "gate_intent", Version: "gate_intent.record_version"}, catalogRecordFailure)
 	if err != nil {
 		return gateIntent{}, err
 	}

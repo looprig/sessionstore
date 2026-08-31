@@ -771,7 +771,7 @@ func encodeCatalogRecord(record CatalogRecord) ([]byte, error) {
 func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 	wire, err := decodeVersionedRecord[catalogWire](
 		value, MaxCatalogRecordBytes, CatalogRecordVersion,
-		versionedRecordFields{Record: "record", Version: "record_version", Fail: catalogRecordFailure})
+		versionedRecordFields{Record: "record", Version: "record_version"}, catalogRecordFailure)
 	if err != nil {
 		return CatalogRecord{}, err
 	}
@@ -825,27 +825,38 @@ func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 // Strictness is a RECORD-level property and stops at the record's own members.
 // What a caller does with the decoded wire value — validating it, walking
 // nested projections, canonicalizing it — belongs to that record's own decoder.
+// fail names what a decode failure is CALLED in the caller's record vocabulary.
+// The three rules — the bound, the well-formedness of the document, and the
+// version gate — are properties of the shared shape and are stated here; only
+// their names belong to each record, so each record keeps its own error type
+// and a caller branching on an inbox failure need not match the catalog's.
+//
+// It is a parameter rather than a member of fields because a record that
+// forgets it must not compile: a missing argument is a compile error, while a
+// missing struct member would be a nil call at decode time, on the one path
+// that only runs when a stored record is already suspect.
 func decodeVersionedRecord[T any](
 	value []byte,
 	maxBytes int,
 	wantVersion uint8,
 	fields versionedRecordFields,
+	fail func(failure versionedRecordFailure, field string, cause error) error,
 ) (T, error) {
 	var wire T
 	if len(value) > maxBytes {
-		return wire, fields.Fail(versionedRecordTooLarge, fields.Record, nil)
+		return wire, fail(versionedRecordTooLarge, fields.Record, nil)
 	}
 	if len(value) == 0 {
-		return wire, fields.Fail(versionedRecordMalformed, fields.Record, nil)
+		return wire, fail(versionedRecordMalformed, fields.Record, nil)
 	}
 	var probe struct {
 		RecordVersion uint8 `json:"record_version"`
 	}
 	if err := json.Unmarshal(value, &probe); err != nil {
-		return wire, fields.Fail(versionedRecordMalformed, fields.Record, err)
+		return wire, fail(versionedRecordMalformed, fields.Record, err)
 	}
 	if probe.RecordVersion != wantVersion {
-		return wire, fields.Fail(versionedRecordVersion, fields.Version, nil)
+		return wire, fail(versionedRecordVersion, fields.Version, nil)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(value))
 	decoder.DisallowUnknownFields()
@@ -854,7 +865,7 @@ func decodeVersionedRecord[T any](
 		// have populated some members before it stopped, and handing a caller a
 		// half-decoded record beside an error is how one of them ends up used.
 		var zero T
-		return zero, fields.Fail(versionedRecordMalformed, fields.Record, err)
+		return zero, fail(versionedRecordMalformed, fields.Record, err)
 	}
 	return wire, nil
 }
@@ -867,13 +878,6 @@ func decodeVersionedRecord[T any](
 type versionedRecordFields struct {
 	Record  string
 	Version string
-
-	// Fail names what a decode failure is CALLED in the caller's record
-	// vocabulary. The shared decoder states the three rules — the bound, the
-	// well-formedness of the document, and the version gate — and each record
-	// keeps its own error type, so a caller branching on an inbox failure does
-	// not have to match the catalog's.
-	Fail func(failure versionedRecordFailure, field string, cause error) error
 }
 
 // versionedRecordFailure is the closed set of failures the shared versioned

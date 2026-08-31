@@ -310,6 +310,28 @@ func (s *Store) AdmitCommand(ctx context.Context, req AdmitCommandRequest) (Inbo
 		return InboxEntry{}, false, err
 	}
 	if created {
+		// The created path is the one place the provider claims something
+		// stronger than "here is the record under that identity": it claims it
+		// stored the bytes THIS call handed it. Every check above holds the
+		// reply to the record's own bytes, which a substituted record satisfies
+		// just as well as the real one, so without this a provider could answer
+		// created=true carrying another command's kind, payload and runtime
+		// mapping and the caller would take it for its own fresh acceptance.
+		//
+		// The comparison is the whole value rather than sameCommandAs plus the
+		// runtime id: on this path every member is ours, so an exact comparison
+		// covers the timestamps and the state as well as the content, and it is
+		// exact because canonicalization is a fixed point — the bytes were
+		// produced by encodeInboxRecord and the record decodes and re-encodes
+		// to them.
+		//
+		// It is deliberately NOT run on the duplicate path, where the stored
+		// bytes are the winner's: they differ from ours in the runtime mapping
+		// and the timestamps by design, and content is the only thing that can
+		// be compared. See sameCommandAs.
+		if !bytes.Equal(stored.Value, value) {
+			return InboxEntry{}, false, inboxErr(InboxErrorIdentity, "value", nil)
+		}
 		return entry, true, nil
 	}
 	if !entry.Record.sameCommandAs(record) {
@@ -355,6 +377,17 @@ func inboxID(scope sessionScope, command sessionwire.CommandID) storage.OrderedI
 // at all: its outcome is settled, it must not be reconciled again, and it
 // remains directly readable by its stable key regardless.
 //
+// CARRY-FORWARD CONTRACT for whoever adds retention or compaction: TERMINAL
+// COMMAND RETENTION MUST BE BOUNDED BELOW BY THE CLIENT RETRY WINDOW. A
+// command's identity and acceptance order can never be reused, so tombstoning a
+// terminal record is not reclamation of a name — it is a permanent,
+// unrecoverable answer to any caller still retrying that command. Such a caller
+// gets InboxErrorDeleted from inboxEntryFor and can neither learn the mapping
+// that was accepted nor re-admit the command under the same id. Sweeping a
+// terminal command away therefore has to wait until no client can still be
+// retrying it. Nothing in this file is wrong today; this task simply has no
+// retention to state the bound in.
+//
 // Admission only ever writes a pending record, so only the first branch is
 // reachable through AdmitCommand. The second exists because every reader that
 // holds a stored row to its own bytes needs the same derivation, and a terminal
@@ -399,8 +432,15 @@ func inboxDue(record InboxRecord) storage.Due {
 //     property of a scope rather than of a row. Zero is not an allocated order,
 //     and returned as an acceptance order it would compare equal for every
 //     command in the session and silently destroy the order consumers sort by.
-//   - Namespace is not record-derived: it echoes the query this reader itself
-//     issued, and the bytes carry no counterpart to compare it against.
+//   - Namespace is excluded, and NOT merely because it echoes the query this
+//     reader issued — so does OrderingScope, which is checked. The difference
+//     is where each one is re-derived from: OrderingScope is rebuilt from the
+//     tenant and session the RECORD's own bytes name, after those have been
+//     held to the request, so the check is a comparison against the record.
+//     The namespace is a package constant with no counterpart in any record,
+//     so a comparison against it could only restate that this file's own
+//     constant equals itself. What actually keeps namespaces apart is that
+//     each record kind owns one, which TestOrderedNamespacesAreDistinct pins.
 //   - Rank is written unranked and nothing ranks or reads commands by rank, so
 //     a check would guard a view with no consumer.
 //   - Revision is provider state with no meaning in the record; it is returned
@@ -546,7 +586,7 @@ func encodeInboxRecord(record InboxRecord) ([]byte, error) {
 func decodeInboxRecord(value []byte) (InboxRecord, error) {
 	wire, err := decodeVersionedRecord[inboxWire](
 		value, MaxInboxRecordBytes, InboxRecordVersion,
-		versionedRecordFields{Record: "record", Version: "record_version", Fail: inboxRecordFailure})
+		versionedRecordFields{Record: "record", Version: "record_version"}, inboxRecordFailure)
 	if err != nil {
 		return InboxRecord{}, err
 	}
