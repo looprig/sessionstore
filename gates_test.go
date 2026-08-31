@@ -1097,6 +1097,77 @@ func TestListDueGatesDoesNotReadAProviderFailureAsAnAbsentSession(t *testing.T) 
 	}
 }
 
+// TestNoSuchSessionAdmitsOnlyAnAbsentSession drives the classifier directly,
+// which is the only way to reach the arms the list path cannot produce.
+//
+// The due reader's decision to DROP a row rather than fail the page rests
+// entirely on this predicate, so a looser spelling of it would turn a provider
+// outage into silently empty results deployment-wide. The list path exercises
+// the catalog arm alone; a failure that is neither a *CatalogError nor a
+// *KeyspaceError — a provider error escaping unclassified — never reaches it at
+// all, and that is exactly the shape a loosened predicate would misread.
+func TestNoSuchSessionAdmitsOnlyAnAbsentSession(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		err  error
+		want bool
+	}{
+		"the record is absent":              {err: catalogErr(CatalogErrorNotFound, "record", nil), want: true},
+		"the record is tombstoned":          {err: catalogErr(CatalogErrorDeleted, "record", nil), want: true},
+		"the session witness is unbound":    {err: &KeyspaceError{Code: KeyspaceBindingNotFound}, want: true},
+		"the provider failed":               {err: catalogErr(CatalogErrorBackend, "record", errors.New("provider outage")), want: false},
+		"the mutation was ambiguous":        {err: catalogErr(CatalogErrorConflict, "record", nil), want: false},
+		"the failure carries no store type": {err: errors.New("provider outage"), want: false},
+		"the witness is ambiguous":          {err: &KeyspaceError{Code: KeyspaceBindingAmbiguous}, want: false},
+		"the witness is collided":           {err: &KeyspaceError{Code: KeyspaceHashCollision}, want: false},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := noSuchSession(test.err); got != test.want {
+				t.Fatalf("noSuchSession(%v) = %t, want %t", test.err, got, test.want)
+			}
+		})
+	}
+}
+
+// TestRowLocalCatalogFailureSeparatesTheRowFromThePage drives the other half of
+// the due reader's decision, in both directions on each arm.
+//
+// A hash collision is a durable fact about ONE session's witness: retrying
+// reports it again and no other row is implicated, so the row is counted and
+// stepped over. Every other keyspace failure says nothing about the row, and
+// treating one as row-local is the page of silent zeroes this predicate exists
+// to prevent.
+func TestRowLocalCatalogFailureSeparatesTheRowFromThePage(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		err  error
+		want bool
+	}{
+		"a collided witness is about this row":    {err: &KeyspaceError{Code: KeyspaceHashCollision}, want: true},
+		"an unbound witness is not":               {err: &KeyspaceError{Code: KeyspaceBindingNotFound}, want: false},
+		"an ambiguous witness is not":             {err: &KeyspaceError{Code: KeyspaceBindingAmbiguous}, want: false},
+		"a misfiled record is about this row":     {err: catalogErr(CatalogErrorIdentity, "record", nil), want: true},
+		"an undecodable record is about this row": {err: catalogErr(CatalogErrorMalformed, "record", nil), want: true},
+		"a provider failure is not":               {err: catalogErr(CatalogErrorBackend, "record", nil), want: false},
+		"an ambiguous mutation is not":            {err: catalogErr(CatalogErrorConflict, "record", nil), want: false},
+		"an unclassified failure is not":          {err: errors.New("provider outage"), want: false},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := rowLocalCatalogFailure(test.err); got != test.want {
+				t.Fatalf("rowLocalCatalogFailure(%v) = %t, want %t", test.err, got, test.want)
+			}
+		})
+	}
+}
+
 // TestListDueGatesDoesNotAnswerOneTenantWithAnother pins the identity a due
 // page caches a session record under. Session ids are unique within a tenant
 // and not across them, so two tenants can legitimately hold the same session id
