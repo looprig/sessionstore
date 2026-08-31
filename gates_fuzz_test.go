@@ -83,8 +83,14 @@ func FuzzGateIntentCodec(f *testing.F) {
 		if err != nil {
 			t.Fatalf("accepted an intent that does not re-encode: %v", err)
 		}
-		if len(encoded) > MaxGateIntentBytes {
-			t.Fatalf("re-encoded intent exceeds the intent bound: %d", len(encoded))
+		// Asserted against the ARITHMETIC ceiling rather than the storage
+		// bound. MaxGateIntentBytes is what a stored record may be, and it
+		// leaves nearly two kilobytes of slop that a new member could grow into
+		// unnoticed; maxGateIntentEncodedBytes is the claim the file actually
+		// makes about this record's size, so this is where the fuzzer can
+		// falsify it.
+		if len(encoded) > maxGateIntentEncodedBytes {
+			t.Fatalf("re-encoded intent is %d bytes, above the %d its arithmetic allows", len(encoded), maxGateIntentEncodedBytes)
 		}
 		again, err := decodeGateIntent(encoded)
 		if err != nil {

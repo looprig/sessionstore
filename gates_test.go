@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +19,8 @@ import (
 	"github.com/looprig/storage"
 	"github.com/looprig/storage/memstore"
 )
+
+// --- fixtures and assertions ----------------------------------------------
 
 // openGateFixture creates a session and gives it a durable journal tip, which
 // is the precondition every open has: a gate names the event that opened it,
@@ -32,6 +35,26 @@ func openGateFixture(t *testing.T, store *Store) CatalogEntry {
 	return entry
 }
 
+// mustPrepareSession creates one session and gives it a durable journal tip, so
+// gates opened on it can name events that already exist.
+func mustPrepareSession(
+	t *testing.T,
+	store *Store,
+	tenant sessionwire.TenantID,
+	session sessionwire.SessionID,
+	tip uint64,
+) {
+	t.Helper()
+	mustCreateSession(t, store, tenant, session, catalogActiveAt)
+	if _, err := store.UpdateCatalogHostState(context.Background(), UpdateCatalogHostStateRequest{
+		TenantID: tenant, SessionID: session, LeaseEpoch: 1,
+		State: sessionwire.SessionStateRunning, Residency: sessionwire.SessionResidencyResident,
+		LastActiveAt: catalogActiveAt, LastJournalSeq: tip, LastEventID: "event-tip",
+	}); err != nil {
+		t.Fatalf("UpdateCatalogHostState(%s/%s): %v", tenant, session, err)
+	}
+}
+
 func mustOpenGate(t *testing.T, store *Store, epoch uint64, gate sessionwire.GateProjection) CatalogEntry {
 	t.Helper()
 	entry, err := store.OpenGate(context.Background(), OpenGateRequest{
@@ -41,6 +64,21 @@ func mustOpenGate(t *testing.T, store *Store, epoch uint64, gate sessionwire.Gat
 		t.Fatalf("OpenGate(%s): %v", gate.GateID, err)
 	}
 	return entry
+}
+
+func mustOpenGateOn(
+	t *testing.T,
+	store *Store,
+	tenant sessionwire.TenantID,
+	session sessionwire.SessionID,
+	gate sessionwire.GateProjection,
+) {
+	t.Helper()
+	if _, err := store.OpenGate(context.Background(), OpenGateRequest{
+		TenantID: tenant, SessionID: session, LeaseEpoch: 1, Gate: gate,
+	}); err != nil {
+		t.Fatalf("OpenGate(%s/%s/%s): %v", tenant, session, gate.GateID, err)
+	}
 }
 
 func mustReadGates(t *testing.T, store *Store) sessionwire.GatePage {
@@ -54,12 +92,107 @@ func mustReadGates(t *testing.T, store *Store) sessionwire.GatePage {
 	return page
 }
 
+func mustListDueGates(t *testing.T, store *Store, before time.Time) DueGatePage {
+	t.Helper()
+	page, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: before, Limit: 50})
+	if err != nil {
+		t.Fatalf("ListDueGates: %v", err)
+	}
+	return page
+}
+
 func gateIDs(page sessionwire.GatePage) []string {
 	ids := make([]string, 0, len(page.Gates))
 	for _, gate := range page.Gates {
 		ids = append(ids, string(gate.GateID))
 	}
 	return ids
+}
+
+func dueGateIDs(page DueGatePage) []string {
+	ids := make([]string, 0, len(page.Gates))
+	for _, entry := range page.Gates {
+		ids = append(ids, string(entry.SessionID)+"/"+string(entry.Gate.GateID))
+	}
+	return ids
+}
+
+func gateWithDeadline(gate sessionwire.GateProjection, deadline time.Time) sessionwire.GateProjection {
+	gate.Deadline = deadline
+	return gate
+}
+
+func testGateIntent() gateIntent {
+	return gateIntent{
+		TenantID:         catalogTenant,
+		SessionID:        catalogSession,
+		GateID:           "gate-a",
+		OpenedEventID:    "event-gate-a",
+		OpenedJournalSeq: 5,
+		Deadline:         catalogDeadline,
+	}
+}
+
+func mustEncodeGateIntent(t *testing.T, intent gateIntent) []byte {
+	t.Helper()
+	value, err := encodeGateIntent(intent)
+	if err != nil {
+		t.Fatalf("encodeGateIntent: %v", err)
+	}
+	return value
+}
+
+// putRawGateIntent writes one intent straight to the provider. It is how a test
+// presents the reader with a state the write paths refuse to produce — an
+// intent with no matching open gate, one filed under another identity, or one
+// whose bytes are corrupt.
+func putRawGateIntent(
+	t *testing.T,
+	store *Store,
+	tenant sessionwire.TenantID,
+	session sessionwire.SessionID,
+	key sessionwire.GateID,
+	value []byte,
+	deadline time.Time,
+) {
+	t.Helper()
+	scope, err := store.deriveSessionScope(tenant, session)
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	if _, _, err := store.backend.OrderedIndex.Create(
+		context.Background(), gateIntentID(scope, key), scope.SessionNamespace, value, storage.Rank{}, gateDue(deadline),
+	); err != nil {
+		t.Fatalf("seed intent: %v", err)
+	}
+}
+
+// moveGateIntentDue rewrites one intent's provider due state out of band,
+// leaving its stored bytes alone. It is the only way to present the reader with
+// a row whose filing disagrees with the record it files.
+func moveGateIntentDue(
+	t *testing.T,
+	store *Store,
+	tenant sessionwire.TenantID,
+	session sessionwire.SessionID,
+	gate sessionwire.GateID,
+	due time.Time,
+) {
+	t.Helper()
+	scope, err := store.deriveSessionScope(tenant, session)
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	id := gateIntentID(scope, gate)
+	stored, err := store.backend.OrderedIndex.Get(context.Background(), id)
+	if err != nil {
+		t.Fatalf("read intent: %v", err)
+	}
+	if _, err := store.backend.OrderedIndex.Update(
+		context.Background(), id, stored.Revision, stored.Value, storage.Rank{}, gateDue(due),
+	); err != nil {
+		t.Fatalf("move intent due: %v", err)
+	}
 }
 
 // assertNoGateIntent fails unless the gate has no intent record at all. It
@@ -299,6 +432,36 @@ func TestOpenGateRecordsTheDeadlineAsAnAbsoluteDueTime(t *testing.T) {
 	}
 }
 
+func TestOpenGateIndexesADeadlineForAGateProjectedWithoutOne(t *testing.T) {
+	store := openTestStore(t)
+	openGateFixture(t, store)
+	gate := testGate("gate-a", 5)
+	// A wholesale re-projection publishes the gate and deliberately writes no
+	// intent, so the deadline is durable nowhere.
+	projected := testHostStateRequest(1)
+	projected.OpenGates = []sessionwire.GateProjection{gate}
+	if _, err := store.UpdateCatalogHostState(context.Background(), projected); err != nil {
+		t.Fatalf("UpdateCatalogHostState: %v", err)
+	}
+	assertNoGateIntent(t, store, gate.GateID)
+
+	// OpenGate finds the gate already projected. Reporting success without
+	// indexing the deadline would make the operation whose whole job is that
+	// index silently do nothing, and the caller could not tell.
+	if _, err := store.OpenGate(context.Background(), OpenGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: gate,
+	}); err != nil {
+		t.Fatalf("OpenGate: %v", err)
+	}
+	record := gateIntentRecord(t, store, gate.GateID)
+	if record.Due != gateDue(gate.Deadline) {
+		t.Fatalf("intent due = %+v, want the gate's deadline %+v", record.Due, gateDue(gate.Deadline))
+	}
+	if page := mustReadGates(t, store); len(page.Gates) != 1 {
+		t.Fatalf("the repair changed the projection: %v", gateIDs(page))
+	}
+}
+
 // --- rejections, each of which must precede every write -------------------
 
 func TestOpenGateRefusesAnEventAboveTheDurableTip(t *testing.T) {
@@ -336,7 +499,41 @@ func TestOpenGateRefusesADifferentGateWithAnOpenIdentity(t *testing.T) {
 	_, err := store.OpenGate(context.Background(), OpenGateRequest{
 		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: changed,
 	})
-	assertCatalogCode(t, err, CatalogErrorConflict)
+	// The field is asserted, not just the code. The intent check below this one
+	// refuses the same request with the same code, so a test that read only the
+	// code would keep passing if the PROJECTION check were deleted — and would
+	// then be asserting that a conflict is noticed one provider write later
+	// than it should be.
+	if got := assertCatalogCode(t, err, CatalogErrorConflict); got.Field != "gate_id" {
+		t.Fatalf("failure field = %q, want gate_id: the open projection must refuse this before the intent does", got.Field)
+	}
+	assertCatalogUnchanged(t, store, entry)
+}
+
+// TestOpenGateRefusesAnIdentityHeldByAnotherIntent reaches the check that the
+// projection cannot make. UpdateCatalogHostState replaces the open gates
+// wholesale and leaves intents alone, so after one the identity looks free in
+// the projection while its deadline intent still names a different gate.
+func TestOpenGateRefusesAnIdentityHeldByAnotherIntent(t *testing.T) {
+	store := openTestStore(t)
+	openGateFixture(t, store)
+	mustOpenGate(t, store, 1, testGate("gate-a", 5))
+	cleared := testHostStateRequest(1)
+	entry, err := store.UpdateCatalogHostState(context.Background(), cleared)
+	if err != nil {
+		t.Fatalf("UpdateCatalogHostState: %v", err)
+	}
+	if len(entry.Record.OpenGates) != 0 {
+		t.Fatal("the wholesale re-projection did not clear the open gates")
+	}
+
+	different := testGate("gate-a", 6)
+	_, err = store.OpenGate(context.Background(), OpenGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: different,
+	})
+	if got := assertCatalogCode(t, err, CatalogErrorConflict); got.Field != "gate_intent" {
+		t.Fatalf("failure field = %q, want gate_intent", got.Field)
+	}
 	assertCatalogUnchanged(t, store, entry)
 }
 
@@ -353,6 +550,46 @@ func TestOpenGateIsIdempotentForTheSameOpenGate(t *testing.T) {
 	if page := mustReadGates(t, store); len(page.Gates) != 1 {
 		t.Fatalf("a repeated open duplicated the gate: %v", gateIDs(page))
 	}
+}
+
+// TestOpenGateRefusesToReopenAResolvedGate covers what the tombstone is for: a
+// gate identity is spent once it has been resolved, so a late or replayed open
+// cannot resurrect it under the same id.
+func TestOpenGateRefusesToReopenAResolvedGate(t *testing.T) {
+	store := openTestStore(t)
+	openGateFixture(t, store)
+	gate := testGate("gate-a", 5)
+	mustOpenGate(t, store, 1, gate)
+	entry, err := store.ResolveGate(context.Background(), ResolveGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, GateID: "gate-a",
+	})
+	if err != nil {
+		t.Fatalf("ResolveGate: %v", err)
+	}
+
+	_, err = store.OpenGate(context.Background(), OpenGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: gate,
+	})
+	assertCatalogCode(t, err, CatalogErrorDeleted)
+	assertCatalogUnchanged(t, store, entry)
+}
+
+func TestOpenGateRefusesAnUnrepresentableDeadline(t *testing.T) {
+	store := openTestStore(t)
+	entry := openGateFixture(t, store)
+
+	// Core accepts any nonzero deadline, so this is this package's own bound:
+	// an instant outside the representable range would wrap into a due time at
+	// the wrong end of history rather than sorting late.
+	far := gateWithDeadline(testGate("gate-a", 5), time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC))
+	_, err := store.OpenGate(context.Background(), OpenGateRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: far,
+	})
+	if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != "gate.deadline" {
+		t.Fatalf("failure field = %q, want gate.deadline", got.Field)
+	}
+	assertCatalogUnchanged(t, store, entry)
+	assertNoGateIntent(t, store, "gate-a")
 }
 
 func TestOpenGateRefusesMoreThanTheProjectionHolds(t *testing.T) {
@@ -445,622 +682,7 @@ func TestGateOperationsRejectInvalidIdentities(t *testing.T) {
 	assertNoGateIntent(t, store, "gate-a")
 }
 
-// --- the reader validates what the writer could not -----------------------
-
-// TestReadGatesFailsClosedOnAGateAboveItsOwnTip reaches the one inconsistency a
-// gate write cannot prevent: UpdateCatalogHostState replaces the whole
-// projection wholesale and is the Host's own re-projection path, so it can
-// store a gate naming an event past the record's durable tip. A page like that
-// violates its own contract, so the read refuses it rather than publishing it.
-func TestReadGatesFailsClosedOnAGateAboveItsOwnTip(t *testing.T) {
-	store := openTestStore(t)
-	openGateFixture(t, store)
-	req := testHostStateRequest(1)
-	req.OpenGates = []sessionwire.GateProjection{testGate("gate-a", req.LastJournalSeq+1)}
-	if _, err := store.UpdateCatalogHostState(context.Background(), req); err != nil {
-		t.Fatalf("UpdateCatalogHostState: %v", err)
-	}
-
-	_, err := store.ReadGates(context.Background(), ReadGatesRequest{
-		TenantID: catalogTenant, SessionID: catalogSession,
-	})
-	assertCatalogCode(t, err, CatalogErrorSequence)
-}
-
-// --- lifecycle ------------------------------------------------------------
-
-// declaredGateOperations enumerates gates.go's public Store operations from the
-// source, for the same reason declaredCatalogOperations does it for catalog.go:
-// the file that declares an operation is the file the close test enumerates, so
-// a new one cannot be added without being exercised here.
-func declaredGateOperations(t *testing.T) map[string]bool {
-	t.Helper()
-	file, err := parser.ParseFile(token.NewFileSet(), "gates.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse gates.go: %v", err)
-	}
-	operations := map[string]bool{}
-	for _, declaration := range file.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if !ok || function.Recv == nil || !function.Name.IsExported() {
-			continue
-		}
-		receiver, ok := function.Recv.List[0].Type.(*ast.StarExpr)
-		if !ok {
-			continue
-		}
-		if name, ok := receiver.X.(*ast.Ident); ok && name.Name == "Store" {
-			operations[function.Name.Name] = true
-		}
-	}
-	if len(operations) == 0 {
-		t.Fatal("no public Store operations were found in gates.go; the enumerator is not reaching the declarations")
-	}
-	return operations
-}
-
-func TestGateOperationsRefuseAfterClose(t *testing.T) {
-	store, err := Open(context.Background(), memstore.New())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	openGateFixture(t, store)
-	if err := store.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	operations := map[string]func() error{
-		"OpenGate": func() error {
-			_, err := store.OpenGate(context.Background(), OpenGateRequest{
-				TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: testGate("gate-a", 5),
-			})
-			return err
-		},
-		"ResolveGate": func() error {
-			_, err := store.ResolveGate(context.Background(), ResolveGateRequest{
-				TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, GateID: "gate-a",
-			})
-			return err
-		},
-		"ReadGates": func() error {
-			_, err := store.ReadGates(context.Background(), ReadGatesRequest{
-				TenantID: catalogTenant, SessionID: catalogSession,
-			})
-			return err
-		},
-		"ListDueGates": func() error {
-			_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
-				DueAtOrBefore: catalogDeadline, Limit: 10,
-			})
-			return err
-		},
-	}
-
-	declared := declaredGateOperations(t)
-	for name := range declared {
-		if operations[name] == nil {
-			t.Errorf("gates.go declares the public operation %s and this test does not exercise it", name)
-		}
-	}
-	for name := range operations {
-		if !declared[name] {
-			t.Errorf("this test exercises %s, which gates.go no longer declares (was it moved to another file?)", name)
-		}
-	}
-
-	for name, call := range operations {
-		t.Run(name, func(t *testing.T) {
-			if err := call(); !errors.As(err, new(*StoreClosedError)) {
-				t.Fatalf("%s after Close = %T %v, want *StoreClosedError", name, err, err)
-			}
-		})
-	}
-}
-
-var (
-	_ func(*Store, context.Context, OpenGateRequest) (CatalogEntry, error)          = (*Store).OpenGate
-	_ func(*Store, context.Context, ResolveGateRequest) (CatalogEntry, error)       = (*Store).ResolveGate
-	_ func(*Store, context.Context, ReadGatesRequest) (sessionwire.GatePage, error) = (*Store).ReadGates
-	_ func(*Store, context.Context, ListDueGatesRequest) ([]DueGate, error)         = (*Store).ListDueGates
-)
-
-// --- the due view ---------------------------------------------------------
-
-// mustPrepareSession creates one session and gives it a durable journal tip, so
-// gates opened on it can name events that already exist.
-func mustPrepareSession(
-	t *testing.T,
-	store *Store,
-	tenant sessionwire.TenantID,
-	session sessionwire.SessionID,
-	tip uint64,
-) {
-	t.Helper()
-	mustCreateSession(t, store, tenant, session, catalogActiveAt)
-	if _, err := store.UpdateCatalogHostState(context.Background(), UpdateCatalogHostStateRequest{
-		TenantID: tenant, SessionID: session, LeaseEpoch: 1,
-		State: sessionwire.SessionStateRunning, Residency: sessionwire.SessionResidencyResident,
-		LastActiveAt: catalogActiveAt, LastJournalSeq: tip, LastEventID: "event-tip",
-	}); err != nil {
-		t.Fatalf("UpdateCatalogHostState(%s/%s): %v", tenant, session, err)
-	}
-}
-
-func mustOpenGateOn(
-	t *testing.T,
-	store *Store,
-	tenant sessionwire.TenantID,
-	session sessionwire.SessionID,
-	gate sessionwire.GateProjection,
-) {
-	t.Helper()
-	if _, err := store.OpenGate(context.Background(), OpenGateRequest{
-		TenantID: tenant, SessionID: session, LeaseEpoch: 1, Gate: gate,
-	}); err != nil {
-		t.Fatalf("OpenGate(%s/%s/%s): %v", tenant, session, gate.GateID, err)
-	}
-}
-
-func gateWithDeadline(gate sessionwire.GateProjection, deadline time.Time) sessionwire.GateProjection {
-	gate.Deadline = deadline
-	return gate
-}
-
-// putRawGateIntent writes one intent straight to the provider. It is how a test
-// presents the reader with a state the write paths refuse to produce — an
-// intent with no matching open gate, one filed under another identity, or one
-// whose bytes are corrupt.
-func putRawGateIntent(
-	t *testing.T,
-	store *Store,
-	tenant sessionwire.TenantID,
-	session sessionwire.SessionID,
-	key sessionwire.GateID,
-	value []byte,
-	deadline time.Time,
-) {
-	t.Helper()
-	scope, err := store.deriveSessionScope(tenant, session)
-	if err != nil {
-		t.Fatalf("deriveSessionScope: %v", err)
-	}
-	if _, _, err := store.backend.OrderedIndex.Create(
-		context.Background(), gateIntentID(scope, key), scope.SessionNamespace, value, storage.Rank{}, gateDue(deadline),
-	); err != nil {
-		t.Fatalf("seed intent: %v", err)
-	}
-}
-
-func mustEncodeGateIntent(t *testing.T, intent gateIntent) []byte {
-	t.Helper()
-	value, err := encodeGateIntent(intent)
-	if err != nil {
-		t.Fatalf("encodeGateIntent: %v", err)
-	}
-	return value
-}
-
-func dueGateIDs(due []DueGate) []string {
-	ids := make([]string, 0, len(due))
-	for _, entry := range due {
-		ids = append(ids, string(entry.SessionID)+"/"+string(entry.Gate.GateID))
-	}
-	return ids
-}
-
-func mustListDueGates(t *testing.T, store *Store, before time.Time) []DueGate {
-	t.Helper()
-	due, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: before, Limit: 50})
-	if err != nil {
-		t.Fatalf("ListDueGates: %v", err)
-	}
-	return due
-}
-
-// TestListDueGatesReportsOnlyGatesTheProjectionStillOpens is the reader half of
-// the ordering contract. Every case below is a state a crash or a wholesale
-// re-projection can really leave behind, and only the one with a matching
-// durable open event may be reported.
-func TestListDueGatesReportsOnlyGatesTheProjectionStillOpens(t *testing.T) {
-	store := openTestStore(t)
-	bound := catalogDeadline
-	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
-	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
-
-	// Due and still open.
-	mustOpenGateOn(t, store, catalogTenant, "session-1", gateWithDeadline(testGate("gate-due", 5), bound.Add(-time.Hour)))
-	// Open but not yet due.
-	mustOpenGateOn(t, store, catalogTenant, "session-1", gateWithDeadline(testGate("gate-later", 6), bound.Add(time.Hour)))
-	// Due and then resolved: a tombstoned intent leaves the due pages.
-	mustOpenGateOn(t, store, catalogTenant, "session-2", gateWithDeadline(testGate("gate-resolved", 7), bound.Add(-time.Hour)))
-	if _, err := store.ResolveGate(context.Background(), ResolveGateRequest{
-		TenantID: catalogTenant, SessionID: "session-2", LeaseEpoch: 1, GateID: "gate-resolved",
-	}); err != nil {
-		t.Fatalf("ResolveGate: %v", err)
-	}
-	// An interrupted open: the intent is durable, the projection never
-	// committed. This is the remnant the reader exists to validate away.
-	//
-	// It is seeded on the session that DOES have an open gate, so a reader
-	// that reported a due intent without checking which gate it names would
-	// report that session's gate twice rather than silently reporting nothing.
-	orphan := gateIntent{
-		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-orphan",
-		OpenedEventID: "event-gate-orphan", OpenedJournalSeq: 9, Deadline: bound.Add(-time.Hour),
-	}
-	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-orphan", mustEncodeGateIntent(t, orphan), orphan.Deadline)
-	// An intent whose session has no catalog record at all.
-	stray := orphan
-	stray.SessionID = "session-missing"
-	stray.GateID = "gate-stray"
-	stray.OpenedEventID = "event-gate-stray"
-	putRawGateIntent(t, store, catalogTenant, "session-missing", "gate-stray", mustEncodeGateIntent(t, stray), stray.Deadline)
-
-	due := mustListDueGates(t, store, bound)
-	got := dueGateIDs(due)
-	if len(got) != 1 || got[0] != "session-1/gate-due" {
-		t.Fatalf("due gates = %v, want [session-1/gate-due]", got)
-	}
-	if due[0].TenantID != catalogTenant {
-		t.Fatalf("due gate tenant = %q, want %q", due[0].TenantID, catalogTenant)
-	}
-	// The projection is returned, not a reconstruction of it from the index.
-	if due[0].Gate.Prompt.Title != "Confirm" || due[0].Gate.OpenedJournalSeq != 5 {
-		t.Fatalf("due gate did not carry the durable projection: %+v", due[0].Gate)
-	}
-}
-
-// TestListDueGatesRejectsAnIntentThatNamesAnotherGate proves the reader holds a
-// stored intent to the identity the provider filed it under rather than
-// trusting either one alone.
-func TestListDueGatesRejectsAnIntentThatNamesAnotherGate(t *testing.T) {
-	store := openTestStore(t)
-	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
-	impostor := gateIntent{
-		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-b",
-		OpenedEventID: "event-gate-b", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
-	}
-	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-a", mustEncodeGateIntent(t, impostor), impostor.Deadline)
-
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	got := assertCatalogCode(t, err, CatalogErrorIdentity)
-	if !strings.HasPrefix(got.Field, "due_gates[0].") {
-		t.Fatalf("failure field = %q, want the failing row's position", got.Field)
-	}
-}
-
-// TestListDueGatesRejectsAnIntentFiledUnderAnotherSession covers the other half
-// of that identity: the record's bytes name a session, and the ordering scope
-// it was filed under must be that session's.
-func TestListDueGatesRejectsAnIntentFiledUnderAnotherSession(t *testing.T) {
-	store := openTestStore(t)
-	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
-	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
-	misfiled := gateIntent{
-		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-a",
-		OpenedEventID: "event-gate-a", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
-	}
-	// Filed under session-2's order scope while claiming session-1.
-	putRawGateIntent(t, store, catalogTenant, "session-2", "gate-a", mustEncodeGateIntent(t, misfiled), misfiled.Deadline)
-
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	got := assertCatalogCode(t, err, CatalogErrorIdentity)
-	if got.Field != "due_gates[0].ordering_scope" {
-		t.Fatalf("failure field = %q, want due_gates[0].ordering_scope", got.Field)
-	}
-}
-
-func TestListDueGatesFailsClosedOnACorruptIntent(t *testing.T) {
-	store := openTestStore(t)
-	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
-	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-a", []byte("{not json"), catalogDeadline.Add(-time.Hour))
-
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	assertCatalogCode(t, err, CatalogErrorMalformed)
-}
-
-func TestListDueGatesRejectsAnInvalidRequest(t *testing.T) {
-	store := openTestStore(t)
-	for _, tt := range []struct {
-		name string
-		req  ListDueGatesRequest
-	}{
-		{"negative limit", ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: -1}},
-		{"limit above the page ceiling", ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: storage.MaxOrderedPageLimit + 1}},
-		{"zero bound", ListDueGatesRequest{Limit: 10}},
-		{"unrepresentable bound", ListDueGatesRequest{DueAtOrBefore: time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC), Limit: 10}},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, err := store.ListDueGates(context.Background(), tt.req); err == nil {
-				t.Fatal("an invalid due request was accepted")
-			} else {
-				assertCatalogCode(t, err, CatalogErrorInvalid)
-			}
-		})
-	}
-}
-
-func TestListDueGatesHonoursItsLimit(t *testing.T) {
-	store := openTestStore(t)
-	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
-	for i := range 3 {
-		mustOpenGateOn(t, store, catalogTenant, "session-1",
-			gateWithDeadline(testGate("gate-"+strconv.Itoa(i), uint64(i+1)), catalogDeadline.Add(-time.Hour)))
-	}
-	due, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 2})
-	if err != nil {
-		t.Fatalf("ListDueGates: %v", err)
-	}
-	if len(due) != 2 {
-		t.Fatalf("due gates = %v, want 2 rows", dueGateIDs(due))
-	}
-}
-
-// --- redaction ------------------------------------------------------------
-
-// TestGateFailuresAreRedacted holds every gate path to the same rule the rest
-// of the package obeys: a returned error names the stage that failed and never
-// the provider's text, the tenant, the session, the gate, or the prompt a
-// caller supplied.
-func TestGateFailuresAreRedacted(t *testing.T) {
-	base := memstore.New()
-	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
-	base.OrderedIndex = hostile
-	store := openStore(t, base)
-	openGateFixture(t, store)
-	// A due gate exists before the provider is armed, so the due page really
-	// reaches a session read and fails there rather than returning empty.
-	mustOpenGateOn(t, store, catalogTenant, catalogSession,
-		gateWithDeadline(testGate("gate-due", 5), catalogDeadline.Add(-time.Hour)))
-	secret := errors.New("provider path /var/secret/tenant-a/session-a/gate-a")
-	hostile.failGets(secret)
-
-	secrets := []string{"secret", "tenant-a", "session-a", "gate-a", "gate-due", "Confirm", "Proceed?"}
-	for name, call := range map[string]func() error{
-		"OpenGate": func() error {
-			_, err := store.OpenGate(context.Background(), OpenGateRequest{
-				TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: testGate("gate-a", 5),
-			})
-			return err
-		},
-		"ResolveGate": func() error {
-			_, err := store.ResolveGate(context.Background(), ResolveGateRequest{
-				TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, GateID: "gate-a",
-			})
-			return err
-		},
-		"ReadGates": func() error {
-			_, err := store.ReadGates(context.Background(), ReadGatesRequest{
-				TenantID: catalogTenant, SessionID: catalogSession,
-			})
-			return err
-		},
-		// The due page is the only multi-session surface here, so it is the one
-		// whose failures could name a session the caller never asked about.
-		"ListDueGates": func() error {
-			_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
-				DueAtOrBefore: catalogDeadline, Limit: 10,
-			})
-			return err
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			err := call()
-			assertCatalogCode(t, err, CatalogErrorBackend)
-			for _, leak := range secrets {
-				if strings.Contains(err.Error(), leak) {
-					t.Fatalf("%q leaked into %q", leak, err.Error())
-				}
-			}
-			if !errors.Is(err, secret) {
-				t.Fatal("cause was not preserved for errors.Is")
-			}
-		})
-	}
-}
-
-// --- the intent codec -----------------------------------------------------
-
-func testGateIntent() gateIntent {
-	return gateIntent{
-		TenantID:         catalogTenant,
-		SessionID:        catalogSession,
-		GateID:           "gate-a",
-		OpenedEventID:    "event-gate-a",
-		OpenedJournalSeq: 5,
-		Deadline:         catalogDeadline,
-	}
-}
-
-func TestGateIntentRoundTripsToACanonicalForm(t *testing.T) {
-	intent := testGateIntent()
-	intent.Deadline = catalogDeadline.In(time.FixedZone("elsewhere", 3600))
-	encoded := mustEncodeGateIntent(t, intent)
-	decoded, err := decodeGateIntent(encoded)
-	if err != nil {
-		t.Fatalf("decodeGateIntent: %v", err)
-	}
-	if decoded.Deadline.Location() != time.UTC {
-		t.Fatalf("deadline was not canonicalized to UTC: %v", decoded.Deadline)
-	}
-	if !decoded.Deadline.Equal(intent.Deadline) {
-		t.Fatalf("deadline instant changed: %v -> %v", intent.Deadline, decoded.Deadline)
-	}
-	reencoded := mustEncodeGateIntent(t, decoded)
-	if !bytes.Equal(encoded, reencoded) {
-		t.Fatalf("round trip changed the canonical bytes:\n%s\n%s", encoded, reencoded)
-	}
-}
-
-func TestGateIntentDecodeFailsClosed(t *testing.T) {
-	valid := mustEncodeGateIntent(t, testGateIntent())
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(valid, &members); err != nil {
-		t.Fatalf("a stored intent is not JSON: %v", err)
-	}
-	mutate := func(apply func(map[string]json.RawMessage)) []byte {
-		copied := make(map[string]json.RawMessage, len(members))
-		for name, value := range members {
-			copied[name] = value
-		}
-		apply(copied)
-		encoded, err := json.Marshal(copied)
-		if err != nil {
-			t.Fatalf("marshal variant: %v", err)
-		}
-		return encoded
-	}
-	for _, tt := range []struct {
-		name  string
-		value []byte
-		want  CatalogErrorCode
-	}{
-		{"empty", nil, CatalogErrorMalformed},
-		{"too large", append(append([]byte(nil), valid...), bytes.Repeat([]byte(" "), MaxGateIntentBytes)...), CatalogErrorTooLarge},
-		{"not json", []byte("{"), CatalogErrorMalformed},
-		{"trailing content", append(append([]byte(nil), valid...), '{'), CatalogErrorMalformed},
-		{"unknown version", mutate(func(m map[string]json.RawMessage) { m["record_version"] = json.RawMessage("2") }), CatalogErrorVersion},
-		{"undeclared member", mutate(func(m map[string]json.RawMessage) { m["surprise"] = json.RawMessage("1") }), CatalogErrorMalformed},
-		{"empty tenant", mutate(func(m map[string]json.RawMessage) { m["tenant_id"] = json.RawMessage(`""`) }), CatalogErrorInvalid},
-		{"empty session", mutate(func(m map[string]json.RawMessage) { m["session_id"] = json.RawMessage(`""`) }), CatalogErrorInvalid},
-		{"empty gate", mutate(func(m map[string]json.RawMessage) { m["gate_id"] = json.RawMessage(`""`) }), CatalogErrorInvalid},
-		{"empty opening event", mutate(func(m map[string]json.RawMessage) { m["opened_event_id"] = json.RawMessage(`""`) }), CatalogErrorInvalid},
-		{"zero opening sequence", mutate(func(m map[string]json.RawMessage) { m["opened_journal_seq"] = json.RawMessage("0") }), CatalogErrorInvalid},
-		{"zero deadline", mutate(func(m map[string]json.RawMessage) { m["deadline"] = json.RawMessage(`"0001-01-01T00:00:00Z"`) }), CatalogErrorInvalid},
-		{"unrepresentable deadline", mutate(func(m map[string]json.RawMessage) { m["deadline"] = json.RawMessage(`"3000-01-01T00:00:00Z"`) }), CatalogErrorInvalid},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, err := decodeGateIntent(tt.value); err == nil {
-				t.Fatal("a malformed intent decoded")
-			} else {
-				assertCatalogCode(t, err, tt.want)
-			}
-		})
-	}
-}
-
-func TestGateIntentEncodeRefusesAnInvalidIntent(t *testing.T) {
-	invalid := testGateIntent()
-	invalid.OpenedJournalSeq = 0
-	if _, err := encodeGateIntent(invalid); err == nil {
-		t.Fatal("an intent naming no opening event encoded")
-	} else {
-		assertCatalogCode(t, err, CatalogErrorInvalid)
-	}
-}
-
-// --- concurrency ----------------------------------------------------------
-
-// TestConcurrentOpenGatesKeepEveryGate opens two gates at once on one record.
-// The record is one compare-and-swap, so one writer legitimately loses; what it
-// must not do is silently drop the other writer's gate, and its retry must
-// find its own intent rather than colliding with it.
-func TestConcurrentOpenGatesKeepEveryGate(t *testing.T) {
-	store := openTestStore(t)
-	openGateFixture(t, store)
-
-	open := func(gate sessionwire.GateProjection) error {
-		var err error
-		for range 8 {
-			_, err = store.OpenGate(context.Background(), OpenGateRequest{
-				TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: gate,
-			})
-			var catalog *CatalogError
-			if err == nil || !errors.As(err, &catalog) || catalog.Code != CatalogErrorConflict {
-				return err
-			}
-		}
-		return err
-	}
-	var wait sync.WaitGroup
-	errs := make([]error, 2)
-	gates := []sessionwire.GateProjection{testGate("gate-a", 3), testGate("gate-b", 7)}
-	for i := range gates {
-		wait.Add(1)
-		go func() {
-			defer wait.Done()
-			errs[i] = open(gates[i])
-		}()
-	}
-	wait.Wait()
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("OpenGate(%s): %v", gates[i].GateID, err)
-		}
-	}
-	if page := mustReadGates(t, store); len(page.Gates) != 2 {
-		t.Fatalf("concurrent opens left %v, want both gates", gateIDs(page))
-	}
-}
-
-// --- guards the ordinary paths cannot reach -------------------------------
-
-func TestOpenGateRefusesAnUnrepresentableDeadline(t *testing.T) {
-	store := openTestStore(t)
-	entry := openGateFixture(t, store)
-
-	// Core accepts any nonzero deadline, so this is this package's own bound:
-	// an instant outside the representable range would wrap into a due time at
-	// the wrong end of history rather than sorting late.
-	far := gateWithDeadline(testGate("gate-a", 5), time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC))
-	_, err := store.OpenGate(context.Background(), OpenGateRequest{
-		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: far,
-	})
-	if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != "gate.deadline" {
-		t.Fatalf("failure field = %q, want gate.deadline", got.Field)
-	}
-	assertCatalogUnchanged(t, store, entry)
-	assertNoGateIntent(t, store, "gate-a")
-}
-
-// TestOpenGateRefusesToReopenAResolvedGate covers what the tombstone is for: a
-// gate identity is spent once it has been resolved, so a late or replayed open
-// cannot resurrect it under the same id.
-func TestOpenGateRefusesToReopenAResolvedGate(t *testing.T) {
-	store := openTestStore(t)
-	openGateFixture(t, store)
-	gate := testGate("gate-a", 5)
-	mustOpenGate(t, store, 1, gate)
-	entry, err := store.ResolveGate(context.Background(), ResolveGateRequest{
-		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, GateID: "gate-a",
-	})
-	if err != nil {
-		t.Fatalf("ResolveGate: %v", err)
-	}
-
-	_, err = store.OpenGate(context.Background(), OpenGateRequest{
-		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: gate,
-	})
-	assertCatalogCode(t, err, CatalogErrorDeleted)
-	assertCatalogUnchanged(t, store, entry)
-}
-
-// TestOpenGateRefusesAnIdentityHeldByAnotherIntent reaches the check that the
-// projection cannot make. UpdateCatalogHostState replaces the open gates
-// wholesale and leaves intents alone, so after one the identity looks free in
-// the projection while its deadline intent still names a different gate.
-func TestOpenGateRefusesAnIdentityHeldByAnotherIntent(t *testing.T) {
-	store := openTestStore(t)
-	openGateFixture(t, store)
-	mustOpenGate(t, store, 1, testGate("gate-a", 5))
-	cleared := testHostStateRequest(1)
-	entry, err := store.UpdateCatalogHostState(context.Background(), cleared)
-	if err != nil {
-		t.Fatalf("UpdateCatalogHostState: %v", err)
-	}
-	if len(entry.Record.OpenGates) != 0 {
-		t.Fatal("the wholesale re-projection did not clear the open gates")
-	}
-
-	different := testGate("gate-a", 6)
-	_, err = store.OpenGate(context.Background(), OpenGateRequest{
-		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: different,
-	})
-	if got := assertCatalogCode(t, err, CatalogErrorConflict); got.Field != "gate_intent" {
-		t.Fatalf("failure field = %q, want gate_intent", got.Field)
-	}
-	assertCatalogUnchanged(t, store, entry)
-}
+// --- resolving is idempotent and completes an interrupted resolve ---------
 
 func TestResolveGateRefusesASupersededLeaseEpoch(t *testing.T) {
 	store := openTestStore(t)
@@ -1153,173 +775,6 @@ func TestResolveGateIsIdempotentAndQuiet(t *testing.T) {
 	}
 }
 
-// TestListDueGatesDoesNotAnswerOneTenantWithAnother pins the identity a due
-// page caches a session record under. Session ids are unique within a tenant
-// and not across them, so two tenants can legitimately hold the same session id
-// and the same gate id; a page that cached by session alone would validate one
-// tenant's intent against the other tenant's projection and report a gate that
-// tenant never opened.
-func TestListDueGatesDoesNotAnswerOneTenantWithAnother(t *testing.T) {
-	store := openTestStore(t)
-	const shared = sessionwire.SessionID("session-shared")
-	mustPrepareSession(t, store, catalogTenant, shared, 100)
-	mustPrepareSession(t, store, catalogOtherTenant, shared, 100)
-
-	due := gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(-time.Hour))
-	mustOpenGateOn(t, store, catalogTenant, shared, due)
-	// The other tenant has the same identities in an intent alone: an open
-	// that never committed. Nothing about it may be answered by the first
-	// tenant's record.
-	orphan := gateIntent{
-		TenantID: catalogOtherTenant, SessionID: shared, GateID: due.GateID,
-		OpenedEventID: due.OpenedEventID, OpenedJournalSeq: due.OpenedJournalSeq, Deadline: due.Deadline,
-	}
-	putRawGateIntent(t, store, catalogOtherTenant, shared, due.GateID, mustEncodeGateIntent(t, orphan), orphan.Deadline)
-
-	rows := mustListDueGates(t, store, catalogDeadline)
-	if len(rows) != 1 {
-		t.Fatalf("due gates = %d rows, want only the tenant that really opened one", len(rows))
-	}
-	if rows[0].TenantID != catalogTenant {
-		t.Fatalf("due gate tenant = %q, want %q", rows[0].TenantID, catalogTenant)
-	}
-}
-
-// TestListDueGatesChecksEveryRowsFiling extends the identity check past the
-// first row of a session. A page resolves each session once, so a misfiled
-// intent arriving behind a well-filed one for the same session is exactly the
-// row a per-session check would wave through.
-func TestListDueGatesChecksEveryRowsFiling(t *testing.T) {
-	store := openTestStore(t)
-	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
-	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
-	// Sorted first by an earlier deadline, so it resolves session-1 into the
-	// page's cache before the misfiled row is read.
-	mustOpenGateOn(t, store, catalogTenant, "session-1",
-		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(-2*time.Hour)))
-	misfiled := gateIntent{
-		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-b",
-		OpenedEventID: "event-gate-b", OpenedJournalSeq: 6, Deadline: catalogDeadline.Add(-time.Hour),
-	}
-	putRawGateIntent(t, store, catalogTenant, "session-2", "gate-b", mustEncodeGateIntent(t, misfiled), misfiled.Deadline)
-
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[1].ordering_scope" {
-		t.Fatalf("failure field = %q, want due_gates[1].ordering_scope", got.Field)
-	}
-}
-
-// --- provider-supplied keys are held to the record's own bytes ------------
-
-// moveGateIntentDue rewrites one intent's provider due state out of band,
-// leaving its stored bytes alone. It is the only way to present the reader with
-// a row whose filing disagrees with the record it files.
-func moveGateIntentDue(
-	t *testing.T,
-	store *Store,
-	tenant sessionwire.TenantID,
-	session sessionwire.SessionID,
-	gate sessionwire.GateID,
-	due time.Time,
-) {
-	t.Helper()
-	scope, err := store.deriveSessionScope(tenant, session)
-	if err != nil {
-		t.Fatalf("deriveSessionScope: %v", err)
-	}
-	id := gateIntentID(scope, gate)
-	stored, err := store.backend.OrderedIndex.Get(context.Background(), id)
-	if err != nil {
-		t.Fatalf("read intent: %v", err)
-	}
-	if _, err := store.backend.OrderedIndex.Update(
-		context.Background(), id, stored.Revision, stored.Value, storage.Rank{}, gateDue(due),
-	); err != nil {
-		t.Fatalf("move intent due: %v", err)
-	}
-}
-
-// TestListDueGatesRejectsAnIntentDueAtSomethingElse closes the third member of
-// the same family as the stable key and the ordering scope: the due time is a
-// provider-supplied key component, and a page that trusted it would report a
-// gate as expired because its INDEX said so while the record's own bytes named
-// a deadline a day away.
-func TestListDueGatesRejectsAnIntentDueAtSomethingElse(t *testing.T) {
-	store := openTestStore(t)
-	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
-	mustOpenGateOn(t, store, catalogTenant, "session-1",
-		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(24*time.Hour)))
-	moveGateIntentDue(t, store, catalogTenant, "session-1", "gate-a", catalogDeadline.Add(-time.Hour))
-
-	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[0].due" {
-		t.Fatalf("failure field = %q, want due_gates[0].due", got.Field)
-	}
-}
-
-// TestListDueGatesRejectsAnIntentRankedIntoAnotherSession is the fourth member.
-// A ranking scope cannot be changed after a record is created, so a disagreeing
-// one can only arrive by a provider filing the record wrongly in the first
-// place — the same reachability class as a misfiled ordering scope.
-func TestListDueGatesRejectsAnIntentRankedIntoAnotherSession(t *testing.T) {
-	store := openTestStore(t)
-	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
-	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
-	other, err := store.deriveSessionScope(catalogTenant, "session-2")
-	if err != nil {
-		t.Fatalf("deriveSessionScope: %v", err)
-	}
-	intent := gateIntent{
-		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-a",
-		OpenedEventID: "event-gate-a", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
-	}
-	scope, err := store.deriveSessionScope(catalogTenant, "session-1")
-	if err != nil {
-		t.Fatalf("deriveSessionScope: %v", err)
-	}
-	if _, _, err := store.backend.OrderedIndex.Create(
-		context.Background(), gateIntentID(scope, "gate-a"), other.SessionNamespace,
-		mustEncodeGateIntent(t, intent), storage.Rank{}, gateDue(intent.Deadline),
-	); err != nil {
-		t.Fatalf("seed intent: %v", err)
-	}
-
-	_, err = store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
-	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[0].ranking_scope" {
-		t.Fatalf("failure field = %q, want due_gates[0].ranking_scope", got.Field)
-	}
-}
-
-// --- a provider failure is never read as an absent session ----------------
-
-// TestListDueGatesDoesNotReadAProviderFailureAsAnAbsentSession is what keeps
-// noSuchSession narrow. Dropping a row is a claim that the session does not
-// exist; a provider that is merely failing supports no such claim, and a page
-// that returned empty here would report "nothing is due" during an outage.
-func TestListDueGatesDoesNotReadAProviderFailureAsAnAbsentSession(t *testing.T) {
-	store, hostile := openHostileListStore(t)
-	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
-	mustOpenGateOn(t, store, catalogTenant, "session-1",
-		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(-time.Hour)))
-	if rows := mustListDueGates(t, store, catalogDeadline); len(rows) != 1 {
-		t.Fatalf("fixture is not due: %v", dueGateIDs(rows))
-	}
-
-	hostile.failGets(errors.New("provider unavailable"))
-	rows, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
-		DueAtOrBefore: catalogDeadline, Limit: 10,
-	})
-	if err == nil {
-		t.Fatalf("a failing provider produced %d due rows and no error", len(rows))
-	}
-	assertCatalogCode(t, err, CatalogErrorBackend)
-	if rows != nil {
-		t.Fatalf("a failed page returned rows: %v", dueGateIDs(rows))
-	}
-}
-
-// --- resolve completes what an interrupted resolve left -------------------
-
 // TestResolveGateRetiresAnIntentWhoseGateIsNoLongerProjected reaches the state
 // the unconditional retire exists for: the projection no longer names the gate
 // while its intent is still live and due. A resolve gated on finding the gate
@@ -1356,15 +811,14 @@ func TestResolveGateRetiresAnIntentWhoseGateIsNoLongerProjected(t *testing.T) {
 // reporting success would leave a deadline that outlives the gate it belongs to
 // with nothing recording that anything is wrong.
 func TestResolveGateReportsAFailedRetire(t *testing.T) {
-	base := memstore.New()
-	failing := &intentFailingOrdered{OrderedIndex: base.OrderedIndex}
-	base.OrderedIndex = failing
-	store := openStore(t, base)
+	store, failing := openHostileListStore(t)
 	openGateFixture(t, store)
 	mustOpenGate(t, store, 1, testGate("gate-a", 5))
 
+	// Only the intent read fails: a resolve reads the catalog record first, so
+	// a provider that failed every Get would stop before the read under test.
 	secret := errors.New("provider path /var/secret/tenant-a/session-a/gate-a")
-	failing.failIntentGets(secret)
+	failing.failGetsIn(gateNamespace, secret)
 	_, err := store.ResolveGate(context.Background(), ResolveGateRequest{
 		TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, GateID: "gate-a",
 	})
@@ -1377,9 +831,15 @@ func TestResolveGateReportsAFailedRetire(t *testing.T) {
 			t.Fatalf("%q leaked into %q", leak, err.Error())
 		}
 	}
+	// The projection was already cleared, which is what proves the failure
+	// happened at the RETIRE step rather than before it: this is the resolve's
+	// one tolerable interruption, and it is the state a retry completes.
+	if page := mustReadGates(t, store); len(page.Gates) != 0 {
+		t.Fatalf("the resolve failed before it cleared the projection: %v", gateIDs(page))
+	}
 	// Read the intent back through an unarmed provider: it must still be due,
 	// because a resolve that could not read it cannot have retired it.
-	failing.failIntentGets(nil)
+	failing.failGetsIn(gateNamespace, nil)
 	if due := gateIntentRecord(t, store, "gate-a").Due; due.State != storage.DueAt {
 		t.Fatalf("the intent was retired by a resolve that failed: %+v", due)
 	}
@@ -1393,5 +853,752 @@ func TestResolveGateReportsAFailedRetire(t *testing.T) {
 	}
 	if due := gateIntentRecord(t, store, "gate-a").Due; due.State != storage.NotDue {
 		t.Fatalf("the retry did not retire the intent: %+v", due)
+	}
+}
+
+// --- the reader validates what the writer could not -----------------------
+
+// TestReadGatesFailsClosedOnAGateAboveItsOwnTip reaches the one inconsistency a
+// gate write cannot prevent: UpdateCatalogHostState replaces the whole
+// projection wholesale and is the Host's own re-projection path, so it can
+// store a gate naming an event past the record's durable tip. A page like that
+// violates its own contract, so the read refuses it rather than publishing it.
+func TestReadGatesFailsClosedOnAGateAboveItsOwnTip(t *testing.T) {
+	store := openTestStore(t)
+	openGateFixture(t, store)
+	req := testHostStateRequest(1)
+	req.OpenGates = []sessionwire.GateProjection{testGate("gate-a", req.LastJournalSeq+1)}
+	if _, err := store.UpdateCatalogHostState(context.Background(), req); err != nil {
+		t.Fatalf("UpdateCatalogHostState: %v", err)
+	}
+
+	_, err := store.ReadGates(context.Background(), ReadGatesRequest{
+		TenantID: catalogTenant, SessionID: catalogSession,
+	})
+	assertCatalogCode(t, err, CatalogErrorSequence)
+}
+
+// --- the due view ---------------------------------------------------------
+
+// TestListDueGatesReportsOnlyGatesTheProjectionStillOpens is the reader half of
+// the ordering contract. Every case below is a state a crash or a wholesale
+// re-projection can really leave behind, and only the one with a matching
+// durable open event may be reported.
+func TestListDueGatesReportsOnlyGatesTheProjectionStillOpens(t *testing.T) {
+	store := openTestStore(t)
+	bound := catalogDeadline
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
+
+	// Due and still open.
+	mustOpenGateOn(t, store, catalogTenant, "session-1", gateWithDeadline(testGate("gate-due", 5), bound.Add(-time.Hour)))
+	// Open but not yet due.
+	mustOpenGateOn(t, store, catalogTenant, "session-1", gateWithDeadline(testGate("gate-later", 6), bound.Add(time.Hour)))
+	// Due and then resolved: a tombstoned intent leaves the due pages.
+	mustOpenGateOn(t, store, catalogTenant, "session-2", gateWithDeadline(testGate("gate-resolved", 7), bound.Add(-time.Hour)))
+	if _, err := store.ResolveGate(context.Background(), ResolveGateRequest{
+		TenantID: catalogTenant, SessionID: "session-2", LeaseEpoch: 1, GateID: "gate-resolved",
+	}); err != nil {
+		t.Fatalf("ResolveGate: %v", err)
+	}
+	// An interrupted open: the intent is durable, the projection never
+	// committed. This is the remnant the reader exists to validate away.
+	//
+	// It is seeded on the session that DOES have an open gate, so a reader
+	// that reported a due intent without checking which gate it names would
+	// report that session's gate twice rather than silently reporting nothing.
+	orphan := gateIntent{
+		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-orphan",
+		OpenedEventID: "event-gate-orphan", OpenedJournalSeq: 9, Deadline: bound.Add(-time.Hour),
+	}
+	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-orphan", mustEncodeGateIntent(t, orphan), orphan.Deadline)
+	// An intent whose session has no catalog record at all.
+	stray := orphan
+	stray.SessionID = "session-missing"
+	stray.GateID = "gate-stray"
+	stray.OpenedEventID = "event-gate-stray"
+	putRawGateIntent(t, store, catalogTenant, "session-missing", "gate-stray", mustEncodeGateIntent(t, stray), stray.Deadline)
+
+	due := mustListDueGates(t, store, bound)
+	got := dueGateIDs(due)
+	if len(got) != 1 || got[0] != "session-1/gate-due" {
+		t.Fatalf("due gates = %v, want [session-1/gate-due]", got)
+	}
+	if due.Gates[0].TenantID != catalogTenant {
+		t.Fatalf("due gate tenant = %q, want %q", due.Gates[0].TenantID, catalogTenant)
+	}
+	// The projection is returned, not a reconstruction of it from the index.
+	if due.Gates[0].Gate.Prompt.Title != "Confirm" || due.Gates[0].Gate.OpenedJournalSeq != 5 {
+		t.Fatalf("due gate did not carry the durable projection: %+v", due.Gates[0].Gate)
+	}
+	// Every row was examined, including the three that reported nothing.
+	if due.Examined != 3 {
+		t.Fatalf("examined = %d, want the 3 due rows the provider returned", due.Examined)
+	}
+}
+
+func TestListDueGatesHonoursItsLimit(t *testing.T) {
+	store := openTestStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	for i := range 3 {
+		mustOpenGateOn(t, store, catalogTenant, "session-1",
+			gateWithDeadline(testGate("gate-"+strconv.Itoa(i), uint64(i+1)), catalogDeadline.Add(-time.Hour)))
+	}
+	due, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 2})
+	if err != nil {
+		t.Fatalf("ListDueGates: %v", err)
+	}
+	if len(due.Gates) != 2 {
+		t.Fatalf("due gates = %v, want 2 rows", dueGateIDs(due))
+	}
+	if due.Limit != 2 || due.Examined != 2 {
+		t.Fatalf("page reported examined %d of limit %d, want 2 of 2", due.Examined, due.Limit)
+	}
+	// A caller that names no limit still has to be able to compare the two, so
+	// the page reports the EFFECTIVE limit rather than echoing the request.
+	unlimited, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline})
+	if err != nil {
+		t.Fatalf("ListDueGates: %v", err)
+	}
+	if unlimited.Limit != store.limits.MaxPageSize {
+		t.Fatalf("effective limit = %d, want the store's page size %d", unlimited.Limit, store.limits.MaxPageSize)
+	}
+}
+
+func TestListDueGatesReportsWhenAPageWasConsumedByRemnants(t *testing.T) {
+	store := openTestStore(t)
+	bound := catalogDeadline
+	mustPrepareSession(t, store, catalogTenant, "session-a", 100)
+	// Three gates opened and then dropped by an ordinary wholesale
+	// re-projection — the path the file header documents as normal — leave
+	// three remnant intents with the oldest deadlines in the view.
+	for i := range 3 {
+		mustOpenGateOn(t, store, catalogTenant, "session-a",
+			gateWithDeadline(testGate("gate-r"+strconv.Itoa(i), uint64(i+1)), bound.Add(-time.Duration(3-i)*time.Hour)))
+	}
+	if _, err := store.UpdateCatalogHostState(context.Background(), UpdateCatalogHostStateRequest{
+		TenantID: catalogTenant, SessionID: "session-a", LeaseEpoch: 1,
+		State: sessionwire.SessionStateRunning, Residency: sessionwire.SessionResidencyResident,
+		LastActiveAt: catalogActiveAt, LastJournalSeq: 100, LastEventID: "event-tip",
+	}); err != nil {
+		t.Fatalf("UpdateCatalogHostState: %v", err)
+	}
+	mustOpenGateOn(t, store, catalogTenant, "session-a",
+		gateWithDeadline(testGate("gate-live", 9), bound.Add(-30*time.Minute)))
+
+	// The hazard itself: the remnants sort ahead of the live gate and a page
+	// their size reports nothing at all.
+	blocked, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: bound, Limit: 3})
+	if err != nil {
+		t.Fatalf("ListDueGates: %v", err)
+	}
+	if len(blocked.Gates) != 0 {
+		t.Fatalf("fixture did not starve the page: %v", dueGateIDs(blocked))
+	}
+	// …and the signal that makes it distinguishable from "nothing is due".
+	if blocked.Examined != blocked.Limit || blocked.Limit != 3 {
+		t.Fatalf("examined %d of limit %d, want a full page of 3 so blocking is detectable", blocked.Examined, blocked.Limit)
+	}
+
+	// One row further and the live gate appears, which is what proves the
+	// earlier page was blocked rather than empty.
+	past, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: bound, Limit: 4})
+	if err != nil {
+		t.Fatalf("ListDueGates: %v", err)
+	}
+	if got := dueGateIDs(past); len(got) != 1 || got[0] != "session-a/gate-live" {
+		t.Fatalf("due gates = %v, want [session-a/gate-live]", got)
+	}
+	if past.Examined != 4 {
+		t.Fatalf("examined = %d, want all 4 rows", past.Examined)
+	}
+}
+
+func TestListDueGatesRejectsAnInvalidRequest(t *testing.T) {
+	store := openTestStore(t)
+	for _, tt := range []struct {
+		name string
+		req  ListDueGatesRequest
+	}{
+		{"negative limit", ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: -1}},
+		{"limit above the page ceiling", ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: storage.MaxOrderedPageLimit + 1}},
+		{"zero bound", ListDueGatesRequest{Limit: 10}},
+		{"unrepresentable bound", ListDueGatesRequest{DueAtOrBefore: time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC), Limit: 10}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := store.ListDueGates(context.Background(), tt.req); err == nil {
+				t.Fatal("an invalid due request was accepted")
+			} else {
+				assertCatalogCode(t, err, CatalogErrorInvalid)
+			}
+		})
+	}
+}
+
+// TestListDueGatesDoesNotReadAProviderFailureAsAnAbsentSession is what keeps
+// noSuchSession narrow. Dropping a row is a claim that the session does not
+// exist; a provider that is merely failing supports no such claim, and a page
+// that returned empty here would report "nothing is due" during an outage.
+func TestListDueGatesDoesNotReadAProviderFailureAsAnAbsentSession(t *testing.T) {
+	store, hostile := openHostileListStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	mustOpenGateOn(t, store, catalogTenant, "session-1",
+		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(-time.Hour)))
+	if rows := mustListDueGates(t, store, catalogDeadline); len(rows.Gates) != 1 {
+		t.Fatalf("fixture is not due: %v", dueGateIDs(rows))
+	}
+
+	hostile.failGets(errors.New("provider unavailable"))
+	rows, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
+		DueAtOrBefore: catalogDeadline, Limit: 10,
+	})
+	if err == nil {
+		t.Fatalf("a failing provider produced %d due rows and no error", len(rows.Gates))
+	}
+	assertCatalogCode(t, err, CatalogErrorBackend)
+	if len(rows.Gates) != 0 || rows.Examined != 0 {
+		t.Fatalf("a failed page returned a page: %+v", rows)
+	}
+}
+
+// TestListDueGatesDoesNotAnswerOneTenantWithAnother pins the identity a due
+// page caches a session record under. Session ids are unique within a tenant
+// and not across them, so two tenants can legitimately hold the same session id
+// and the same gate id; a page that cached by session alone would validate one
+// tenant's intent against the other tenant's projection and report a gate that
+// tenant never opened.
+func TestListDueGatesDoesNotAnswerOneTenantWithAnother(t *testing.T) {
+	store := openTestStore(t)
+	const shared = sessionwire.SessionID("session-shared")
+	mustPrepareSession(t, store, catalogTenant, shared, 100)
+	mustPrepareSession(t, store, catalogOtherTenant, shared, 100)
+
+	due := gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(-time.Hour))
+	mustOpenGateOn(t, store, catalogTenant, shared, due)
+	// The other tenant has the same identities in an intent alone: an open
+	// that never committed. Nothing about it may be answered by the first
+	// tenant's record.
+	orphan := gateIntent{
+		TenantID: catalogOtherTenant, SessionID: shared, GateID: due.GateID,
+		OpenedEventID: due.OpenedEventID, OpenedJournalSeq: due.OpenedJournalSeq, Deadline: due.Deadline,
+	}
+	putRawGateIntent(t, store, catalogOtherTenant, shared, due.GateID, mustEncodeGateIntent(t, orphan), orphan.Deadline)
+
+	rows := mustListDueGates(t, store, catalogDeadline)
+	if len(rows.Gates) != 1 {
+		t.Fatalf("due gates = %d rows, want only the tenant that really opened one", len(rows.Gates))
+	}
+	if rows.Gates[0].TenantID != catalogTenant {
+		t.Fatalf("due gate tenant = %q, want %q", rows.Gates[0].TenantID, catalogTenant)
+	}
+}
+
+// --- a due row's provider keys are held to the record's own bytes ---------
+
+// TestListDueGatesRejectsAnIntentThatNamesAnotherGate proves the reader holds a
+// stored intent to the identity the provider filed it under rather than
+// trusting either one alone.
+func TestListDueGatesRejectsAnIntentThatNamesAnotherGate(t *testing.T) {
+	store := openTestStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	impostor := gateIntent{
+		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-b",
+		OpenedEventID: "event-gate-b", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
+	}
+	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-a", mustEncodeGateIntent(t, impostor), impostor.Deadline)
+
+	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
+	got := assertCatalogCode(t, err, CatalogErrorIdentity)
+	if !strings.HasPrefix(got.Field, "due_gates[0].") {
+		t.Fatalf("failure field = %q, want the failing row's position", got.Field)
+	}
+}
+
+// TestListDueGatesRejectsAnIntentFiledUnderAnotherSession covers the other half
+// of that identity: the record's bytes name a session, and the ordering scope
+// it was filed under must be that session's.
+func TestListDueGatesRejectsAnIntentFiledUnderAnotherSession(t *testing.T) {
+	store := openTestStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
+	misfiled := gateIntent{
+		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-a",
+		OpenedEventID: "event-gate-a", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
+	}
+	// Filed under session-2's order scope while claiming session-1.
+	putRawGateIntent(t, store, catalogTenant, "session-2", "gate-a", mustEncodeGateIntent(t, misfiled), misfiled.Deadline)
+
+	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
+	got := assertCatalogCode(t, err, CatalogErrorIdentity)
+	if got.Field != "due_gates[0].ordering_scope" {
+		t.Fatalf("failure field = %q, want due_gates[0].ordering_scope", got.Field)
+	}
+}
+
+// TestListDueGatesRejectsAnIntentRankedIntoAnotherSession is the fourth member.
+// A ranking scope cannot be changed after a record is created, so a disagreeing
+// one can only arrive by a provider filing the record wrongly in the first
+// place — the same reachability class as a misfiled ordering scope.
+func TestListDueGatesRejectsAnIntentRankedIntoAnotherSession(t *testing.T) {
+	store := openTestStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
+	other, err := store.deriveSessionScope(catalogTenant, "session-2")
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	intent := gateIntent{
+		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-a",
+		OpenedEventID: "event-gate-a", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
+	}
+	scope, err := store.deriveSessionScope(catalogTenant, "session-1")
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	if _, _, err := store.backend.OrderedIndex.Create(
+		context.Background(), gateIntentID(scope, "gate-a"), other.SessionNamespace,
+		mustEncodeGateIntent(t, intent), storage.Rank{}, gateDue(intent.Deadline),
+	); err != nil {
+		t.Fatalf("seed intent: %v", err)
+	}
+
+	_, err = store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
+	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[0].ranking_scope" {
+		t.Fatalf("failure field = %q, want due_gates[0].ranking_scope", got.Field)
+	}
+}
+
+// TestListDueGatesRejectsAnIntentDueAtSomethingElse closes the third member of
+// the same family as the stable key and the ordering scope: the due time is a
+// provider-supplied key component, and a page that trusted it would report a
+// gate as expired because its INDEX said so while the record's own bytes named
+// a deadline a day away.
+func TestListDueGatesRejectsAnIntentDueAtSomethingElse(t *testing.T) {
+	store := openTestStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	mustOpenGateOn(t, store, catalogTenant, "session-1",
+		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(24*time.Hour)))
+	moveGateIntentDue(t, store, catalogTenant, "session-1", "gate-a", catalogDeadline.Add(-time.Hour))
+
+	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
+	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[0].due" {
+		t.Fatalf("failure field = %q, want due_gates[0].due", got.Field)
+	}
+}
+
+// TestListDueGatesRefusesATombstonedRow holds the provider to the one due-view
+// promise this reader cannot re-derive from a record: that a tombstone is not
+// returned. Serving one would report a RETIRED gate as due, which is the exact
+// outcome resolving a gate exists to prevent.
+func TestListDueGatesRefusesATombstonedRow(t *testing.T) {
+	store, hostile := openHostileListStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	mustOpenGateOn(t, store, catalogTenant, "session-1",
+		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(-time.Hour)))
+	hostile.answerDue(func(page storage.DuePage, err error) (storage.DuePage, error) {
+		for i := range page.Records {
+			page.Records[i].Deleted = true
+		}
+		return page, err
+	})
+
+	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
+	if got := assertCatalogCode(t, err, CatalogErrorDeleted); got.Field != "due_gates[0].gate_intent" {
+		t.Fatalf("failure field = %q, want due_gates[0].gate_intent", got.Field)
+	}
+}
+
+// TestListDueGatesChecksEveryRowsFiling extends the identity check past the
+// first row of a session. A page resolves each session once, so a misfiled
+// intent arriving behind a well-filed one for the same session is exactly the
+// row a per-session check would wave through.
+func TestListDueGatesChecksEveryRowsFiling(t *testing.T) {
+	store := openTestStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
+	// Sorted first by an earlier deadline, so it resolves session-1 into the
+	// page's cache before the misfiled row is read.
+	mustOpenGateOn(t, store, catalogTenant, "session-1",
+		gateWithDeadline(testGate("gate-a", 5), catalogDeadline.Add(-2*time.Hour)))
+	misfiled := gateIntent{
+		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-b",
+		OpenedEventID: "event-gate-b", OpenedJournalSeq: 6, Deadline: catalogDeadline.Add(-time.Hour),
+	}
+	putRawGateIntent(t, store, catalogTenant, "session-2", "gate-b", mustEncodeGateIntent(t, misfiled), misfiled.Deadline)
+
+	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
+	if got := assertCatalogCode(t, err, CatalogErrorIdentity); got.Field != "due_gates[1].ordering_scope" {
+		t.Fatalf("failure field = %q, want due_gates[1].ordering_scope", got.Field)
+	}
+}
+
+// TestListDueGatesRejectsAMisfiledRowWithoutReadingTheSession pins the ordering
+// of the row checks, not just their outcome: deriving a scope is pure, so a row
+// whose filing disagrees with its own bytes is refused before any provider work
+// is done on its behalf.
+func TestListDueGatesRejectsAMisfiledRowWithoutReadingTheSession(t *testing.T) {
+	base := memstore.New()
+	ordered := &recordingOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = ordered
+	store := openStore(t, base)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	mustPrepareSession(t, store, catalogTenant, "session-2", 100)
+	misfiled := gateIntent{
+		TenantID: catalogTenant, SessionID: "session-1", GateID: "gate-a",
+		OpenedEventID: "event-gate-a", OpenedJournalSeq: 5, Deadline: catalogDeadline.Add(-time.Hour),
+	}
+	putRawGateIntent(t, store, catalogTenant, "session-2", "gate-a", mustEncodeGateIntent(t, misfiled), misfiled.Deadline)
+
+	before := len(ordered.snapshot())
+	if _, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
+		DueAtOrBefore: catalogDeadline, Limit: 10,
+	}); err == nil {
+		t.Fatal("a misfiled row was accepted")
+	} else {
+		assertCatalogCode(t, err, CatalogErrorIdentity)
+	}
+	for _, call := range ordered.snapshot()[before:] {
+		if call.op == "get" && call.id.Namespace == catalogNamespace {
+			t.Fatal("a misfiled row cost a catalog read before it was refused")
+		}
+	}
+}
+
+func TestListDueGatesFailsClosedOnACorruptIntent(t *testing.T) {
+	store := openTestStore(t)
+	mustPrepareSession(t, store, catalogTenant, "session-1", 100)
+	putRawGateIntent(t, store, catalogTenant, "session-1", "gate-a", []byte("{not json"), catalogDeadline.Add(-time.Hour))
+
+	_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{DueAtOrBefore: catalogDeadline, Limit: 10})
+	assertCatalogCode(t, err, CatalogErrorMalformed)
+}
+
+// --- redaction ------------------------------------------------------------
+
+// TestGateFailuresAreRedacted holds every gate path to the same rule the rest
+// of the package obeys: a returned error names the stage that failed and never
+// the provider's text, the tenant, the session, the gate, or the prompt a
+// caller supplied.
+func TestGateFailuresAreRedacted(t *testing.T) {
+	base := memstore.New()
+	hostile := &hostileOrdered{OrderedIndex: base.OrderedIndex}
+	base.OrderedIndex = hostile
+	store := openStore(t, base)
+	openGateFixture(t, store)
+	// A due gate exists before the provider is armed, so the due page really
+	// reaches a session read and fails there rather than returning empty.
+	mustOpenGateOn(t, store, catalogTenant, catalogSession,
+		gateWithDeadline(testGate("gate-due", 5), catalogDeadline.Add(-time.Hour)))
+	secret := errors.New("provider path /var/secret/tenant-a/session-a/gate-a")
+	hostile.failGets(secret)
+
+	secrets := []string{"secret", "tenant-a", "session-a", "gate-a", "gate-due", "Confirm", "Proceed?"}
+	for name, call := range map[string]func() error{
+		"OpenGate": func() error {
+			_, err := store.OpenGate(context.Background(), OpenGateRequest{
+				TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: testGate("gate-a", 5),
+			})
+			return err
+		},
+		"ResolveGate": func() error {
+			_, err := store.ResolveGate(context.Background(), ResolveGateRequest{
+				TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, GateID: "gate-a",
+			})
+			return err
+		},
+		"ReadGates": func() error {
+			_, err := store.ReadGates(context.Background(), ReadGatesRequest{
+				TenantID: catalogTenant, SessionID: catalogSession,
+			})
+			return err
+		},
+		// The due page is the only multi-session surface here, so it is the one
+		// whose failures could name a session the caller never asked about.
+		"ListDueGates": func() error {
+			_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
+				DueAtOrBefore: catalogDeadline, Limit: 10,
+			})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := call()
+			assertCatalogCode(t, err, CatalogErrorBackend)
+			for _, leak := range secrets {
+				if strings.Contains(err.Error(), leak) {
+					t.Fatalf("%q leaked into %q", leak, err.Error())
+				}
+			}
+			if !errors.Is(err, secret) {
+				t.Fatal("cause was not preserved for errors.Is")
+			}
+		})
+	}
+}
+
+// --- the intent codec -----------------------------------------------------
+
+func TestGateIntentRoundTripsToACanonicalForm(t *testing.T) {
+	intent := testGateIntent()
+	intent.Deadline = catalogDeadline.In(time.FixedZone("elsewhere", 3600))
+	encoded := mustEncodeGateIntent(t, intent)
+	decoded, err := decodeGateIntent(encoded)
+	if err != nil {
+		t.Fatalf("decodeGateIntent: %v", err)
+	}
+	if decoded.Deadline.Location() != time.UTC {
+		t.Fatalf("deadline was not canonicalized to UTC: %v", decoded.Deadline)
+	}
+	if !decoded.Deadline.Equal(intent.Deadline) {
+		t.Fatalf("deadline instant changed: %v -> %v", intent.Deadline, decoded.Deadline)
+	}
+	reencoded := mustEncodeGateIntent(t, decoded)
+	if !bytes.Equal(encoded, reencoded) {
+		t.Fatalf("round trip changed the canonical bytes:\n%s\n%s", encoded, reencoded)
+	}
+}
+
+func TestGateIntentDecodeFailsClosed(t *testing.T) {
+	valid := mustEncodeGateIntent(t, testGateIntent())
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(valid, &members); err != nil {
+		t.Fatalf("a stored intent is not JSON: %v", err)
+	}
+	mutate := func(apply func(map[string]json.RawMessage)) []byte {
+		copied := make(map[string]json.RawMessage, len(members))
+		for name, value := range members {
+			copied[name] = value
+		}
+		apply(copied)
+		encoded, err := json.Marshal(copied)
+		if err != nil {
+			t.Fatalf("marshal variant: %v", err)
+		}
+		return encoded
+	}
+	for _, tt := range []struct {
+		name  string
+		value []byte
+		want  CatalogErrorCode
+	}{
+		{"empty", nil, CatalogErrorMalformed},
+		{"too large", append(append([]byte(nil), valid...), bytes.Repeat([]byte(" "), MaxGateIntentBytes)...), CatalogErrorTooLarge},
+		{"not json", []byte("{"), CatalogErrorMalformed},
+		{"trailing content", append(append([]byte(nil), valid...), '{'), CatalogErrorMalformed},
+		{"unknown version", mutate(func(m map[string]json.RawMessage) { m["record_version"] = json.RawMessage("2") }), CatalogErrorVersion},
+		{"undeclared member", mutate(func(m map[string]json.RawMessage) { m["surprise"] = json.RawMessage("1") }), CatalogErrorMalformed},
+		{"empty tenant", mutate(func(m map[string]json.RawMessage) { m["tenant_id"] = json.RawMessage(`""`) }), CatalogErrorInvalid},
+		{"empty session", mutate(func(m map[string]json.RawMessage) { m["session_id"] = json.RawMessage(`""`) }), CatalogErrorInvalid},
+		{"empty gate", mutate(func(m map[string]json.RawMessage) { m["gate_id"] = json.RawMessage(`""`) }), CatalogErrorInvalid},
+		{"empty opening event", mutate(func(m map[string]json.RawMessage) { m["opened_event_id"] = json.RawMessage(`""`) }), CatalogErrorInvalid},
+		{"zero opening sequence", mutate(func(m map[string]json.RawMessage) { m["opened_journal_seq"] = json.RawMessage("0") }), CatalogErrorInvalid},
+		{"zero deadline", mutate(func(m map[string]json.RawMessage) { m["deadline"] = json.RawMessage(`"0001-01-01T00:00:00Z"`) }), CatalogErrorInvalid},
+		{"unrepresentable deadline", mutate(func(m map[string]json.RawMessage) { m["deadline"] = json.RawMessage(`"3000-01-01T00:00:00Z"`) }), CatalogErrorInvalid},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := decodeGateIntent(tt.value); err == nil {
+				t.Fatal("a malformed intent decoded")
+			} else {
+				assertCatalogCode(t, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestGateIntentEncodeRefusesAnInvalidIntent(t *testing.T) {
+	invalid := testGateIntent()
+	invalid.OpenedJournalSeq = 0
+	if _, err := encodeGateIntent(invalid); err == nil {
+		t.Fatal("an intent naming no opening event encoded")
+	} else {
+		assertCatalogCode(t, err, CatalogErrorInvalid)
+	}
+}
+
+// TestGateIntentSizeCeilingCoversEveryMember is the guard maxGateIntentEncodedBytes
+// claims to be and cannot be on its own: the constant is hand-derived
+// arithmetic and is not a function of the wire struct, so a new member would
+// slip past it. This builds the widest possible value of every member by
+// reflection, so a new member is measured automatically — and an unfamiliar
+// member KIND fails outright rather than being silently skipped.
+func TestGateIntentSizeCeilingCoversEveryMember(t *testing.T) {
+	// The measurement recorded in maxGateIntentEncodedBytes' comment. It is
+	// asserted exactly so that a change to the record forces the comment to be
+	// re-measured rather than being absorbed by headroom until it is not.
+	const measured = 6322
+
+	wire := reflect.New(reflect.TypeOf(gateIntentWire{})).Elem()
+	// Control bytes are valid in a sessionwire id and encoding/json spells them
+	// as six-character \u00XX escapes, so this is the id that costs the most.
+	widestID := strings.Repeat("\x01", sessionwire.MaxIDBytes)
+	// A non-UTC offset is wider than the Z a canonical intent stores, so the
+	// measurement holds for an instant this package would first canonicalize.
+	widestTime := maxRankableTime.In(time.FixedZone("widest", -(11*3600 + 30*60)))
+	for i := range wire.NumField() {
+		field := wire.Field(i)
+		switch {
+		case field.Type() == reflect.TypeOf(time.Time{}):
+			field.Set(reflect.ValueOf(widestTime))
+		case field.Kind() == reflect.String:
+			field.SetString(widestID)
+		case field.Kind() >= reflect.Uint && field.Kind() <= reflect.Uint64:
+			field.SetUint(^uint64(0) >> (64 - field.Type().Bits()))
+		default:
+			t.Fatalf("gateIntentWire.%s is a %s, which this builder cannot make the widest value of: extend it, then re-measure the ceiling",
+				wire.Type().Field(i).Name, field.Kind())
+		}
+	}
+	encoded, err := json.Marshal(wire.Interface())
+	if err != nil {
+		t.Fatalf("marshal widest intent: %v", err)
+	}
+	if len(encoded) > maxGateIntentEncodedBytes {
+		t.Fatalf("the widest intent is %d bytes, above the %d ceiling: the record outgrew its arithmetic",
+			len(encoded), maxGateIntentEncodedBytes)
+	}
+	if len(encoded) != measured {
+		t.Fatalf("the widest intent is %d bytes, not the %d recorded in maxGateIntentEncodedBytes' comment: re-measure it and update the comment",
+			len(encoded), measured)
+	}
+}
+
+// --- concurrency ----------------------------------------------------------
+
+// TestConcurrentOpenGatesKeepEveryGate opens two gates at once on one record.
+// The record is one compare-and-swap, so one writer legitimately loses; what it
+// must not do is silently drop the other writer's gate, and its retry must
+// find its own intent rather than colliding with it.
+func TestConcurrentOpenGatesKeepEveryGate(t *testing.T) {
+	store := openTestStore(t)
+	openGateFixture(t, store)
+
+	open := func(gate sessionwire.GateProjection) error {
+		var err error
+		for range 8 {
+			_, err = store.OpenGate(context.Background(), OpenGateRequest{
+				TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: gate,
+			})
+			var catalog *CatalogError
+			if err == nil || !errors.As(err, &catalog) || catalog.Code != CatalogErrorConflict {
+				return err
+			}
+		}
+		return err
+	}
+	var wait sync.WaitGroup
+	errs := make([]error, 2)
+	gates := []sessionwire.GateProjection{testGate("gate-a", 3), testGate("gate-b", 7)}
+	for i := range gates {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errs[i] = open(gates[i])
+		}()
+	}
+	wait.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("OpenGate(%s): %v", gates[i].GateID, err)
+		}
+	}
+	if page := mustReadGates(t, store); len(page.Gates) != 2 {
+		t.Fatalf("concurrent opens left %v, want both gates", gateIDs(page))
+	}
+}
+
+// --- the public surface and its lifecycle ---------------------------------
+
+var (
+	_ func(*Store, context.Context, OpenGateRequest) (CatalogEntry, error)          = (*Store).OpenGate
+	_ func(*Store, context.Context, ResolveGateRequest) (CatalogEntry, error)       = (*Store).ResolveGate
+	_ func(*Store, context.Context, ReadGatesRequest) (sessionwire.GatePage, error) = (*Store).ReadGates
+	_ func(*Store, context.Context, ListDueGatesRequest) (DueGatePage, error)       = (*Store).ListDueGates
+)
+
+// declaredGateOperations enumerates gates.go's public Store operations from the
+// source, for the same reason declaredCatalogOperations does it for catalog.go:
+// the file that declares an operation is the file the close test enumerates, so
+// a new one cannot be added without being exercised here.
+func declaredGateOperations(t *testing.T) map[string]bool {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), "gates.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse gates.go: %v", err)
+	}
+	operations := map[string]bool{}
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Recv == nil || !function.Name.IsExported() {
+			continue
+		}
+		receiver, ok := function.Recv.List[0].Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		if name, ok := receiver.X.(*ast.Ident); ok && name.Name == "Store" {
+			operations[function.Name.Name] = true
+		}
+	}
+	if len(operations) == 0 {
+		t.Fatal("no public Store operations were found in gates.go; the enumerator is not reaching the declarations")
+	}
+	return operations
+}
+
+func TestGateOperationsRefuseAfterClose(t *testing.T) {
+	store, err := Open(context.Background(), memstore.New())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	openGateFixture(t, store)
+	if err := store.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	operations := map[string]func() error{
+		"OpenGate": func() error {
+			_, err := store.OpenGate(context.Background(), OpenGateRequest{
+				TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: testGate("gate-a", 5),
+			})
+			return err
+		},
+		"ResolveGate": func() error {
+			_, err := store.ResolveGate(context.Background(), ResolveGateRequest{
+				TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, GateID: "gate-a",
+			})
+			return err
+		},
+		"ReadGates": func() error {
+			_, err := store.ReadGates(context.Background(), ReadGatesRequest{
+				TenantID: catalogTenant, SessionID: catalogSession,
+			})
+			return err
+		},
+		"ListDueGates": func() error {
+			_, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
+				DueAtOrBefore: catalogDeadline, Limit: 10,
+			})
+			return err
+		},
+	}
+
+	declared := declaredGateOperations(t)
+	for name := range declared {
+		if operations[name] == nil {
+			t.Errorf("gates.go declares the public operation %s and this test does not exercise it", name)
+		}
+	}
+	for name := range operations {
+		if !declared[name] {
+			t.Errorf("this test exercises %s, which gates.go no longer declares (was it moved to another file?)", name)
+		}
+	}
+
+	for name, call := range operations {
+		t.Run(name, func(t *testing.T) {
+			if err := call(); !errors.As(err, new(*StoreClosedError)) {
+				t.Fatalf("%s after Close = %T %v, want *StoreClosedError", name, err, err)
+			}
+		})
 	}
 }

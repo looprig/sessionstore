@@ -177,10 +177,23 @@ with no durable deadline. `ListDueGates` is the reader that closes that: it
 validates every due intent against the session's durable open projection and
 drops the ones that match nothing. It is a bounded read that takes no action —
 what a Host does about an expired gate is gate continuation, which this package
-does not yet implement. It also has no continuation cursor yet: it returns one
-bounded page and never reports whether more work is due behind it, so a caller
-must not treat it as a sweep. Pagination is a later addition, which is why the
-request carries no resume position.
+does not yet implement.
+
+Its missing continuation is a liveness hazard rather than an ergonomic gap, and
+a caller has to know it. A remnant intent is dropped from the page but never
+retired: `OpenGate` writes the intent before the projection, so an intent with
+no matching open gate cannot be told apart from a gate being opened right now,
+and a reader that retired what it drops would race a live open. Because the due
+view is deadline-ordered and this call has no resume position, `Limit` remnants
+at the head of the order mask every live gate behind them indefinitely — and a
+Host that re-projects wholesale produces one remnant per gate it drops, so a few
+hundred ordinary re-projections can silently switch expiry off deployment-wide.
+
+`DueGatePage` therefore reports `Examined` and the effective `Limit` beside its
+gates: `Examined == Limit` with no gates is head-of-line blocking rather than an
+empty answer, and it is the only signal available until a continuation exists. A
+later task adds that continuation and, with it, whatever retires remnants
+safely; until then no caller may treat this as a sweep.
 
 Retiring an intent is a tombstone rather than an erasure: the record stays
 readable for audit, its identity can never be reused to reopen the same gate,

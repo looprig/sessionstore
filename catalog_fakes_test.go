@@ -134,17 +134,28 @@ func (k *keysCountingKV) Keys(ctx context.Context, prefix string) ([]string, err
 type hostileOrdered struct {
 	storage.OrderedIndex
 
-	mu      sync.Mutex
-	getErr  error
-	rewrite func([]byte) []byte
-	ranked  func(storage.RankedPage, error) (storage.RankedPage, error)
+	mu           sync.Mutex
+	getErr       error
+	getNamespace string
+	rewrite      func([]byte) []byte
+	ranked       func(storage.RankedPage, error) (storage.RankedPage, error)
+	due          func(storage.DuePage, error) (storage.DuePage, error)
 }
 
 // failGets makes every later Get return err.
-func (o *hostileOrdered) failGets(err error) {
+func (o *hostileOrdered) failGets(err error) { o.failGetsIn("", err) }
+
+// failGetsIn makes every later Get in one namespace return err, leaving the
+// other namespaces working. An empty namespace fails all of them.
+//
+// The namespace is a parameter rather than a second fake because an operation
+// that reads two namespaces in order — a resolve reads the catalog record and
+// then the gate intent — cannot have its SECOND read exercised by a provider
+// that fails the first. Passing nil disarms it.
+func (o *hostileOrdered) failGetsIn(namespace string, err error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.getErr = err
+	o.getErr, o.getNamespace = err, namespace
 }
 
 // corruptGets rewrites the stored value every later Get returns, so a read can
@@ -165,6 +176,27 @@ func (o *hostileOrdered) answerRanked(answer func(storage.RankedPage, error) (st
 	o.ranked = answer
 }
 
+// answerDue is answerRanked's counterpart for the due view, and it is the only
+// way to present SessionStore with a due page a conforming provider never
+// produces — a tombstoned row, for instance, which the ordered index promises
+// to exclude.
+func (o *hostileOrdered) answerDue(answer func(storage.DuePage, error) (storage.DuePage, error)) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.due = answer
+}
+
+func (o *hostileOrdered) ListDue(ctx context.Context, namespace string, dueAtOrBefore int64, after storage.DueCursor, limit int) (storage.DuePage, error) {
+	page, err := o.OrderedIndex.ListDue(ctx, namespace, dueAtOrBefore, after, limit)
+	o.mu.Lock()
+	answer := o.due
+	o.mu.Unlock()
+	if answer == nil {
+		return page, err
+	}
+	return answer(page, err)
+}
+
 func (o *hostileOrdered) ListRanked(ctx context.Context, namespace, rankingScope string, after storage.RankedCursor, limit int) (storage.RankedPage, error) {
 	page, err := o.OrderedIndex.ListRanked(ctx, namespace, rankingScope, after, limit)
 	o.mu.Lock()
@@ -178,9 +210,9 @@ func (o *hostileOrdered) ListRanked(ctx context.Context, namespace, rankingScope
 
 func (o *hostileOrdered) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
 	o.mu.Lock()
-	getErr, rewrite := o.getErr, o.rewrite
+	getErr, namespace, rewrite := o.getErr, o.getNamespace, o.rewrite
 	o.mu.Unlock()
-	if getErr != nil {
+	if getErr != nil && (namespace == "" || namespace == id.Namespace) {
 		return storage.OrderedRecord{}, getErr
 	}
 	record, err := o.OrderedIndex.Get(ctx, id)

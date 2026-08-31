@@ -87,16 +87,26 @@ const _ = uint(storage.MaxOrderedValueBytes - MaxGateIntentBytes)
 
 // maxGateIntentEncodedBytes is the largest an encoded intent can be. Unlike a
 // catalog record, whose gate prompts are unbounded caller text, an intent holds
-// four validated identities, one integer, and one timestamp — so its size has
-// an arithmetic ceiling: four ids at MaxIDBytes, each at its worst possible
-// JSON escaping of six characters per byte, plus ample room for the member
-// names, the widest uint64, and an RFC 3339 instant.
+// four validated identities, one integer, and one timestamp, so its size has an
+// arithmetic ceiling.
 //
-// That is why encodeGateIntent has no size check. A runtime branch there could
-// not be reached by any intent that passes validation, so it could never be
-// tested and would sit in the file as an untested claim. The relationship is
-// stated instead as an unsigned constant that fails to COMPILE if a future
-// member ever makes an intent large enough to need one.
+// The measurement, not an estimate: four ids at sessionwire.MaxIDBytes, each at
+// its worst JSON escaping — a sessionwire id accepts control bytes, and
+// encoding/json spells those as six-character \u00XX escapes — is 6144 bytes.
+// The scaffolding around them, member names and punctuation and the widest
+// uint64 and the widest RFC 3339 instant, measures 178 bytes. That is 6322
+// against the 6400 below, so the +256 term is 178 bytes of real content and 78
+// bytes of headroom. It is not slack to spend: it does not hold one more id.
+//
+// A NEW MEMBER INVALIDATES THIS ARITHMETIC — re-measure it rather than assuming
+// the headroom absorbs one. The constant cannot check that itself, because it
+// is not a function of the wire struct; what does check it is
+// TestGateIntentSizeCeilingCoversEveryMember, which builds the widest possible
+// value of every member by reflection and so grows a new one automatically.
+//
+// That is also why encodeGateIntent has no size check. A runtime branch there
+// could not be reached by any intent that passes validation, so it could never
+// be tested and would sit in the file as an untested claim.
 //
 // The decode side keeps its bound and needs it: stored bytes are not this
 // package's own output, and a bound before a decoder allocates is a
@@ -169,6 +179,28 @@ type DueGate struct {
 	Gate      sessionwire.GateProjection
 }
 
+// DueGatePage is one bounded page of due gates together with what producing it
+// cost.
+//
+// Examined and Limit exist because Gates alone cannot be read. A page whose
+// rows were all remnant intents returns no gates and no error, which is
+// indistinguishable from a deployment where nothing is due — and that is not a
+// rare state but the permanent one a starved due view settles into, for the
+// reasons ListDueGates documents. Examined == Limit with no gates is
+// head-of-line blocking: this page was full, and none of it reported anything.
+//
+// Limit is the EFFECTIVE limit, after a zero request limit has been resolved to
+// the store's page size, so the comparison is available to a caller that did
+// not name one.
+//
+// The type exists rather than a second return value so the continuation a later
+// task adds is an added field rather than a changed signature.
+type DueGatePage struct {
+	Gates    []DueGate
+	Examined int
+	Limit    int
+}
+
 // OpenGate records a gate's deadline and then projects it as publicly open.
 //
 // Every rejection below precedes both writes, and the two writes are ordered:
@@ -238,6 +270,22 @@ func (s *Store) OpenGate(ctx context.Context, req OpenGateRequest) (CatalogEntry
 			// underneath it.
 			if !sameOpenGate(open, gate) {
 				return CatalogEntry{}, &CatalogError{Code: CatalogErrorConflict, Field: "gate_id", Revision: current.Revision}
+			}
+			// The projection is not evidence that the deadline is indexed.
+			// UpdateCatalogHostState projects gates wholesale and deliberately
+			// leaves intents alone, so this branch is reached for gates that
+			// have no intent at all — and returning success without writing one
+			// would make the operation whose entire job is making a deadline
+			// durable silently do nothing.
+			//
+			// This is the one place an intent legitimately follows a
+			// projection. It cannot produce the state this file's header rules
+			// out — a gate open with no durable deadline — because that state
+			// already exists when this branch is entered, and this is what
+			// repairs it. commitGateIntent is idempotent by identity and still
+			// refuses an identity held by a different or a resolved gate.
+			if err := s.commitGateIntent(opCtx, scope, gate, intent); err != nil {
+				return CatalogEntry{}, err
 			}
 			return current, nil
 		}
@@ -372,37 +420,68 @@ func (s *Store) ReadGates(ctx context.Context, req ReadGatesRequest) (sessionwir
 // remnant — an intent whose open event never committed — and something has to
 // be the reader that validates it away rather than acting on it.
 //
-// It has no continuation cursor, which also means it cannot sweep: it answers
-// "what is due, up to this many rows" and nothing more. That is deferred, not
-// overlooked. The reconciler this eventually serves is a Factory component that
-// claims a session and acts on it, and it will need to page — a LATER task adds
-// the continuation, which is why ListDueGatesRequest has no resume position and
-// DueGate has no place to carry one. Until then a caller must not assume a
-// sweep exists: this returns one bounded page and never reports whether more
-// work is due behind it.
-func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) ([]DueGate, error) {
+// # It has no continuation, and that is a liveness hazard, not an ergonomic gap
+//
+// A remnant intent is DROPPED from the page but never retired. It cannot be:
+// OpenGate makes an intent durable before it commits the projection, so an
+// intent with no matching open gate is indistinguishable from a gate being
+// opened right now, and a reader that retired what it drops would race a live
+// open into exactly the state this file's header promises is never produced.
+//
+// The consequence is head-of-line blocking, and it is permanent. The due view
+// is ordered by deadline ASCENDING, a remnant's deadline is in the past and
+// never changes, and this call has no resume position — so once Limit remnants
+// accumulate ahead of the live gates, every page consists entirely of them and
+// no live gate is ever reported again. A Host that re-projects its open gates
+// wholesale through UpdateCatalogHostState — a normal path, documented as such
+// above — produces one remnant per gate it drops, so a few hundred ordinary
+// re-projections can silently switch gate expiry off deployment-wide.
+//
+// That is why the page reports Examined as well as its gates: a caller can
+// distinguish "nothing is due" from "this page was consumed entirely by rows
+// that reported nothing", which is the only signal available until a
+// continuation exists. See DueGatePage.
+//
+// A LATER task adds the continuation and, with it, whatever retires remnants
+// safely. Until then a caller must not treat this as a sweep: it returns one
+// bounded page, it never reports whether more work is due behind it, and it can
+// be starved.
+func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) (DueGatePage, error) {
 	limit, ok := s.pageLimit(req.Limit)
 	if !ok {
-		return nil, catalogErr(CatalogErrorInvalid, "limit", nil)
+		return DueGatePage{}, catalogErr(CatalogErrorInvalid, "limit", nil)
 	}
-	if !rankableTime(req.DueAtOrBefore) || req.DueAtOrBefore.IsZero() {
-		return nil, catalogErr(CatalogErrorInvalid, "due_at_or_before", nil)
+	// rankableTime already refuses the zero Time, which is earlier than every
+	// representable instant; a separate IsZero check would be a second
+	// statement of one rule.
+	if !rankableTime(req.DueAtOrBefore) {
+		return DueGatePage{}, catalogErr(CatalogErrorInvalid, "due_at_or_before", nil)
 	}
 	opCtx, release, err := s.admitForeground(ctx)
 	if err != nil {
-		return nil, err
+		return DueGatePage{}, err
 	}
 	defer release()
 
 	page, err := s.backend.OrderedIndex.ListDue(opCtx, gateNamespace, req.DueAtOrBefore.UnixMilli(), "", limit)
 	if err != nil {
-		return nil, classifyCatalogOrderedError(err, "due_gates")
+		return DueGatePage{}, classifyCatalogOrderedError(err, "due_gates")
 	}
-	due := make([]DueGate, 0, len(page.Records))
-	// One session's gates arrive adjacently and a session is read at most once
-	// per page, so a page costs work proportional to its own rows rather than
-	// to the number of gates a single session happens to have open.
-	sessions := map[dueSessionKey]dueSession{}
+	due := DueGatePage{
+		Gates:    make([]DueGate, 0, len(page.Records)),
+		Examined: len(page.Records),
+		Limit:    limit,
+	}
+	// Rows are ordered by deadline, so one session's gates do NOT arrive
+	// adjacently: they interleave with every other session's. What the map
+	// delivers is that a session's record is read at most once per page
+	// whatever order its rows arrive in, which is why it is a map and not a
+	// one-entry last-seen cache — that would reintroduce a re-read per row.
+	//
+	// It retains a scope and the session's open-gate projections rather than
+	// whole catalog records, so a page holds at most its own row count times
+	// MaxCatalogOpenGates projections instead of that many 256 KiB records.
+	sessions := make(map[dueSessionKey]dueSession, len(page.Records))
 	for index, stored := range page.Records {
 		// A failure is located by position for the same reason a listing's is:
 		// one unreadable row must not make the whole due view unreadable with
@@ -411,17 +490,27 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) ([]Du
 		position := "due_gates[" + strconv.Itoa(index) + "]"
 		intent, err := gateIntentFor(stored)
 		if err != nil {
-			return nil, locateCatalogError(err, position)
+			return DueGatePage{}, locateCatalogError(err, position)
 		}
 		key := dueSessionKey{tenant: intent.TenantID, session: intent.SessionID}
-		session, ok := sessions[key]
-		if !ok {
-			scope, err := s.deriveSessionScope(intent.TenantID, intent.SessionID)
-			if err != nil {
-				return nil, locateCatalogError(err, position)
+		session, cached := sessions[key]
+		if !cached {
+			// Deriving a scope is pure, so a row's filing is settled before any
+			// provider work is done on its behalf: a misfiled row costs no
+			// round trip.
+			if session.scope, err = s.deriveSessionScope(intent.TenantID, intent.SessionID); err != nil {
+				return DueGatePage{}, locateCatalogError(err, position)
 			}
-			session.scope = scope
-			read, err := s.readCatalogEntry(opCtx, scope, intent.TenantID, intent.SessionID)
+		}
+		// The intent must be FILED as its own bytes say it should be. It is
+		// checked for every row rather than once per session: what is being
+		// verified belongs to the ROW, and a cached session would otherwise let
+		// a misfiled intent through behind a well-filed one.
+		if err := verifyGateIntentFiling(stored, intent, session.scope); err != nil {
+			return DueGatePage{}, locateCatalogError(err, position)
+		}
+		if !cached {
+			entry, err := s.readCatalogEntry(opCtx, session.scope, intent.TenantID, intent.SessionID)
 			if err != nil {
 				// A session that has no durable existence cannot have a
 				// durably open gate, so its remnant intents are discarded
@@ -432,21 +521,15 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) ([]Du
 				// provider error — is a reason to stop rather than to conclude
 				// anything about this gate.
 				if !noSuchSession(err) {
-					return nil, locateCatalogError(err, position)
+					return DueGatePage{}, locateCatalogError(err, position)
 				}
 			} else {
-				session.entry = &read
+				session.exists = true
+				session.gates = entry.Record.OpenGates
 			}
 			sessions[key] = session
 		}
-		// The intent must be FILED as its own bytes say it should be. It is
-		// checked for every row rather than once per session: what is being
-		// verified belongs to the ROW, and a cached session would otherwise let
-		// a misfiled intent through behind a well-filed one.
-		if err := verifyGateIntentFiling(stored, intent, session.scope); err != nil {
-			return nil, locateCatalogError(err, position)
-		}
-		if session.entry == nil {
+		if !session.exists {
 			continue
 		}
 		// The validation this reader exists for: an intent is only reported
@@ -454,9 +537,9 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) ([]Du
 		// open, with the same opening event and the same deadline. An intent
 		// written for an open that never committed matches nothing and is
 		// dropped.
-		for _, gate := range session.entry.Record.OpenGates {
+		for _, gate := range session.gates {
 			if intent.matches(gate) {
-				due = append(due, DueGate{TenantID: intent.TenantID, SessionID: intent.SessionID, Gate: gate})
+				due.Gates = append(due.Gates, DueGate{TenantID: intent.TenantID, SessionID: intent.SessionID, Gate: gate})
 				break
 			}
 		}
@@ -487,13 +570,18 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) ([]Du
 //     function exists at all: a due page selects rows BY this field, so a
 //     reader that trusted it would report a gate as expired because the index
 //     said so while the record's own deadline was still a day away.
-//   - Namespace and the deleted flag are not record-derived: they echo the
-//     query this reader itself issued, and the bytes carry no counterpart to
-//     compare them against.
+//   - Deleted is not record-derived, but it needs no counterpart: ListDue
+//     returns current nondeleted records by contract, and a violation of that
+//     one means reporting a RETIRED gate as due, so it is asserted directly.
+//   - Namespace is not record-derived either: it echoes the query this reader
+//     itself issued, and the bytes carry no counterpart to compare it against.
 //   - Rank is written as unranked and nothing ranks or reads gate intents, so a
 //     check would guard a view with no consumer.
 //   - Revision and Order are provider state with no meaning in the record.
 func verifyGateIntentFiling(stored storage.OrderedRecord, intent gateIntent, scope sessionScope) error {
+	if stored.Deleted {
+		return catalogErr(CatalogErrorDeleted, "gate_intent", nil)
+	}
 	if stored.ID.OrderingScope != scope.SessionNamespace {
 		return catalogErr(CatalogErrorIdentity, "ordering_scope", nil)
 	}
@@ -520,14 +608,18 @@ type dueSessionKey struct {
 }
 
 // dueSession is what a due page remembers about one session it has already
-// resolved: the scope every row filed under that session must match, and its
-// catalog record, which is nil when the session has no durable existence at
-// all. Caching the nil case matters as much as caching the record — a page full
-// of remnant intents for one deleted session would otherwise re-read it once
-// per row.
+// resolved: the scope every row filed under that session must match, whether
+// the session durably exists, and its open-gate projections.
+//
+// It holds the projections rather than the CatalogEntry so a page retains the
+// gates it actually matches against instead of whole catalog records, whose
+// bound is three orders of magnitude larger. Caching the "does not exist" case
+// matters as much as caching a record: a page full of remnant intents for one
+// deleted session would otherwise re-read it once per row.
 type dueSession struct {
-	scope sessionScope
-	entry *CatalogEntry
+	scope  sessionScope
+	exists bool
+	gates  []sessionwire.GateProjection
 }
 
 // noSuchSession reports whether err means the named session has no durable
@@ -705,7 +797,8 @@ func encodeGateIntent(intent gateIntent) ([]byte, error) {
 // it, so an intent corrupted in place cannot be handed to a reader.
 func decodeGateIntent(value []byte) (gateIntent, error) {
 	wire, err := decodeVersionedRecord[gateIntentWire](
-		value, MaxGateIntentBytes, GateIntentRecordVersion, "gate_intent", "gate_intent.record_version")
+		value, MaxGateIntentBytes, GateIntentRecordVersion,
+		versionedRecordFields{Record: "gate_intent", Version: "gate_intent.record_version"})
 	if err != nil {
 		return gateIntent{}, err
 	}
@@ -740,7 +833,8 @@ func canonicalGateIntent(intent gateIntent) (gateIntent, error) {
 	if intent.OpenedJournalSeq == 0 {
 		return gateIntent{}, catalogErr(CatalogErrorInvalid, "gate_intent.opened_journal_seq", nil)
 	}
-	if !rankableTime(intent.Deadline) || intent.Deadline.IsZero() {
+	// rankableTime already refuses the zero Time; see ListDueGates.
+	if !rankableTime(intent.Deadline) {
 		return gateIntent{}, catalogErr(CatalogErrorInvalid, "gate_intent.deadline", nil)
 	}
 	intent.Deadline = intent.Deadline.UTC()

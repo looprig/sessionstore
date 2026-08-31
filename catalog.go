@@ -770,7 +770,8 @@ func encodeCatalogRecord(record CatalogRecord) ([]byte, error) {
 // ObjectReference, which drop an undeclared member rather than proxy it.
 func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 	wire, err := decodeVersionedRecord[catalogWire](
-		value, MaxCatalogRecordBytes, CatalogRecordVersion, "record", "record_version")
+		value, MaxCatalogRecordBytes, CatalogRecordVersion,
+		versionedRecordFields{Record: "record", Version: "record_version"})
 	if err != nil {
 		return CatalogRecord{}, err
 	}
@@ -828,31 +829,44 @@ func decodeVersionedRecord[T any](
 	value []byte,
 	maxBytes int,
 	wantVersion uint8,
-	field, versionField string,
+	fields versionedRecordFields,
 ) (T, error) {
 	var wire T
 	if len(value) > maxBytes {
-		return wire, catalogErr(CatalogErrorTooLarge, field, nil)
+		return wire, catalogErr(CatalogErrorTooLarge, fields.Record, nil)
 	}
 	if len(value) == 0 {
-		return wire, catalogErr(CatalogErrorMalformed, field, nil)
+		return wire, catalogErr(CatalogErrorMalformed, fields.Record, nil)
 	}
 	var probe struct {
 		RecordVersion uint8 `json:"record_version"`
 	}
 	if err := json.Unmarshal(value, &probe); err != nil {
-		return wire, catalogErr(CatalogErrorMalformed, field, err)
+		return wire, catalogErr(CatalogErrorMalformed, fields.Record, err)
 	}
 	if probe.RecordVersion != wantVersion {
-		return wire, catalogErr(CatalogErrorVersion, versionField, nil)
+		return wire, catalogErr(CatalogErrorVersion, fields.Version, nil)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(value))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&wire); err != nil {
+		// Deliberately the zero value rather than wire: a failed Decode may
+		// have populated some members before it stopped, and handing a caller a
+		// half-decoded record beside an error is how one of them ends up used.
 		var zero T
-		return zero, catalogErr(CatalogErrorMalformed, field, err)
+		return zero, catalogErr(CatalogErrorMalformed, fields.Record, err)
 	}
 	return wire, nil
+}
+
+// versionedRecordFields names the members a stored record's decode failures are
+// reported against. It is a struct rather than two adjacent string parameters
+// because two adjacent strings of one type are silently swappable, and the two
+// call sites already spell them differently enough — "record_version" against
+// "gate_intent.record_version" — that a swapped pair would read as plausible.
+type versionedRecordFields struct {
+	Record  string
+	Version string
 }
 
 // canonicalCatalogRecord validates a record and returns its one canonical
