@@ -235,7 +235,16 @@ func TestAdministrativeObjectListFailsClosed(t *testing.T) {
 	valid := objectMetadata(ObjectKindArtifact, [16]byte{1}, 1, digest, "").Reference
 	for name, mutate := range map[string]func(string) []string{
 		"malformed": func(prefix string) []string { return []string{prefix + "../escape"} },
+		// Out of prefix AND canonically splittable, which is what reaches the
+		// prefix guard at all. The obvious spelling of this case — a whole
+		// foreign path — is refused one line earlier by the suffix split,
+		// since it has five fields rather than two, so it would pass while
+		// proving nothing about the guard it names.
 		"out of prefix": func(string) []string {
+			parts := strings.Split(valid.ObjectID, ":")
+			return []string{parts[3] + "/" + parts[2]}
+		},
+		"out of prefix under a foreign path": func(string) []string {
 			return []string{"other/v1/artifact/" + hex.EncodeToString(digest[:]) + "/04000000000000000000000000"}
 		},
 		"duplicate": func(prefix string) []string {

@@ -324,15 +324,8 @@ func TestDecodeRejectsEveryForbiddenKnownTagEvenWhenZero(t *testing.T) {
 			{tagCommandKind, []byte("input")},
 		},
 	}
-	forbidden := map[EnvelopeKind][]uint8{
-		EnvelopeKindPublicEvent:       {tagLeaseEpoch, tagRuntimeCommandID, tagCommandKind},
-		EnvelopeKindRuntimeControl:    {tagPublicInline, tagPublicReference, tagLeaseEpoch, tagRuntimeCommandID, tagCommandKind},
-		EnvelopeKindOpeningFence:      {tagIdentity, tagPublicInline, tagPublicReference, tagRuntimeInline, tagRuntimeReference, tagRuntimeCommandID, tagCommandKind},
-		EnvelopeKindApplicationPrefix: {tagPublicInline, tagPublicReference, tagRuntimeInline, tagRuntimeReference},
-	}
-
-	for kind, tags := range forbidden {
-		for _, tag := range tags {
+	for _, kind := range knownEnvelopeKinds() {
+		for _, tag := range forbiddenEnvelopeTags(kind) {
 			name := fmt.Sprintf("kind_%d_tag_%d", kind, tag)
 			t.Run(name, func(t *testing.T) {
 				t.Parallel()
@@ -500,7 +493,7 @@ func TestEnvelopeErrorIsTypedBoundedAndUnwraps(t *testing.T) {
 	}
 }
 
-func assertEnvelopeErrorCode(t *testing.T, err error, want EnvelopeErrorCode) {
+func assertEnvelopeErrorCode(t *testing.T, err error, want EnvelopeErrorCode) *EnvelopeError {
 	t.Helper()
 	if err == nil {
 		t.Fatalf("error = nil, want code %q", want)
@@ -512,6 +505,7 @@ func assertEnvelopeErrorCode(t *testing.T, err error, want EnvelopeErrorCode) {
 	if got.Code != want {
 		t.Fatalf("error code = %q, want %q (error %v)", got.Code, want, err)
 	}
+	return got
 }
 
 func assertEnvelopeEqual(t *testing.T, got, want Envelope) {
@@ -607,4 +601,148 @@ func insertTestWireField(fields []testWireField, extra testWireField) []testWire
 		result = append(result, extra)
 	}
 	return result
+}
+
+// knownEnvelopeKinds is every kind knownEnvelopeKind accepts, found by asking
+// it rather than by listing what the asker remembered. The kind is one byte on
+// the wire, so the whole domain is enumerable and a kind added to the schema
+// joins every table below without an edit.
+func knownEnvelopeKinds() []EnvelopeKind {
+	var kinds []EnvelopeKind
+	for value := 0; value < 256; value++ {
+		if kind := EnvelopeKind(value); knownEnvelopeKind(kind) {
+			kinds = append(kinds, kind)
+		}
+	}
+	return kinds
+}
+
+// forbiddenEnvelopeTags derives the wire fields one kind may NOT carry from
+// allowedEnvelopeFields, which is the schema's own statement of the allowance.
+//
+// Derived rather than listed for the reason declaredObjectKinds is: a
+// hand-written complement fails OPEN. A field added to the schema, or a kind
+// added to the closed set, would simply not be asserted against, and the tests
+// that rest on this would stay green while covering less than they claim.
+func forbiddenEnvelopeTags(kind EnvelopeKind) []uint8 {
+	allowed := allowedEnvelopeFields(kind)
+	var tags []uint8
+	for tag := tagIdentity; tag <= tagCommandKind; tag++ {
+		if allowed&(1<<(tag-1)) == 0 {
+			tags = append(tags, tag)
+		}
+	}
+	return tags
+}
+
+// envelopeMember is one Go member of an Envelope that the record-shape rules
+// govern, together with the wire field it occupies.
+type envelopeMember struct {
+	field envelopeFieldSet
+	// owner is the one kind whose identity this member is, and is zero for
+	// every member that does not share the identity field. Three members share
+	// tagIdentity, so the field set alone cannot say that a RecordID on a
+	// public event is forbidden — that record carries an identity, just not
+	// this one.
+	owner EnvelopeKind
+	set   func(*Envelope)
+}
+
+func envelopeMembers() map[string]envelopeMember {
+	reference := func() *BodySlot {
+		return &BodySlot{Reference: &BodyReference{
+			Reference: sessionwire.ObjectReference{ObjectID: "leaked-object"},
+			SizeBytes: 3, SHA256: digestSequence(9),
+		}}
+	}
+	return map[string]envelopeMember{
+		"event_id":  {fieldIdentity, EnvelopeKindPublicEvent, func(e *Envelope) { e.EventID = "leaked-event" }},
+		"record_id": {fieldIdentity, EnvelopeKindRuntimeControl, func(e *Envelope) { e.RecordID = "leaked-runtime-record" }},
+		"command_id": {fieldIdentity, EnvelopeKindApplicationPrefix, func(e *Envelope) {
+			e.CommandID = "leaked-command"
+		}},
+		"public_inline":     {fieldPublicInline, 0, func(e *Envelope) { e.Public = BodySlot{Inline: []byte(`{"leaked":true}`)} }},
+		"public_reference":  {fieldPublicReference, 0, func(e *Envelope) { e.Public = *reference() }},
+		"runtime_inline":    {fieldRuntimeInline, 0, func(e *Envelope) { e.Runtime = BodySlot{Inline: []byte("leaked")} }},
+		"runtime_reference": {fieldRuntimeReference, 0, func(e *Envelope) { e.Runtime = *reference() }},
+		"lease_epoch":       {fieldLeaseEpoch, 0, func(e *Envelope) { e.LeaseEpoch = 7 }},
+		"runtime_command_id": {fieldRuntimeCommandID, 0, func(e *Envelope) {
+			e.RuntimeCommandID = uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff")
+		}},
+		"command_kind": {fieldCommandKind, 0, func(e *Envelope) { e.CommandKind = "leaked" }},
+	}
+}
+
+// validEnvelopeOfKind is the minimal accepted record of one kind, so a test
+// that adds ONE disallowed member is asserting about that member alone.
+func validEnvelopeOfKind(t *testing.T, kind EnvelopeKind) Envelope {
+	t.Helper()
+	switch kind {
+	case EnvelopeKindPublicEvent:
+		return Envelope{Kind: kind, EventID: "e", Public: BodySlot{Inline: []byte(`{}`)}}
+	case EnvelopeKindRuntimeControl:
+		return Envelope{Kind: kind, RecordID: "r", Runtime: BodySlot{Inline: []byte{}}}
+	case EnvelopeKindOpeningFence:
+		return Envelope{Kind: kind, LeaseEpoch: 1}
+	case EnvelopeKindApplicationPrefix:
+		return Envelope{Kind: kind, CommandID: "c", LeaseEpoch: 1, CommandKind: "input",
+			RuntimeCommandID: uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff")}
+	default:
+		t.Fatalf("no valid envelope is defined for kind %d", kind)
+		return Envelope{}
+	}
+}
+
+// TestEncodeRefusesEveryDisallowedMemberOfEveryKind drives the per-member
+// record-shape refusals on the ENCODE path, one member at a time.
+//
+// Their failure mode is not an error a caller sees: the encoder emits only the
+// fields its kind's arm names, so a member that is not refused is SILENTLY
+// DROPPED. A public event carrying a RecordID encoded, round-tripped, and came
+// back with RecordID empty — the writer's record and the reader's disagreed and
+// nothing said so. The decode path's counterpart above cannot reach these
+// guards at all: a frame carrying a forbidden TAG is refused by
+// validateDecodedFields first, so every one of these lines was unexercised.
+//
+// The members come from the same derivation the decode test uses, plus the
+// owner of the shared identity field, and the table is held to covering every
+// field in the schema.
+func TestEncodeRefusesEveryDisallowedMemberOfEveryKind(t *testing.T) {
+	t.Parallel()
+
+	members := envelopeMembers()
+	covered := envelopeFieldSet(0)
+	for _, member := range members {
+		covered |= member.field
+	}
+	var every envelopeFieldSet
+	for tag := tagIdentity; tag <= tagCommandKind; tag++ {
+		every |= 1 << (tag - 1)
+	}
+	if covered != every {
+		t.Fatalf("the member table covers fields %08b, want every schema field %08b", covered, every)
+	}
+
+	for _, kind := range knownEnvelopeKinds() {
+		allowed := allowedEnvelopeFields(kind)
+		for name, member := range members {
+			if allowed&member.field != 0 && (member.owner == 0 || member.owner == kind) {
+				continue
+			}
+			t.Run(fmt.Sprintf("kind_%d_%s", kind, name), func(t *testing.T) {
+				t.Parallel()
+
+				env := validEnvelopeOfKind(t, kind)
+				if _, err := EncodeEnvelope(env); err != nil {
+					t.Fatalf("the unmodified fixture is not valid: %v", err)
+				}
+				member.set(&env)
+				_, err := EncodeEnvelope(env)
+				shape := assertEnvelopeErrorCode(t, err, EnvelopeErrorField)
+				if shape.Field != "record_shape" {
+					t.Fatalf("Field = %q, want record_shape", shape.Field)
+				}
+			})
+		}
+	}
 }
