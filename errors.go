@@ -344,12 +344,24 @@ func journalErr(code JournalErrorCode, field string, cause error) error {
 //     was taken under. That lease has provably been superseded and must not
 //     retry under the same epoch; Epoch carries the committed high-water mark,
 //     as CatalogErrorEpoch does.
-//   - ClaimHeld and ClaimLost — the pair the journal already spells for lease
-//     ownership, meaning the same two things here. Held: someone else holds a
-//     LIVE claim on this command, so back off and try after it expires. Lost:
-//     the caller does not hold the live claim the transition requires, either
-//     because it never claimed or because its claim expired; it must claim
-//     again, which the apply deadline may no longer permit.
+//   - ClaimHeld — a LIVE claim is held on this command and is not provably the
+//     caller's. It cannot say "someone else": a claim records the lease epoch it
+//     was taken under and no claimant identity, so two writers under one epoch
+//     are indistinguishable to it. That matters for the likeliest recipient,
+//     which is not a rival but a claimer meeting its OWN live claim: a claim
+//     cannot be renewed, so a caller that wants more time must enter applying
+//     before its claim lapses, and waiting for the claim to expire — the advice
+//     that fits a rival — is the one thing that caller must not do.
+//   - ClaimLost — the caller does not hold the live claim the transition
+//     requires, and Field says which of the two situations it is. "lease_epoch"
+//     means the claim is held under another epoch, so the caller never held this
+//     command; "claim" means the caller's own claim lapsed. Both are answered by
+//     claiming again, which the apply deadline may no longer permit, but they
+//     read very differently to an operator: the first is a writer working on a
+//     command that is not its own, the second is a writer that was too slow.
+//
+// ClaimHeld and ClaimLost are the pair the journal already spells for lease
+// ownership, and they mean the corresponding two things here.
 //   - Deadline — a NEW claim was attempted at or after the command's apply
 //     deadline. No retry helps: the command is now the deadline reconciler's,
 //     and the caller learns its answer by reading the terminal record.

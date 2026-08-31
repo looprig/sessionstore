@@ -73,6 +73,42 @@ import (
 // guard read twice within one operation could disagree with itself, and a guard
 // supplied by the request would let the caller whose behaviour it bounds choose
 // the answer.
+//
+// That single reading is taken BEFORE the provider read, so every guard runs
+// against an instant no LATER than the true one, and the direction of that skew
+// is a property worth keeping deliberately. Under it a claim looks more live and
+// the deadline looks further away, so the machine errs toward leaving an
+// existing claim alone and toward letting a borderline-late claim proceed. It
+// never errs toward taking a claim that is in fact still held, which is the one
+// direction that could put two writers on one command; a claim admitted a
+// millisecond past its deadline is settled by the reconciler regardless.
+//
+// An edit that moved the reading after the provider read, or took a second one,
+// would keep the guards looking correct while reversing that: the instant could
+// then be later than the one the record was read at, and the machine would start
+// erring toward taking claims rather than leaving them.
+
+// MaxCommandClaimTTL bounds how far ahead of the store's clock a claim may
+// lapse. It is a ceiling on caller error and clock skew, not a policy TTL: a
+// caller chooses its own TTL well below this, and nothing here is a
+// recommendation of an hour.
+//
+// It exists because an over-long claim is a durable liveness fault that one
+// caller can commit alone. A claim may legitimately outlive the apply deadline —
+// that is what lets an unexpired claim win the deadline race — and inboxDue caps
+// the due horizon at the deadline, so from the deadline onward the command is
+// DUE, is paged by every reconciler pass, and can be settled by nobody until the
+// claim lapses. Unbounded, "until the claim lapses" is bounded only by
+// rankableTime, which is centuries: one caller with a skewed clock parks a row
+// in the deadline view for the life of the deployment. The bound turns that into
+// at most one TTL, which is the same shape of exposure a crashed claimer already
+// has.
+//
+// It is stated as a package constant with no deployment knob for the reason
+// MaxInboxPayloadBytes is: it is a bound on what this record may mean, not a
+// tuning parameter, and a deployment that needed a longer one would be saying
+// something about the machine rather than about its own capacity.
+const MaxCommandClaimTTL = time.Hour
 
 // ClaimCommandRequest takes a short-lived claim on one accepted command.
 //
@@ -100,6 +136,14 @@ type ClaimCommandRequest struct {
 // members mean what ClaimCommandRequest's mean; ClaimExpiresAt replaces the
 // claim's expiry, because the bound that mattered while the claimer was
 // preparing is not the bound that matters while it is applying.
+//
+// It is the machine's ONE IRREVERSIBLE expiry choice, and a caller should size
+// it for the whole application rather than for the next step. Applying is a
+// fortress: it cannot be re-claimed at any epoch and it cannot be renewed, so
+// once this expiry lapses the command can be completed only by this same lease
+// epoch and settled by nobody else until a later task's recovery reads the
+// journal correlation. A value chosen too small does not fail the application —
+// it parks the command.
 type BeginApplyingCommandRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
@@ -135,6 +179,16 @@ type CompleteCommandRequest struct {
 // therefore the honest statement "I am not acting under a session lease", and it
 // buys exactly the authority the state machine grants that caller: it may settle
 // a command that nobody is working on, and nothing else.
+//
+// A NONZERO epoch here is a consistency check on a view the caller asserts, not
+// an authority boundary. Nothing forces a caller to name one — a superseded Host
+// obtains the reconciler's authority simply by passing zero — so the fence
+// cannot be what keeps a stale lease out. What keeps it out is the claim rule
+// below it, which is a property of the RECORD and applies identically at every
+// epoch: a live claim admits only its own, and an applying record admits nobody.
+// The fence's job is narrower and still worth doing: a caller that volunteers an
+// epoch below the record's high-water mark is telling the store its view of the
+// session is stale, and is told so rather than acting on it.
 //
 // Rejection is a value rather than a pointer because a rejection without a
 // reason is not a state this record has. It is validated as a public projection,
@@ -205,6 +259,15 @@ func (s *Store) GetCommand(ctx context.Context, req GetCommandRequest) (InboxEnt
 // did, and the reclaim horizon a reader derives from them follows. There is no
 // second due state to file and no operation-shaped due state anywhere in this
 // file — see inboxDue, which is the only definition there is.
+//
+// A CLAIM CANNOT BE RENEWED, and a caller that needs more time has exactly one
+// move: enter applying before its claim lapses. Re-claiming under the same epoch
+// is refused for as long as the claim is live (that is the equal-epoch rule) and
+// admitted only once it has lapsed — by which time any other writer at that
+// epoch or above may take it, and the deadline may have closed new claims
+// entirely. Renewal is deliberately absent rather than forgotten: it would let
+// one writer hold a command indefinitely, and the state that legitimately spans
+// a long application is applying, which the deadline cannot cancel.
 func (s *Store) ClaimCommand(ctx context.Context, req ClaimCommandRequest) (InboxEntry, error) {
 	scope, now, err := s.beginInboxTransition(req.TenantID, req.SessionID, req.CommandID, req.ExpectedRevision, req.LeaseEpoch, true)
 	if err != nil {
@@ -272,11 +335,8 @@ func (s *Store) BeginApplyingCommand(ctx context.Context, req BeginApplyingComma
 	if current.Record.State != InboxStateClaimed {
 		return InboxEntry{}, inboxErr(InboxErrorState, "state", nil)
 	}
-	if err := commandEpochFence(current.Record, req.LeaseEpoch); err != nil {
+	if err := commandClaimFence(current.Record, req.LeaseEpoch); err != nil {
 		return InboxEntry{}, err
-	}
-	if req.LeaseEpoch != current.Record.Claim.LeaseEpoch {
-		return InboxEntry{}, inboxErr(InboxErrorClaimLost, "lease_epoch", nil)
 	}
 	if !claimLive(current.Record, now) {
 		return InboxEntry{}, inboxErr(InboxErrorClaimLost, "claim", nil)
@@ -325,11 +385,8 @@ func (s *Store) CompleteCommand(ctx context.Context, req CompleteCommandRequest)
 	if current.Record.State != InboxStateApplying {
 		return InboxEntry{}, inboxErr(InboxErrorState, "state", nil)
 	}
-	if err := commandEpochFence(current.Record, req.LeaseEpoch); err != nil {
+	if err := commandClaimFence(current.Record, req.LeaseEpoch); err != nil {
 		return InboxEntry{}, err
-	}
-	if req.LeaseEpoch != current.Record.Claim.LeaseEpoch {
-		return InboxEntry{}, inboxErr(InboxErrorClaimLost, "lease_epoch", nil)
 	}
 	// The claim that applied the command is kept: it is the durable record of
 	// which lease did so, and validateInboxState requires an applied command to
@@ -369,11 +426,22 @@ func (s *Store) CompleteCommand(ctx context.Context, req CompleteCommandRequest)
 // case. Such a record stays non-terminal, so it stays due, so it occupies a
 // place in every due page from its deadline onward, and nothing in this file can
 // settle it. One crashed applier therefore parks a row in the deadline view
-// permanently. Nothing is starved TODAY, because this package exposes no due
-// command reader for anything to be starved out of; the hazard arrives with the
-// reader. ListDueGates met the same shape and answered it by reporting what a
-// page EXAMINED alongside what it returned, so a page that is full of rows it
-// could not act on is distinguishable from a deployment with nothing to do.
+// permanently.
+//
+// It has a SECOND SOURCE, and a reader sizing that signal needs both. A live
+// claim also occupies a due place it cannot be settled from, for as long as it
+// lasts, and a claim may lapse after the apply deadline by design. That one is
+// bounded — MaxCommandClaimTTL is exactly the bound, and it exists for this —
+// so it is transient occupancy rather than permanent, but it is ordinary
+// operation rather than a crash: every command claimed close to its deadline
+// contributes. Expect a due page to contain rows that will clear on their own
+// and rows that never will, and do not size the signal for the crash case alone.
+//
+// Nothing is starved TODAY, because this package exposes no due command reader
+// for anything to be starved out of; the hazard arrives with the reader.
+// ListDueGates met the same shape and answered it by reporting what a page
+// EXAMINED alongside what it returned, so a page that is full of rows it could
+// not act on is distinguishable from a deployment with nothing to do.
 func (s *Store) RejectCommand(ctx context.Context, req RejectCommandRequest) (InboxEntry, error) {
 	scope, now, err := s.beginInboxTransition(req.TenantID, req.SessionID, req.CommandID, req.ExpectedRevision, req.LeaseEpoch, false)
 	if err != nil {
@@ -511,17 +579,28 @@ func (s *Store) beginInboxTransition(
 
 // requestedClaim validates a caller's claim members and returns the claim to
 // store. The well-formedness rule is the record's own, called rather than
-// restated; what is added here is the one thing a stored record cannot express,
-// which is that a claim must lapse in the FUTURE. A claim born expired is
-// indistinguishable from no claim to every guard in this file, so accepting one
-// would let a caller write a state it can never act on and hand the command
-// straight back to the reclaim horizon.
+// restated; what is added here are the two things a stored record cannot
+// express, both of them relations between the claim and the store's clock.
+//
+// A claim must lapse in the FUTURE: one born expired is indistinguishable from
+// no claim to every guard in this file, so accepting one would let a caller
+// write a state it can never act on and hand the command straight back to the
+// reclaim horizon.
+//
+// And it must lapse within MaxCommandClaimTTL, which is where that constant's
+// reasoning lives.
 func requestedClaim(epoch uint64, expiresAt time.Time, now time.Time) (CommandClaim, error) {
 	claim := CommandClaim{LeaseEpoch: epoch, ExpiresAt: expiresAt}
 	if err := validateCommandClaim(claim); err != nil {
 		return CommandClaim{}, err
 	}
 	if !now.Before(expiresAt) {
+		return CommandClaim{}, inboxErr(InboxErrorInvalid, "claim_expires_at", nil)
+	}
+	// Sub rather than now.Add(MaxCommandClaimTTL): the sum saturates silently at
+	// the end of the representable range, so a clock near it would compare a
+	// caller's expiry against a horizon that had stopped moving.
+	if expiresAt.Sub(now) > MaxCommandClaimTTL {
 		return CommandClaim{}, inboxErr(InboxErrorInvalid, "claim_expires_at", nil)
 	}
 	return claim, nil
@@ -568,6 +647,27 @@ func claimLive(record InboxRecord, now time.Time) bool {
 func commandEpochFence(record InboxRecord, epoch uint64) error {
 	if epoch < record.Claim.LeaseEpoch {
 		return &InboxError{Code: InboxErrorEpoch, Field: "lease_epoch", Epoch: record.Claim.LeaseEpoch}
+	}
+	return nil
+}
+
+// commandClaimFence admits a write that must come from the claim's OWNER: it
+// fences a superseded epoch and then refuses an epoch that is not the claim's.
+//
+// The ORDER is the contract, not an implementation detail, and it is why this is
+// a function rather than two lines written twice. A caller below the high-water
+// mark is superseded permanently and must learn that; a caller above it merely
+// has not claimed this command and may still claim it. Reporting the second
+// answer to a caller entitled to the first would send a dead lease back to try
+// again forever. The two callers — beginning an application and completing one —
+// are also exactly the pair a successor lease's recovery will have to change, so
+// the rule they share is stated where that change is made once.
+func commandClaimFence(record InboxRecord, epoch uint64) error {
+	if err := commandEpochFence(record, epoch); err != nil {
+		return err
+	}
+	if epoch != record.Claim.LeaseEpoch {
+		return inboxErr(InboxErrorClaimLost, "lease_epoch", nil)
 	}
 	return nil
 }

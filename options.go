@@ -116,6 +116,26 @@ func WithShutdownTimeout(timeout time.Duration) Option {
 }
 
 // WithClock supplies the clock used by Store.
+//
+// Only the clock VALUE is validated, and only for being non-nil. Nothing checks
+// what it returns: there is no monotonicity requirement, no bound, and no
+// comparison against the machine's own clock. That is a deliberate limit on what
+// this package claims, and it has a consequence worth stating where the clock is
+// supplied rather than leaving it to be discovered from whichever guard survived
+// it.
+//
+// The rule the package holds itself to instead is that a guard is a function of
+// the RECORD, never of the clock alone. A stored record is validated against
+// rankableTime, which bounds the instants a record may CARRY; it says nothing
+// about a clock, so a predicate that compares against an absent or zero instant
+// has to be total on its own — see claimLive in inbox_claim.go, whose zero-claim
+// conjunct exists for exactly that reason.
+//
+// What a wrong clock costs is therefore LIVENESS rather than safety. A clock
+// running slow leaves claims looking live and deadlines looking distant, so work
+// waits; one running fast expires claims early, so work is redone. Neither puts
+// two writers on one command, because ownership is decided by the lease epoch
+// and by the record's revision, and neither of those is a clock reading.
 func WithClock(clock Clock) Option {
 	return func(cfg *config) error {
 		if isNilDynamic(reflect.ValueOf(clock)) {

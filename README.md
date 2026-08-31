@@ -292,6 +292,15 @@ a strictly greater epoch may take either — its predecessor is provably fenced
 out of the journal, and stalling every claimed command for a claim TTL on every
 failover buys nothing.
 
+A claim cannot be RENEWED. A claimer that needs more time must enter `applying`
+before its claim lapses; re-claiming under the same epoch is refused while the
+claim is live and, once it lapses, is open to every writer at that epoch or
+above. `MaxCommandClaimTTL` bounds how far ahead of the store's clock a claim may
+expire — a ceiling on caller error and clock skew, not a policy TTL. It exists
+because a claim may legitimately outlive the apply deadline while `inboxDue` caps
+the due horizon AT the deadline, so an over-long claim leaves the row due and
+settleable by nobody for the claim's whole life; unbounded, that is centuries.
+
 `applying` may be entered only by the holder of a live claim, and it has no
 deadline check: an unexpired claim wins the deadline race, which is what stops a
 reconciler's clock from cancelling work about to commit. `CompleteCommand`
@@ -307,6 +316,11 @@ Resuming one is continuation of an existing application rather than a new claim,
 it turns on the correlated journal application prefix this package does not yet
 read, and rejecting it on state alone could overwrite a command whose effect had
 already committed.
+
+Both of those leave rows in the due view that the reader cannot act on: an
+expired `applying` record permanently, and a live claim that outlives the
+deadline for at most one `MaxCommandClaimTTL`. Whoever builds the due-command
+reader should size its examined-versus-returned signal for both.
 
 A command's due state is derived from the record rather than from the operation
 writing it. A non-terminal command is due at the earliest instant something must

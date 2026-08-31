@@ -144,17 +144,17 @@ func mustBeginApplying(t *testing.T, store *Store, entry InboxEntry, epoch uint6
 // inboxStates builds one admitted command into each durable state, through the
 // real operations rather than by writing bytes: a fixture assembled by hand
 // would be evidence that the machine accepts a state, not that it produces one.
-var inboxStates = map[string]func(t *testing.T, store *Store, clock *movableClock, entry InboxEntry) InboxEntry{
-	"pending": func(_ *testing.T, _ *Store, _ *movableClock, entry InboxEntry) InboxEntry {
+var inboxStates = map[string]func(t *testing.T, store *Store, entry InboxEntry) InboxEntry{
+	"pending": func(_ *testing.T, _ *Store, entry InboxEntry) InboxEntry {
 		return entry
 	},
-	"claimed": func(t *testing.T, store *Store, _ *movableClock, entry InboxEntry) InboxEntry {
+	"claimed": func(t *testing.T, store *Store, entry InboxEntry) InboxEntry {
 		return mustClaim(t, store, entry, inboxEpoch)
 	},
-	"applying": func(t *testing.T, store *Store, _ *movableClock, entry InboxEntry) InboxEntry {
+	"applying": func(t *testing.T, store *Store, entry InboxEntry) InboxEntry {
 		return mustBeginApplying(t, store, mustClaim(t, store, entry, inboxEpoch), inboxEpoch)
 	},
-	"applied": func(t *testing.T, store *Store, _ *movableClock, entry InboxEntry) InboxEntry {
+	"applied": func(t *testing.T, store *Store, entry InboxEntry) InboxEntry {
 		applying := mustBeginApplying(t, store, mustClaim(t, store, entry, inboxEpoch), inboxEpoch)
 		applied, err := store.CompleteCommand(context.Background(), testCompleteRequest(applying, inboxEpoch))
 		if err != nil {
@@ -162,7 +162,7 @@ var inboxStates = map[string]func(t *testing.T, store *Store, clock *movableCloc
 		}
 		return applied
 	},
-	"rejected": func(t *testing.T, store *Store, _ *movableClock, entry InboxEntry) InboxEntry {
+	"rejected": func(t *testing.T, store *Store, entry InboxEntry) InboxEntry {
 		rejected, err := store.RejectCommand(context.Background(), testRejectRequest(entry, inboxEpoch))
 		if err != nil {
 			t.Fatalf("RejectCommand: %v", err)
@@ -217,82 +217,134 @@ func assertInboxUnchanged(t *testing.T, store *Store, want InboxEntry) {
 
 // --- the state machine ----------------------------------------------------
 
-// TestCommandStateMachineAdmitsExactlyItsTransitions drives every operation
-// against every durable state, at an instant and under a lease epoch the case
-// names, and holds each refusal to leaving the record untouched.
+// transitionExpectation is what one edge of the machine does. An empty want
+// means the edge is allowed and wantState is what it produces.
+type transitionExpectation struct {
+	want      InboxErrorCode
+	wantState InboxState
+}
+
+// commandStateMachine is the COMPLETE edge table: every durable state against
+// every transition, under a lease epoch that is the record's own so that each
+// cell carries exactly ONE fault. A cell that was both in the wrong state and
+// under the wrong epoch would pass whichever guard fired first and would keep
+// passing if the other were deleted; the epoch rules are driven separately.
 //
-// Each case carries exactly ONE fault. A case that was both in the wrong state
-// and under the wrong epoch would pass whichever guard fired first and would
-// keep passing if the other were deleted.
+// It is a table of the CROSS PRODUCT and the test proves that, rather than the
+// table happening to contain one entry per pair today. A hand-written list of
+// twenty cells looks identical to this until a sixth state or a fifth operation
+// arrives, at which point up to nine edges go untested in silence — the same
+// failure declaredStoreOperations exists to prevent one layer up in this file,
+// applied to the edges instead of to the operations.
+var commandStateMachine = map[string]map[string]transitionExpectation{
+	"pending": {
+		"claim":          {wantState: InboxStateClaimed},
+		"begin_applying": {want: InboxErrorState},
+		"complete":       {want: InboxErrorState},
+		"reject":         {wantState: InboxStateRejected},
+	},
+	"claimed": {
+		// A claim under the epoch that already holds a LIVE claim is held off;
+		// that this cell is not a state failure is the whole of the equal-epoch
+		// rule, and the cross product is what forces it to be stated.
+		"claim":          {want: InboxErrorClaimHeld},
+		"begin_applying": {wantState: InboxStateApplying},
+		"complete":       {want: InboxErrorState},
+		"reject":         {wantState: InboxStateRejected},
+	},
+	"applying": {
+		"claim":          {want: InboxErrorState},
+		"begin_applying": {want: InboxErrorState},
+		"complete":       {wantState: InboxStateApplied},
+		"reject":         {wantState: InboxStateRejected},
+	},
+	// Both terminal states refuse every transition, which is what makes them
+	// mutually exclusive rather than merely written at different times.
+	"applied": {
+		"claim":          {want: InboxErrorTerminal},
+		"begin_applying": {want: InboxErrorTerminal},
+		"complete":       {want: InboxErrorTerminal},
+		"reject":         {want: InboxErrorTerminal},
+	},
+	"rejected": {
+		"claim":          {want: InboxErrorTerminal},
+		"begin_applying": {want: InboxErrorTerminal},
+		"complete":       {want: InboxErrorTerminal},
+		"reject":         {want: InboxErrorTerminal},
+	},
+}
+
+// TestCommandStateMachineAdmitsExactlyItsTransitions drives every operation
+// against every durable state and holds each refusal to leaving the record
+// untouched.
+//
+// The edges come from iterating the state and operation registries rather than
+// from the table, so an unlisted pair fails rather than being skipped, and a
+// listed pair that no longer exists fails too.
 func TestCommandStateMachineAdmitsExactlyItsTransitions(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct {
-		name      string
-		state     string
-		operation string
-		epoch     uint64
-		at        time.Time
-		want      InboxErrorCode
-		wantState InboxState
-	}{
-		// The allowed edges.
-		{name: "pending claims", state: "pending", operation: "claim", epoch: inboxEpoch, wantState: InboxStateClaimed},
-		{name: "claimed begins applying", state: "claimed", operation: "begin_applying", epoch: inboxEpoch, wantState: InboxStateApplying},
-		{name: "applying completes", state: "applying", operation: "complete", epoch: inboxEpoch, wantState: InboxStateApplied},
-		{name: "applying rejects", state: "applying", operation: "reject", epoch: inboxEpoch, wantState: InboxStateRejected},
-		{name: "claimed rejects", state: "claimed", operation: "reject", epoch: inboxEpoch, wantState: InboxStateRejected},
-		{name: "pending rejects", state: "pending", operation: "reject", epoch: inboxEpoch, wantState: InboxStateRejected},
-		{name: "pending rejects without a lease", state: "pending", operation: "reject", epoch: 0, wantState: InboxStateRejected},
+	for state := range inboxStates {
+		for operation := range inboxOperations {
+			expect, listed := commandStateMachine[state][operation]
+			if !listed {
+				t.Errorf("the machine has a %s x %s edge and the table does not say what it does", state, operation)
+				continue
+			}
+			t.Run(state+"/"+operation, func(t *testing.T) {
+				t.Parallel()
 
-		// The forbidden edges out of a non-terminal state.
-		{name: "pending cannot begin applying", state: "pending", operation: "begin_applying", epoch: inboxEpoch, want: InboxErrorState},
-		{name: "pending cannot complete", state: "pending", operation: "complete", epoch: inboxEpoch, want: InboxErrorState},
-		{name: "claimed cannot complete", state: "claimed", operation: "complete", epoch: inboxEpoch, want: InboxErrorState},
-		{name: "applying cannot be claimed", state: "applying", operation: "claim", epoch: inboxEpoch, want: InboxErrorState},
-		{name: "applying cannot begin applying again", state: "applying", operation: "begin_applying", epoch: inboxEpoch, want: InboxErrorState},
+				store, _, admitted := inboxFixture(t, memstore.New())
+				entry := inboxStates[state](t, store, admitted)
 
-		// Both terminal states refuse every operation, which is what makes them
-		// mutually exclusive rather than merely written at different times.
-		{name: "applied refuses claim", state: "applied", operation: "claim", epoch: inboxEpoch, want: InboxErrorTerminal},
-		{name: "applied refuses begin applying", state: "applied", operation: "begin_applying", epoch: inboxEpoch, want: InboxErrorTerminal},
-		{name: "applied refuses complete", state: "applied", operation: "complete", epoch: inboxEpoch, want: InboxErrorTerminal},
-		{name: "applied refuses reject", state: "applied", operation: "reject", epoch: inboxEpoch, want: InboxErrorTerminal},
-		{name: "rejected refuses claim", state: "rejected", operation: "claim", epoch: inboxEpoch, want: InboxErrorTerminal},
-		{name: "rejected refuses begin applying", state: "rejected", operation: "begin_applying", epoch: inboxEpoch, want: InboxErrorTerminal},
-		{name: "rejected refuses complete", state: "rejected", operation: "complete", epoch: inboxEpoch, want: InboxErrorTerminal},
-		{name: "rejected refuses reject", state: "rejected", operation: "reject", epoch: inboxEpoch, want: InboxErrorTerminal},
+				got, err := inboxOperations[operation](store, entry, inboxEpoch)
+				if expect.want != "" {
+					assertInboxCode(t, err, expect.want)
+					assertInboxUnchanged(t, store, entry)
+					return
+				}
+				if err != nil {
+					t.Fatalf("%s from %s: %v", operation, state, err)
+				}
+				if got.Record.State != expect.wantState {
+					t.Fatalf("state = %q, want %q", got.Record.State, expect.wantState)
+				}
+				if got.Revision == entry.Revision {
+					t.Fatalf("an accepted transition did not advance the revision %d", entry.Revision)
+				}
+				if got.AcceptedOrder != entry.AcceptedOrder {
+					t.Fatalf("acceptance order moved %d -> %d", entry.AcceptedOrder, got.AcceptedOrder)
+				}
+			})
+		}
 	}
 
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
+	for state, operations := range commandStateMachine {
+		if inboxStates[state] == nil {
+			t.Errorf("the table names the state %s, which the machine no longer builds", state)
+		}
+		for operation := range operations {
+			if inboxOperations[operation] == nil {
+				t.Errorf("the table names the operation %s, which the machine no longer offers", operation)
+			}
+		}
+	}
+}
 
-			store, clock, admitted := inboxFixture(t, memstore.New())
-			entry := inboxStates[test.state](t, store, clock, admitted)
-			if at := test.at; !at.IsZero() {
-				clock.set(at)
-			}
+// TestReconcilerRejectsWithoutALease is the one edge outside the cross product:
+// rejection is the only transition a caller may make while naming no lease
+// epoch at all, so it is driven here rather than given a second epoch column in
+// a table whose whole point is one fault per cell.
+func TestReconcilerRejectsWithoutALease(t *testing.T) {
+	t.Parallel()
 
-			got, err := inboxOperations[test.operation](store, entry, test.epoch)
-			if test.want != "" {
-				assertInboxCode(t, err, test.want)
-				assertInboxUnchanged(t, store, entry)
-				return
-			}
-			if err != nil {
-				t.Fatalf("%s from %s: %v", test.operation, test.state, err)
-			}
-			if got.Record.State != test.wantState {
-				t.Fatalf("state = %q, want %q", got.Record.State, test.wantState)
-			}
-			if got.Revision == entry.Revision {
-				t.Fatalf("an accepted transition did not advance the revision %d", entry.Revision)
-			}
-			if got.AcceptedOrder != entry.AcceptedOrder {
-				t.Fatalf("acceptance order moved %d -> %d", entry.AcceptedOrder, got.AcceptedOrder)
-			}
-		})
+	store, _, admitted := inboxFixture(t, memstore.New())
+	rejected, err := store.RejectCommand(context.Background(), testRejectRequest(admitted, 0))
+	if err != nil {
+		t.Fatalf("a reconciler with no lease could not settle a pending command: %v", err)
+	}
+	if rejected.Record.State != InboxStateRejected {
+		t.Fatalf("state = %q, want %q", rejected.Record.State, InboxStateRejected)
 	}
 }
 
@@ -319,8 +371,8 @@ func TestClaimEpochRefusesASupersededLease(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			store, clock, admitted := inboxFixture(t, memstore.New())
-			entry := inboxStates[test.state](t, store, clock, admitted)
+			store, _, admitted := inboxFixture(t, memstore.New())
+			entry := inboxStates[test.state](t, store, admitted)
 
 			_, err := inboxOperations[test.operation](store, entry, inboxStaleEpoch)
 			failure := assertInboxCode(t, err, InboxErrorEpoch)
@@ -345,8 +397,8 @@ func TestALiveClaimIsHeldAgainstItsOwnEpochAndTakenByAGreaterOne(t *testing.T) {
 	t.Run("equal epoch is held off", func(t *testing.T) {
 		t.Parallel()
 
-		store, clock, admitted := inboxFixture(t, memstore.New())
-		claimed := inboxStates["claimed"](t, store, clock, admitted)
+		store, _, admitted := inboxFixture(t, memstore.New())
+		claimed := inboxStates["claimed"](t, store, admitted)
 
 		_, err := store.ClaimCommand(context.Background(), testClaimRequest(claimed, inboxEpoch))
 		if got := assertInboxCode(t, err, InboxErrorClaimHeld); got.Field != "claim" {
@@ -358,8 +410,8 @@ func TestALiveClaimIsHeldAgainstItsOwnEpochAndTakenByAGreaterOne(t *testing.T) {
 	t.Run("a greater epoch supersedes", func(t *testing.T) {
 		t.Parallel()
 
-		store, clock, admitted := inboxFixture(t, memstore.New())
-		claimed := inboxStates["claimed"](t, store, clock, admitted)
+		store, _, admitted := inboxFixture(t, memstore.New())
+		claimed := inboxStates["claimed"](t, store, admitted)
 
 		taken, err := store.ClaimCommand(context.Background(), testClaimRequest(claimed, inboxNextEpoch))
 		if err != nil {
@@ -391,7 +443,7 @@ func TestAnExpiredClaimIsReclaimable(t *testing.T) {
 			t.Parallel()
 
 			store, clock, admitted := inboxFixture(t, memstore.New())
-			claimed := inboxStates["claimed"](t, store, clock, admitted)
+			claimed := inboxStates["claimed"](t, store, admitted)
 			clock.set(inboxClaimLapsed)
 
 			reclaimed, err := store.ClaimCommand(context.Background(), ClaimCommandRequest{
@@ -421,7 +473,7 @@ func TestAnExpiredClaimCannotApply(t *testing.T) {
 	t.Parallel()
 
 	store, clock, admitted := inboxFixture(t, memstore.New())
-	claimed := inboxStates["claimed"](t, store, clock, admitted)
+	claimed := inboxStates["claimed"](t, store, admitted)
 	clock.set(inboxClaimLapsed)
 
 	// The claim the request would WRITE is live; the only lapsed claim in the
@@ -440,8 +492,8 @@ func TestAnExpiredClaimCannotApply(t *testing.T) {
 func TestAnUnclaimedEpochCannotApply(t *testing.T) {
 	t.Parallel()
 
-	store, clock, admitted := inboxFixture(t, memstore.New())
-	claimed := inboxStates["claimed"](t, store, clock, admitted)
+	store, _, admitted := inboxFixture(t, memstore.New())
+	claimed := inboxStates["claimed"](t, store, admitted)
 
 	_, err := store.BeginApplyingCommand(context.Background(), testBeginApplyingRequest(claimed, inboxNextEpoch))
 	if got := assertInboxCode(t, err, InboxErrorClaimLost); got.Field != "lease_epoch" {
@@ -472,10 +524,12 @@ func TestNoNewClaimStartsAtOrAfterTheApplyDeadline(t *testing.T) {
 			store, clock, admitted := inboxFixture(t, memstore.New())
 			clock.set(test.at)
 
-			// The claim outlives the deadline, so the request itself is valid at
-			// every instant above and only the deadline rule can refuse it.
+			// The claim is taken relative to the instant the case runs at, so
+			// it is well formed and within MaxCommandClaimTTL wherever the
+			// clock is, and at and after the deadline it outlives the deadline.
+			// Only the deadline rule can refuse any of them.
 			claim := testClaimRequest(admitted, inboxEpoch)
-			claim.ClaimExpiresAt = inboxAfterDue.Add(time.Hour)
+			claim.ClaimExpiresAt = test.at.Add(30 * time.Minute)
 			_, err := store.ClaimCommand(context.Background(), claim)
 			if test.want == "" {
 				if err != nil {
@@ -498,10 +552,11 @@ func TestNoNewClaimStartsAtOrAfterTheApplyDeadline(t *testing.T) {
 func TestAnUnexpiredClaimWinsTheDeadlineRace(t *testing.T) {
 	t.Parallel()
 
-	// A claim taken before the deadline that expires after it. Past the
-	// deadline the reconciler is running and the claim is still live.
-	longClaim := inboxAfterDue.Add(time.Hour)
-	pastDeadline := inboxAfterDue
+	// A claim taken before the deadline that expires after it, within
+	// MaxCommandClaimTTL of when it is taken. Past the deadline the reconciler
+	// is running and the claim is still live.
+	longClaim := inboxDeadline.Add(5 * time.Minute)
+	pastDeadline := inboxDeadline.Add(time.Minute)
 	afterLongClaim := longClaim.Add(time.Minute)
 
 	claimLongInto := func(t *testing.T, store *Store, entry InboxEntry) InboxEntry {
@@ -590,7 +645,7 @@ func TestAnUnexpiredClaimWinsTheDeadlineRace(t *testing.T) {
 			// Nor may a successor lease take it, which is what closes the
 			// two-step of superseding the claim and rejecting as its holder.
 			successor := testClaimRequest(applying, inboxNextEpoch)
-			successor.ClaimExpiresAt = test.at.Add(time.Hour)
+			successor.ClaimExpiresAt = test.at.Add(30 * time.Minute)
 			_, err = store.ClaimCommand(context.Background(), successor)
 			assertInboxCode(t, err, InboxErrorState)
 		}
@@ -705,8 +760,8 @@ func TestTerminalTransitionsLeaveTheCommandNotDueAndDirectlyGettable(t *testing.
 			base := memstore.New()
 			ordered := &recordingOrdered{OrderedIndex: base.OrderedIndex}
 			base.OrderedIndex = ordered
-			store, clock, admitted := inboxFixture(t, base)
-			before := inboxStates[test.from](t, store, clock, admitted)
+			store, _, admitted := inboxFixture(t, base)
+			before := inboxStates[test.from](t, store, admitted)
 
 			ordered.reset()
 			terminal, err := test.settle(store, before)
@@ -1297,7 +1352,7 @@ func TestCommandStatusProjectsTheDurableState(t *testing.T) {
 			t.Parallel()
 
 			store, clock, admitted := inboxFixture(t, memstore.New())
-			entry := inboxStates[test.state](t, store, clock, admitted)
+			entry := inboxStates[test.state](t, store, admitted)
 			if !test.at.IsZero() {
 				clock.set(test.at)
 			}
@@ -1592,7 +1647,7 @@ func TestClaimLivenessIsHalfOpen(t *testing.T) {
 			// answered by the compare-and-swap rather than by the interval.
 			claimedIn := func() (*Store, InboxEntry) {
 				store, clock, admitted := inboxFixture(t, memstore.New())
-				claimed := inboxStates["claimed"](t, store, clock, admitted)
+				claimed := inboxStates["claimed"](t, store, admitted)
 				clock.set(test.at)
 				return store, claimed
 			}
@@ -1634,7 +1689,7 @@ func TestCompleteRecordsAnApplicationWhoseClaimLapsed(t *testing.T) {
 	t.Parallel()
 
 	store, clock, admitted := inboxFixture(t, memstore.New())
-	applying := inboxStates["applying"](t, store, clock, admitted)
+	applying := inboxStates["applying"](t, store, admitted)
 	clock.set(inboxClaimLapsed)
 
 	_, err := store.RejectCommand(context.Background(), testRejectRequest(applying, inboxEpoch))
@@ -1662,8 +1717,8 @@ func TestCompleteRecordsAnApplicationWhoseClaimLapsed(t *testing.T) {
 func TestCompleteRefusesALeaseThatDidNotApply(t *testing.T) {
 	t.Parallel()
 
-	store, clock, admitted := inboxFixture(t, memstore.New())
-	applying := inboxStates["applying"](t, store, clock, admitted)
+	store, _, admitted := inboxFixture(t, memstore.New())
+	applying := inboxStates["applying"](t, store, admitted)
 
 	_, err := store.CompleteCommand(context.Background(), testCompleteRequest(applying, inboxNextEpoch))
 	if got := assertInboxCode(t, err, InboxErrorClaimLost); got.Field != "lease_epoch" {
@@ -1701,5 +1756,53 @@ func TestInboxReadsVerifyTheSessionBindingBeforeTheProvider(t *testing.T) {
 	}
 	if got := ordered.countOf("get"); got != 0 {
 		t.Fatalf("an unbound session reached the OrderedIndex %d times", got)
+	}
+}
+
+// TestClaimTTLIsBoundedAbove pins the ceiling on how far ahead of the store's
+// clock a claim may lapse, at the instant itself.
+//
+// The bound is not tidiness. A claim may legitimately outlive the apply deadline
+// — that is what lets it win the deadline race — and inboxDue caps the due
+// horizon at the deadline, so an over-long claim leaves the row DUE and
+// unactionable for the claim's whole life: it is the head-of-line occupancy
+// RejectCommand documents, reached by one caller with a skewed clock rather than
+// by a crash.
+func TestClaimTTLIsBoundedAbove(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		expires time.Duration
+		want    InboxErrorCode
+	}{
+		{name: "at the ceiling", expires: MaxCommandClaimTTL},
+		{name: "past the ceiling", expires: MaxCommandClaimTTL + time.Millisecond, want: InboxErrorInvalid},
+		{name: "far past the ceiling", expires: 100 * 365 * 24 * time.Hour, want: InboxErrorInvalid},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			store, _, admitted := inboxFixture(t, memstore.New())
+			request := testClaimRequest(admitted, inboxEpoch)
+			request.ClaimExpiresAt = inboxClaimStart.Add(test.expires)
+
+			claimed, err := store.ClaimCommand(context.Background(), request)
+			if test.want == "" {
+				if err != nil {
+					t.Fatalf("a claim at the ceiling was refused: %v", err)
+				}
+				if !claimed.Record.Claim.ExpiresAt.Equal(request.ClaimExpiresAt) {
+					t.Fatalf("stored expiry = %s, want %s", claimed.Record.Claim.ExpiresAt, request.ClaimExpiresAt)
+				}
+				return
+			}
+			if got := assertInboxCode(t, err, test.want); got.Field != "claim_expires_at" {
+				t.Fatalf("field = %q, want %q", got.Field, "claim_expires_at")
+			}
+			assertInboxUnchanged(t, store, admitted)
+		})
 	}
 }
