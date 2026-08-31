@@ -124,6 +124,15 @@ func (l *callLog) add(name string) {
 	l.calls = append(l.calls, name)
 }
 
+// reset forgets what has been recorded so far, so a test can build its fixture
+// through the real operations and still assert on the calls ONE later operation
+// makes. It is recordingOrdered.reset's rule for the shared log.
+func (l *callLog) reset() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls = nil
+}
+
 func (l *callLog) snapshot() []string {
 	l.mu.Lock()
 	defer l.mu.Unlock()

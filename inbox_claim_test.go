@@ -1712,9 +1712,14 @@ func TestCompleteRecordsAnApplicationWhoseClaimLapsed(t *testing.T) {
 
 // TestCompleteRefusesALeaseThatDidNotApply closes the other half of the
 // completion rule: dropping the claim TTL requirement does not mean dropping
-// the claim. A successor lease may not record an application it did not start,
-// because whether that application committed is evidence this file does not
-// read.
+// the claim. A successor lease may not record an application it did not start
+// on its own word — it is sent to the journal, and a session with no
+// application evidence in it refuses.
+//
+// This is where the two halves of the file meet, so the failure it asserts is
+// deliberately the EVIDENCE one rather than a lost claim: a successor is no
+// longer refused for being a successor, it is refused for having nothing to
+// point at. The evidence it would need is inbox_recovery_test.go's subject.
 func TestCompleteRefusesALeaseThatDidNotApply(t *testing.T) {
 	t.Parallel()
 
@@ -1722,8 +1727,8 @@ func TestCompleteRefusesALeaseThatDidNotApply(t *testing.T) {
 	applying := inboxStates["applying"](t, store, admitted)
 
 	_, err := store.CompleteCommand(context.Background(), testCompleteRequest(applying, inboxNextEpoch))
-	if got := assertInboxCode(t, err, InboxErrorClaimLost); got.Field != "lease_epoch" {
-		t.Fatalf("field = %q, want %q", got.Field, "lease_epoch")
+	if got := assertInboxCode(t, err, InboxErrorEvidence); got.Field != "result" {
+		t.Fatalf("field = %q, want %q", got.Field, "result")
 	}
 	assertInboxUnchanged(t, store, applying)
 }

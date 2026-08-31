@@ -311,16 +311,49 @@ requirement, because it decides something that has not happened; its lease epoch
 is optional, and a caller that names none is the deadline reconciler, which may
 settle a `pending` or lapsed-`claimed` command and nothing else.
 
-An `applying` record whose claim has lapsed is refused every transition here.
-Resuming one is continuation of an existing application rather than a new claim,
-it turns on the correlated journal application prefix this package does not yet
-read, and rejecting it on state alone could overwrite a command whose effect had
-already committed.
+## Recovering an application from the journal
 
-Both of those leave rows in the due view that the reader cannot act on: an
-expired `applying` record permanently, and a live claim that outlives the
-deadline for at most one `MaxCommandClaimTTL`. Whoever builds the due-command
-reader should size its examined-versus-returned signal for both.
+`FindCommandApplication` correlates one command's record with its session's
+journal and reports what the journal PROVES about its application, which is what
+lets an `applying` record whose claim has lapsed be settled at all. Correlation
+is against the identities in the durable record, never against identities a
+caller supplies, and all three of them must agree: the public `CommandID`, the
+`RuntimeCommandID` the inbox mapped it to (compared as a decoded UUID value, not
+as text), and the command kind. A prefix that names the command under a
+different runtime identity or kind is `conflicted`, not absent — treating a
+broken mapping as absence is what would let a command whose effect committed be
+rejected.
+
+Two things make a negative answer safe, and both are durable state rather than
+an assertion by the caller asking for the settlement. ADJACENCY: a prefix
+belongs immediately before its effect, so the record at `prefix+1` is the whole
+question — a public event means `committed`, an opening fence above the prefix's
+epoch means `abandoned`, and anything else, including nothing yet, means
+`unresolved` and refuses both settlements. FENCING: journal grants are strictly
+increasing and an opening fence is committed by CAS at the tip, so a fence above
+an epoch proves that lease can never append again.
+
+`CompleteCommand` therefore admits a strictly greater epoch on an `applying`
+record when the correlation is `committed` and the result it records is that
+correlated effect. The apply deadline takes no part in it: finishing a durable
+application is continuation, not a new claim, and `ClaimCommand` still refuses
+at or after the deadline. `RejectCommand` admits only a correlation that proves
+no effect committed, for EVERY caller and state — the claim holder standing on
+its own committed effect is refused exactly as a late reconciler is — and an
+expired `applying` record additionally needs a lease epoch above the claim's AND
+a journal fence above that same epoch. The correlation walks the session's
+stream from its first record on every rejection; that cost is deliberate and
+unconditional, because a check the slow path performs and the fast path skips is
+how a committed effect gets overwritten.
+
+That closes the head-of-line hazard the previous section used to leave open: an
+expired `applying` record was settleable by nobody, forever, and is now settled
+by the next lease holder — whose own `OpenJournal` writes the fence that makes
+its evidence conclusive, so the row clears when the session is next attached.
+Two sources of unactionable due rows remain and a due-command reader should size
+its examined-versus-returned signal for both: a live claim outliving the
+deadline, bounded by `MaxCommandClaimTTL`, and an `unresolved` correlation —
+the crash window between a prefix and its effect — bounded by re-attachment.
 
 A command's due state is derived from the record rather than from the operation
 writing it. A non-terminal command is due at the earliest instant something must

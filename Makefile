@@ -99,6 +99,15 @@ FUZZLOGS ?= .fuzzlogs
 # believed. Every artifact the run wrote is examined, not the first: a second
 # one left behind poisons the corpus just as well.
 #
+# The replay is bounded and its stdin is closed, and neither is cosmetic. The
+# loop reads the artifact list on the shell's stdin, so a replay that read
+# os.Stdin would consume the remaining entries and examine ONE artifact instead
+# of all of them — silently reinstating the head -1 bug that was removed here,
+# presenting as artifacts going unexamined rather than as an error. No test in
+# this package reads stdin today; </dev/null is what keeps that from mattering.
+# The timeout is the same shape of bound: without one, a hanging input costs the
+# 10-minute default inside a stage that has already spent its fuzztime.
+#
 # ONE branch retries, and the split is exactly "premise proven" against "premise
 # assumed". A failure that wrote NO artifact and printed a worker-death message
 # is a case where nothing was attributed to an input — an input-attributed
@@ -136,7 +145,7 @@ fuzz:
 				examined=1; \
 				name="$$(basename "$$artifact")"; \
 				replay="$(FUZZLOGS)/$$target.$$name.replay.log"; \
-				if ! GOWORK=off go test -run "^$$target$$/^$$name$$" -count=5 -v . >"$$replay" 2>&1; then \
+				if ! GOWORK=off go test -run "^$$target$$/^$$name$$" -count=5 -timeout 60s -v . >"$$replay" 2>&1 </dev/null; then \
 					echo "--- REPRODUCER: $$artifact REPLAYS AS A FAILURE (replay in $$replay)."; \
 					echo "--- this is a finding whatever the run printed. Commit it and fix the target."; \
 				elif ! grep -q -- "--- PASS: $$target/$$name" "$$replay"; then \

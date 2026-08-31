@@ -368,6 +368,18 @@ func journalErr(code JournalErrorCode, field string, cause error) error {
 //   - State — the record is in a state this transition has no edge out of, and
 //     the caller had a current revision when it asked. It is a caller mistake
 //     about the machine rather than a race.
+//   - Evidence — the journal does not support the settlement asked for, and
+//     Field says which question it failed. "application" means the correlation
+//     did not establish that no effect committed — either one did, or the
+//     evidence is not readable — so the command must be finished or left alone
+//     rather than rejected. "result" means a recovering successor named a
+//     terminal result that is not the effect its prefix is correlated with.
+//     "applying_lease" means the lease holding the record's claim is not yet
+//     provably fenced out of the journal, so it could still commit the effect
+//     this settlement would orphan. None of the three is a race and none is
+//     answered by retrying the same call unchanged: the first two are permanent
+//     for the journal as it stands, and the third becomes settleable only once
+//     a later lease has opened the stream.
 //   - Terminal — the command's outcome is already settled. It is separate from
 //     State because it is the one state failure that is PERMANENT and that
 //     carries an answer: a caller meeting it should read the record and report
@@ -386,6 +398,7 @@ const (
 	InboxErrorClaimLost       InboxErrorCode = "claim_lost"
 	InboxErrorDeadline        InboxErrorCode = "deadline"
 	InboxErrorState           InboxErrorCode = "state"
+	InboxErrorEvidence        InboxErrorCode = "evidence"
 	InboxErrorTerminal        InboxErrorCode = "terminal"
 	InboxErrorUnknown         InboxErrorCode = "unknown"
 	InboxErrorBackend         InboxErrorCode = "backend"

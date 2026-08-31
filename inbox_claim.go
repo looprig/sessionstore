@@ -357,10 +357,24 @@ func (s *Store) BeginApplyingCommand(ctx context.Context, req BeginApplyingComma
 // contrast, DECIDES something that has not happened, so it keeps the live-claim
 // requirement.
 //
-// A successor lease finishing an application it did not start is the other half
-// of this, and it is not here: it turns on the correlated application prefix
-// this file does not read, so a greater epoch is refused as a lost claim rather
-// than admitted on state alone.
+// A SUCCESSOR LEASE finishing an application it did not start is the other half
+// of this, and it arrives with inbox_recovery.go. It is admitted on durable
+// evidence and on nothing else: a strictly greater epoch may complete an
+// applying command only when the journal carries a prefix correlated with the
+// record's own two identities AND the public event that carried its effect, and
+// only when the result it records is that effect. Everything the same-epoch
+// path takes on the caller's word — that an effect exists, and which event it
+// is — the successor has to have read out of the stream.
+//
+// The apply deadline takes no part in it. Finishing an application that is
+// already durable is CONTINUATION of work that started before the deadline, not
+// a new claim, and refusing to record it would leave a command whose effect is
+// visible to a client sitting unfinished forever. The no-new-claim-after-
+// deadline rule is unaffected, because a claim is a different operation and
+// still refuses.
+//
+// The claim is preserved unchanged, including its epoch, so the record keeps
+// naming the lease that APPLIED the command rather than the one that noticed.
 func (s *Store) CompleteCommand(ctx context.Context, req CompleteCommandRequest) (InboxEntry, error) {
 	scope, _, err := s.beginInboxTransition(req.TenantID, req.SessionID, req.CommandID, req.ExpectedRevision, req.LeaseEpoch, true)
 	if err != nil {
@@ -385,8 +399,21 @@ func (s *Store) CompleteCommand(ctx context.Context, req CompleteCommandRequest)
 	if current.Record.State != InboxStateApplying {
 		return InboxEntry{}, inboxErr(InboxErrorState, "state", nil)
 	}
-	if err := commandClaimFence(current.Record, req.LeaseEpoch); err != nil {
+	// The fence runs before the split for the reason commandClaimFence states:
+	// a caller below the high-water mark is superseded permanently and must
+	// learn that, rather than be sent to look for evidence under a lease that
+	// no longer exists.
+	if err := commandEpochFence(current.Record, req.LeaseEpoch); err != nil {
 		return InboxEntry{}, err
+	}
+	if req.LeaseEpoch != current.Record.Claim.LeaseEpoch {
+		application, err := s.scanCommandApplication(opCtx, scope, current.Record)
+		if err != nil {
+			return InboxEntry{}, err
+		}
+		if !application.namesEffect(req.Result) {
+			return InboxEntry{}, inboxErr(InboxErrorEvidence, "result", nil)
+		}
 	}
 	// The claim that applied the command is kept: it is the durable record of
 	// which lease did so, and validateInboxState requires an applied command to
@@ -407,35 +434,51 @@ func (s *Store) CompleteCommand(ctx context.Context, req CompleteCommandRequest)
 //     names one it is still held to the record's high-water mark, because a
 //     caller that asserts an epoch is asserting a view of the session that may
 //     be stale.
+//   - A SUCCESSOR LEASE may settle an applying command its predecessor
+//     abandoned. That one is recovery rather than reconciliation and is
+//     described below.
 //
 // An unexpired claim therefore wins the deadline race outright: while the claim
 // is live the only caller who may reject is its holder, whatever the clock says.
 // So does an applying record, which additionally cannot be reclaimed at all, so
 // the two-step of superseding the claim and then rejecting is closed as well.
 //
-// An APPLYING record whose claim has lapsed is refused, and that refusal is the
-// one place this file is deliberately incomplete: whether such a command should
-// be finished or rejected depends on whether its application prefix committed,
-// which is evidence this file does not read. Rejecting it on state alone could
-// overwrite a command whose effect is already in the journal — the exact
-// overwrite the terminal states exist to prevent — so it fails closed here and
-// waits for the reader that can tell the two apart.
+// EVERY caller is additionally held to the journal, and that check is not the
+// reconciler's alone: rejection is admitted only when the correlation
+// establishes that NO EFFECT COMMITTED under this command. A rejection written
+// over a durable effect is the exact overwrite the terminal states exist to
+// prevent, and the claim holder standing on its own committed effect can commit
+// it as easily as a late reconciler — so the rule is a property of the record's
+// journal rather than of who is asking. Its cost is a walk of the session's
+// stream on every rejection, paid deliberately: see inbox_recovery.go on why it
+// is unconditional.
 //
-// CARRY-FORWARD CONTRACT for whoever adds that reader: AN EXPIRED APPLYING
-// COMMAND IS A HEAD-OF-LINE HAZARD IN THE DUE VIEW, not merely an unfinished
-// case. Such a record stays non-terminal, so it stays due, so it occupies a
-// place in every due page from its deadline onward, and nothing in this file can
-// settle it. One crashed applier therefore parks a row in the deadline view
-// permanently.
+// An APPLYING record whose claim has lapsed is the one settlement that needs an
+// authority as well as evidence, and it needs BOTH:
 //
-// It has a SECOND SOURCE, and a reader sizing that signal needs both. A live
-// claim also occupies a due place it cannot be settled from, for as long as it
-// lasts, and a claim may lapse after the apply deadline by design. That one is
-// bounded — MaxCommandClaimTTL is exactly the bound, and it exists for this —
-// so it is transient occupancy rather than permanent, but it is ordinary
-// operation rather than a crash: every command claimed close to its deadline
-// contributes. Expect a due page to contain rows that will clear on their own
-// and rows that never will, and do not size the signal for the crash case alone.
+//   - a lease epoch strictly above the one that took the claim, which is what
+//     makes this the next lease holder's move rather than an anonymous
+//     reconciler's, and
+//   - a journal fence above that same epoch, which is what proves the applier
+//     can no longer commit the effect this rejection would orphan. The epoch
+//     the caller names cannot prove it; only the fence can.
+//
+// The two arrive together in practice, because the fence is written by the
+// successor's own OpenJournal, which is what turns the head-of-line hazard this
+// file used to document into a bounded one: an expired applying record was
+// settleable by nobody, forever, and is now settled when the session is next
+// attached.
+//
+// The OTHER source of unactionable due rows is unchanged and a reader sizing
+// that signal still needs it. A live claim occupies a due place it cannot be
+// settled from for as long as it lasts, and a claim may lapse after the apply
+// deadline by design. That one is bounded — MaxCommandClaimTTL is exactly the
+// bound, and it exists for this — and it is ordinary operation rather than a
+// crash: every command claimed close to its deadline contributes. So does an
+// UNRESOLVED correlation, which is the crash window between a prefix and its
+// effect: bounded by the same re-attachment as above, but only by it. Expect a
+// due page to contain rows that will clear on their own and rows that need a
+// lease to appear before they can.
 //
 // Nothing is starved TODAY, because this package exposes no due command reader
 // for anything to be starved out of; the hazard arrives with the reader.
@@ -469,13 +512,31 @@ func (s *Store) RejectCommand(ctx context.Context, req RejectCommandRequest) (In
 			return InboxEntry{}, err
 		}
 	}
+	// recovering marks the one arm whose authority is not enough on its own.
+	// It is a local rather than a second reading of the state below, so the
+	// condition that admitted the caller and the condition that demands the
+	// fence cannot come apart.
+	recovering := false
 	switch {
 	case claimLive(current.Record, now):
 		if req.LeaseEpoch != current.Record.Claim.LeaseEpoch {
 			return InboxEntry{}, inboxErr(InboxErrorClaimHeld, "claim", nil)
 		}
 	case current.Record.State == InboxStateApplying:
-		return InboxEntry{}, inboxErr(InboxErrorClaimLost, "claim", nil)
+		if req.LeaseEpoch <= current.Record.Claim.LeaseEpoch {
+			return InboxEntry{}, inboxErr(InboxErrorClaimLost, "claim", nil)
+		}
+		recovering = true
+	}
+	application, err := s.scanCommandApplication(opCtx, scope, current.Record)
+	if err != nil {
+		return InboxEntry{}, err
+	}
+	if !application.provesNoEffect() {
+		return InboxEntry{}, inboxErr(InboxErrorEvidence, "application", nil)
+	}
+	if recovering && !application.fences(current.Record.Claim.LeaseEpoch) {
+		return InboxEntry{}, inboxErr(InboxErrorEvidence, "applying_lease", nil)
 	}
 	return s.commitInboxTransition(opCtx, scope, current,
 		inboxTransition{State: InboxStateRejected, Claim: current.Record.Claim, Rejection: &rejection})
@@ -660,14 +721,18 @@ func commandEpochFence(record InboxRecord, epoch uint64) error {
 // commandClaimFence admits a write that must come from the claim's OWNER: it
 // fences a superseded epoch and then refuses an epoch that is not the claim's.
 //
-// The ORDER is the contract, not an implementation detail, and it is why this is
-// a function rather than two lines written twice. A caller below the high-water
-// mark is superseded permanently and must learn that; a caller above it merely
-// has not claimed this command and may still claim it. Reporting the second
-// answer to a caller entitled to the first would send a dead lease back to try
-// again forever. The two callers — beginning an application and completing one —
-// are also exactly the pair a successor lease's recovery will have to change, so
-// the rule they share is stated where that change is made once.
+// The ORDER is the contract, not an implementation detail. A caller below the
+// high-water mark is superseded permanently and must learn that; a caller above
+// it merely has not claimed this command and may still claim it. Reporting the
+// second answer to a caller entitled to the first would send a dead lease back
+// to try again forever.
+//
+// It had two callers until recovery arrived, and now has one. Completing was
+// the other, and it no longer refuses a greater epoch outright: it fences the
+// superseded case with commandEpochFence — the same first half, in the same
+// order — and sends the greater one to the journal evidence instead. Beginning
+// an application keeps the whole rule, because starting one IS a claim on the
+// work and a lease that never claimed the command may not start it.
 func commandClaimFence(record InboxRecord, epoch uint64) error {
 	if err := commandEpochFence(record, epoch); err != nil {
 		return err
