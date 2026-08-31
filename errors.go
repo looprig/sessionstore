@@ -320,9 +320,10 @@ func journalErr(code JournalErrorCode, field string, cause error) error {
 // The tie goes to the catalog's meaning because of what this record IS: an
 // OrderedIndex row has a Revision, so the command transition machine will
 // compare-and-swap it and will need a name for losing that race. The object
-// aggregate never will. InboxErrorConflict is therefore left undefined and
-// RESERVED for the revision-CAS meaning, and the caller-caused case takes a
-// name that cannot be mistaken for either neighbour.
+// aggregate never will. InboxErrorConflict therefore carries the catalog's
+// meaning exactly — a lost revision compare-and-swap, recoverable, reporting
+// the actual revision, inviting a re-read and a retry — and the caller-caused
+// content case takes a name that cannot be mistaken for either neighbour.
 //
 // Unknown means the mutation's outcome could not be resolved at all, so the
 // caller learns nothing about what is stored and must retry the same identity
@@ -331,13 +332,49 @@ func journalErr(code JournalErrorCode, field string, cause error) error {
 // Identity means a stored record disagreed with the identity it was filed
 // under or asked for. It is not a caller error and not a conflict: it means the
 // provider's answer cannot be trusted, and no retry of the caller's fixes it.
+//
+// The transition machine adds the rest, and each one names a DIFFERENT recovery
+// so that a caller can branch without reading prose:
+//
+//   - NotFound — no command has ever been admitted under that identity. The
+//     caller is asking about something it never accepted.
+//   - Conflict — the record moved under the caller. Re-read and decide again.
+//     Revision carries what the record is at now when the store could see it.
+//   - Epoch — the caller named a lease epoch BELOW the epoch the record's claim
+//     was taken under. That lease has provably been superseded and must not
+//     retry under the same epoch; Epoch carries the committed high-water mark,
+//     as CatalogErrorEpoch does.
+//   - ClaimHeld and ClaimLost — the pair the journal already spells for lease
+//     ownership, meaning the same two things here. Held: someone else holds a
+//     LIVE claim on this command, so back off and try after it expires. Lost:
+//     the caller does not hold the live claim the transition requires, either
+//     because it never claimed or because its claim expired; it must claim
+//     again, which the apply deadline may no longer permit.
+//   - Deadline — a NEW claim was attempted at or after the command's apply
+//     deadline. No retry helps: the command is now the deadline reconciler's,
+//     and the caller learns its answer by reading the terminal record.
+//   - State — the record is in a state this transition has no edge out of, and
+//     the caller had a current revision when it asked. It is a caller mistake
+//     about the machine rather than a race.
+//   - Terminal — the command's outcome is already settled. It is separate from
+//     State because it is the one state failure that is PERMANENT and that
+//     carries an answer: a caller meeting it should read the record and report
+//     the outcome rather than re-deciding anything.
 type InboxErrorCode string
 
 const (
 	InboxErrorInvalid         InboxErrorCode = "invalid"
 	InboxErrorCommandMismatch InboxErrorCode = "command_mismatch"
+	InboxErrorNotFound        InboxErrorCode = "not_found"
 	InboxErrorDeleted         InboxErrorCode = "deleted"
 	InboxErrorIdentity        InboxErrorCode = "identity"
+	InboxErrorConflict        InboxErrorCode = "conflict"
+	InboxErrorEpoch           InboxErrorCode = "epoch"
+	InboxErrorClaimHeld       InboxErrorCode = "claim_held"
+	InboxErrorClaimLost       InboxErrorCode = "claim_lost"
+	InboxErrorDeadline        InboxErrorCode = "deadline"
+	InboxErrorState           InboxErrorCode = "state"
+	InboxErrorTerminal        InboxErrorCode = "terminal"
 	InboxErrorUnknown         InboxErrorCode = "unknown"
 	InboxErrorBackend         InboxErrorCode = "backend"
 	InboxErrorMalformed       InboxErrorCode = "malformed"
@@ -348,10 +385,16 @@ const (
 // InboxError is a typed, redacted command failure. Field names the offending
 // input or stage and never carries a provider name, a key, or any part of the
 // command's private payload.
+//
+// Epoch is populated only for InboxErrorEpoch and Revision only for
+// InboxErrorConflict, each carrying the value that is itself the answer, as
+// CatalogError does for the same two codes.
 type InboxError struct {
-	Code  InboxErrorCode
-	Field string
-	Cause error
+	Code     InboxErrorCode
+	Field    string
+	Epoch    uint64
+	Revision uint64
+	Cause    error
 }
 
 func (e *InboxError) Error() string {

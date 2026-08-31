@@ -245,9 +245,9 @@ deadline is validated as an instant and nothing more.
 `InboxErrorCommandMismatch` is deliberately not called `InboxErrorConflict`. This package spells
 "conflict" two ways already — `CatalogErrorConflict` is a lost revision CAS
 (recoverable, retry after a re-read) and `ObjectErrorConflict` is a key holding
-different content — so the spelling is reserved for the revision-CAS meaning
-the command transition machine will need when it compare-and-swaps this record,
-and the caller-caused case takes a name that cannot be mistaken for either.
+different content — so the spelling is kept for the revision-CAS meaning the
+command transition machine uses when it compare-and-swaps this record, and the
+caller-caused case takes a name that cannot be mistaken for either.
 
 `InboxEntry.AcceptedOrder` is the provider's immutable acceptance order, and it
 is exposed here where `CatalogEntry`'s deliberately is not: consumers sort a
@@ -271,11 +271,57 @@ never be reused, so a tombstone is a permanent answer to any caller still
 retrying it. Whoever adds retention or compaction must bound terminal-command
 retention below by the client retry window.
 
-The record carries the members the command lifecycle needs — state, claim epoch
-and expiry, terminal result, and a typed `sessionwire/v1.ErrorDetail` rejection
-— but this package does not yet move a command out of `pending`. The
-`pending -> claimed -> applying -> applied | rejected` machine, the journal
-application-prefix correlation, and the deadline reconciler are later tasks. A
-command's due state is derived from the record rather than from the operation
-writing it: non-terminal commands are due at their apply deadline, terminal ones
-are not due at all and stay directly readable by their stable key.
+## Command transitions: one read, one revision CAS
+
+`ClaimCommand`, `BeginApplyingCommand`, `CompleteCommand` and `RejectCommand`
+drive `pending -> claimed(epoch, expiry) -> applying(epoch, expiry) -> applied |
+rejected`, and `GetCommand` reads the record a caller re-decides against. Each
+transition is one `Get` and one `Update` of the same authoritative record at the
+revision the caller named, and it touches no other aggregate.
+
+The epoch on a claim is the SESSION LEASE epoch the claimer acts under, not a
+number this aggregate allocates, which is what makes it meaningful to a Host and
+to a Factory replica reconciling the same command. An epoch BELOW the record's
+claim epoch is refused as `InboxErrorEpoch` carrying the high-water mark, which
+is `hostEpochFence`'s rule deliberately. Where the two fences differ is the
+equal case: the catalog fences a record one lease owns, so one grant writing
+many times is normal, while a claim fences a work item two writers under one
+epoch may both reach for and the record carries no claimant identity to tell
+them apart. So an equal epoch may not take a LIVE claim, only a lapsed one, and
+a strictly greater epoch may take either — its predecessor is provably fenced
+out of the journal, and stalling every claimed command for a claim TTL on every
+failover buys nothing.
+
+`applying` may be entered only by the holder of a live claim, and it has no
+deadline check: an unexpired claim wins the deadline race, which is what stops a
+reconciler's clock from cancelling work about to commit. `CompleteCommand`
+requires the claim's epoch but NOT a live claim, because it records an effect
+that is already in the journal and refusing it would strand a committed
+application behind a lapsed TTL. `RejectCommand` keeps the live-claim
+requirement, because it decides something that has not happened; its lease epoch
+is optional, and a caller that names none is the deadline reconciler, which may
+settle a `pending` or lapsed-`claimed` command and nothing else.
+
+An `applying` record whose claim has lapsed is refused every transition here.
+Resuming one is continuation of an existing application rather than a new claim,
+it turns on the correlated journal application prefix this package does not yet
+read, and rejecting it on state alone could overwrite a command whose effect had
+already committed.
+
+A command's due state is derived from the record rather than from the operation
+writing it. A non-terminal command is due at the earliest instant something must
+look at it again — its apply deadline, or a claim expiry that lapses first, so a
+crashed writer costs the command a claim TTL rather than a rejection at its
+deadline — bounded above by the deadline, so the reconciler's page can never
+miss a command whose deadline has passed. A terminal command is not due at all
+and stays directly readable by its stable key. `validateInboxState` states, on
+the record, which members each state must and must not carry, which is what makes
+`applied` and `rejected` structurally exclusive rather than merely sequenced.
+
+`InboxEntry.CommandStatus` projects the durable record onto core's public
+`CommandStatus`. The five durable states map onto four public ones by treating
+an UNCLAIMED `pending` command as `accepted` — core's own definition, "the inbox
+commit succeeded", is exactly what this store knows about a command nobody has
+picked up — and `claimed`/`applying` as `pending`. Claim liveness deliberately
+does not enter into it: a public caller cannot act on it, and it changes with a
+clock rather than with the command.

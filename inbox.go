@@ -17,11 +17,12 @@ import (
 // A command becomes durable exactly once, under an identity the client chose,
 // with an acceptance order the provider allocated and an apply deadline filed
 // as the record's due state. What happens to it afterwards — the
-// pending/claimed/applying/applied/rejected transitions, the correlation of a
-// journal application prefix, the deadline reconciler — belongs to later tasks.
-// The record declares those members because they are part of one authoritative
-// record and a reader here must be able to decode a record a later writer
-// produced; this file never moves a command out of pending.
+// pending/claimed/applying/applied/rejected transitions — is inbox_claim.go,
+// and the correlation of a journal application prefix and the recovery of an
+// expired application belong to a later task. The record declares those members
+// because they are part of one authoritative record and a reader here must be
+// able to decode a record a later writer produced; this file never moves a
+// command out of pending.
 //
 // Why the inbox is its own aggregate rather than catalog state
 //
@@ -102,11 +103,11 @@ type CommandKind string
 
 // InboxState is the durable processing state of one accepted command.
 //
-// The transitions between them — including which writer may make each one,
-// what a claim epoch fences, and what a terminal CAS must set — are NOT
-// implemented in this file. Admission produces InboxStatePending and never
-// anything else; the other states are declared because one authoritative record
-// carries them and a reader here must decode a record a later writer produced.
+// The transitions between them — including which writer may make each one, what
+// a claim epoch fences, and what a terminal CAS must set — are inbox_claim.go's.
+// Admission produces InboxStatePending and never anything else. What each state
+// must and must not carry is validateInboxState, below, because that is a
+// property of the stored record rather than of the operation that wrote it.
 type InboxState string
 
 const (
@@ -391,10 +392,31 @@ func inboxID(scope sessionScope, command sessionwire.CommandID) storage.OrderedI
 // inboxDue is the single definition of a command record's due state, and it is
 // a function of the RECORD rather than of the operation writing it.
 //
-// A non-terminal command is due at its apply deadline, so it participates in
-// the deadline view a reconciler pages through. A terminal command is not due
-// at all: its outcome is settled, it must not be reconciled again, and it
-// remains directly readable by its stable key regardless.
+// A non-terminal command is due at the EARLIEST instant at which something has
+// to look at it again, so it participates in the deadline view a reconciler
+// pages through. That instant is its apply deadline, or its claim expiry when a
+// claim is due to lapse first. A terminal command is not due at all: its
+// outcome is settled, it must not be reconciled again, and it remains directly
+// readable by its stable key regardless.
+//
+// The claim expiry is folded in rather than filed beside the deadline because
+// of what the alternative costs over time. A command claimed by a Host that
+// then crashes is abandoned the moment its claim lapses, but if the record
+// stays due only at its apply deadline nothing looks at it until then — and
+// what looks at it then is the deadline reconciler, whose only move is to
+// REJECT it. One crashed Host would therefore turn every command it had claimed
+// into a rejection, when there was a whole reclaim window in which another Host
+// could have finished the work. Deriving the horizon here makes the abandoned
+// claim visible at the instant it lapses, and any reader can still rebuild the
+// due state from the record's bytes alone, which is what inboxEntryFor demands.
+//
+// The apply deadline remains an UPPER BOUND on the derived instant, and that is
+// load-bearing rather than incidental: a claim expiring after the deadline
+// would make the record due only after the deadline had passed, so the
+// reconciler paging "everything due by now" would not see a command whose
+// deadline had already expired. A claim may legitimately outlive the deadline —
+// that is what lets an unexpired claim win the deadline race — but it may never
+// hide the command from the page that settles it.
 //
 // CARRY-FORWARD CONTRACT for whoever adds retention or compaction: TERMINAL
 // COMMAND RETENTION MUST BE BOUNDED BELOW BY THE CLIENT RETRY WINDOW. A
@@ -431,7 +453,11 @@ func inboxDue(record InboxRecord) storage.Due {
 	if record.State.terminal() {
 		return storage.Due{}
 	}
-	return storage.Due{State: storage.DueAt, UnixMillis: record.ApplyDeadline.UnixMilli()}
+	horizon := record.ApplyDeadline
+	if !record.Claim.isZero() && record.Claim.ExpiresAt.Before(horizon) {
+		horizon = record.Claim.ExpiresAt
+	}
+	return storage.Due{State: storage.DueAt, UnixMillis: horizon.UnixMilli()}
 }
 
 // inboxEntryFor decodes one stored command record and holds every
@@ -517,15 +543,42 @@ func inboxEntryFor(
 // classifyInboxOrderedError maps an OrderedIndex outcome into the inbox
 // vocabulary while preserving the cause for errors.Is and errors.As.
 //
-// It has two arms because admission makes one call. Create's contract accounts
-// for the rest: an identity that already exists — including as a tombstone —
-// is returned as a RECORD rather than as an error, which is why the deleted
-// classification lives in inboxEntryFor and not here; a not-found, a revision
-// conflict, a cursor failure, and a limit failure cannot arise from Create at
-// all; and an oversized value is refused by encodeInboxRecord before the
-// provider can see it, which the unsigned constant above pins. A later task
-// that adds an Update path extends this with the arms that path can produce.
+// The arms and their origins:
+//
+//   - NotFound arises from a Get of a command that was never admitted, and from
+//     an Update only if a provider forgot a row between this package's read and
+//     its compare-and-swap. It is mapped rather than left to fall through to
+//     Backend because "there is no such command" is a different answer from
+//     "the provider is unwell", whichever call produced it.
+//   - Deleted arises from an Update against a tombstone. It cannot arise from
+//     Get or Create, both of which return a tombstone as a RECORD, which is why
+//     inboxEntryFor also classifies one.
+//   - Conflict arises from an Update whose expected revision is stale. The
+//     provider's actual revision is carried through when it disclosed one; it
+//     is documented as possibly zero, and a zero there simply means the store
+//     cannot tell the caller what to re-read to.
+//   - Unknown is an ambiguous mutation, the one outcome that says nothing at
+//     all about what is stored.
+//
+// A cursor failure and a limit failure still have no arm: this file issues no
+// listing. An oversized value is refused by encodeInboxRecord before the
+// provider can see it, which the unsigned constant above pins. A revision
+// exhaustion falls through to Backend deliberately — it is a provider that can
+// no longer accept writes to this record at all, which is not something a
+// caller can act on differently from any other provider failure.
 func classifyInboxOrderedError(err error, field string) error {
+	var notFound *storage.OrderedRecordNotFoundError
+	if errors.As(err, &notFound) {
+		return inboxErr(InboxErrorNotFound, field, err)
+	}
+	var deleted *storage.OrderedDeletedError
+	if errors.As(err, &deleted) {
+		return inboxErr(InboxErrorDeleted, field, err)
+	}
+	var conflict *storage.OrderedRevisionConflictError
+	if errors.As(err, &conflict) {
+		return &InboxError{Code: InboxErrorConflict, Field: field, Revision: conflict.ActualRevision, Cause: err}
+	}
 	var ambiguous *storage.OrderedAmbiguousError
 	if errors.As(err, &ambiguous) {
 		return inboxErr(InboxErrorUnknown, field, err)
@@ -670,11 +723,15 @@ func decodeInboxRecord(value []byte) (InboxRecord, error) {
 // Encoding and decoding both end here, so a record read back is byte-identical
 // to the record written and two encoders cannot disagree.
 //
-// It validates each member's own well-formedness and deliberately does NOT
-// enforce coherence BETWEEN State and the claim, result, and rejection members.
-// Which state may carry which of them is the transition machine's rule, and it
-// is stated where the transitions are made rather than half-stated here, where
-// it could only be a guess about what a later writer is allowed to store.
+// It validates each member's own well-formedness and, through validateInboxState,
+// the coherence BETWEEN State and the claim, result, and rejection members.
+// Admission deferred that coherence because which state may carry which member
+// is the transition machine's rule and there was no machine yet to state it;
+// inbox_claim.go now defines the machine, so the rule is stated here — once, on
+// the record — rather than at each transition. That placement is what makes it
+// apply to a record arriving from BYTES as well as from a transition: a stored
+// row that is both applied and rejected fails closed on the read that meets it
+// instead of being handed to a caller as an outcome.
 func canonicalInboxRecord(record InboxRecord) (InboxRecord, error) {
 	if err := record.TenantID.Validate(); err != nil {
 		return InboxRecord{}, inboxErr(InboxErrorInvalid, "tenant_id", err)
@@ -712,35 +769,17 @@ func canonicalInboxRecord(record InboxRecord) (InboxRecord, error) {
 	if !rankableTime(record.ApplyDeadline) {
 		return InboxRecord{}, inboxErr(InboxErrorInvalid, "apply_deadline", nil)
 	}
-	switch record.State {
-	case InboxStatePending, InboxStateClaimed, InboxStateApplying, InboxStateApplied, InboxStateRejected:
-	default:
-		return InboxRecord{}, inboxErr(InboxErrorInvalid, "state", nil)
+	if err := validateCommandClaim(record.Claim); err != nil {
+		return InboxRecord{}, err
 	}
-	if !record.Claim.isZero() {
-		if record.Claim.LeaseEpoch == 0 || !rankableTime(record.Claim.ExpiresAt) {
-			return InboxRecord{}, inboxErr(InboxErrorInvalid, "claim", nil)
-		}
+	if err := validateCommandResult(record.Result); err != nil {
+		return InboxRecord{}, err
 	}
-	if !record.Result.isZero() {
-		if err := record.Result.EventID.Validate(); err != nil {
-			return InboxRecord{}, inboxErr(InboxErrorInvalid, "result", err)
-		}
-		if record.Result.JournalSeq == 0 || !rankableTime(record.Result.CompletedAt) {
-			return InboxRecord{}, inboxErr(InboxErrorInvalid, "result", nil)
-		}
+	if err := validateCommandRejection(record.Rejection); err != nil {
+		return InboxRecord{}, err
 	}
-	if record.Rejection != nil {
-		if err := record.Rejection.Validate(); err != nil {
-			return InboxRecord{}, inboxErr(InboxErrorInvalid, "rejection", err)
-		}
-		// The rejection is a nested sessionwire projection carrying caller
-		// text, so it goes through the reflective walk rather than an
-		// enumeration of its members: core may add one, and an enumeration
-		// here would silently stop covering it the day it does.
-		if err := validateProjectionText(reflect.ValueOf(*record.Rejection), "rejection", inboxInvalid); err != nil {
-			return InboxRecord{}, err
-		}
+	if err := validateInboxState(record); err != nil {
+		return InboxRecord{}, err
 	}
 
 	// One spelling for "no inline body". This is a NORMALIZATION, not a guard:
@@ -755,4 +794,114 @@ func canonicalInboxRecord(record InboxRecord) (InboxRecord, error) {
 	record.Claim.ExpiresAt = record.Claim.ExpiresAt.UTC()
 	record.Result.CompletedAt = record.Result.CompletedAt.UTC()
 	return record, nil
+}
+
+// validateCommandClaim, validateCommandResult, and validateCommandRejection are
+// the well-formedness rules for the three optional members a transition writes.
+//
+// They are functions rather than inline arms of canonicalInboxRecord because
+// each has two callers: the record canonicalizer, which sees them on the way to
+// and from the stored bytes, and the transition request that supplies one,
+// which must refuse a caller's malformed member BEFORE the store admits the
+// operation. Stating the rule twice is what would let the up-front refusal and
+// the durable rule drift apart; this is the shape OpenGate already uses when it
+// validates a caller's gate through the record's own canonicalizer.
+func validateCommandClaim(claim CommandClaim) error {
+	if claim.isZero() {
+		return nil
+	}
+	if claim.LeaseEpoch == 0 || !rankableTime(claim.ExpiresAt) {
+		return inboxErr(InboxErrorInvalid, "claim", nil)
+	}
+	return nil
+}
+
+func validateCommandResult(result CommandResult) error {
+	if result.isZero() {
+		return nil
+	}
+	if err := result.EventID.Validate(); err != nil {
+		return inboxErr(InboxErrorInvalid, "result", err)
+	}
+	if result.JournalSeq == 0 || !rankableTime(result.CompletedAt) {
+		return inboxErr(InboxErrorInvalid, "result", nil)
+	}
+	return nil
+}
+
+func validateCommandRejection(rejection *sessionwire.ErrorDetail) error {
+	if rejection == nil {
+		return nil
+	}
+	if err := rejection.Validate(); err != nil {
+		return inboxErr(InboxErrorInvalid, "rejection", err)
+	}
+	// The rejection is a nested sessionwire projection carrying caller text, so
+	// it goes through the reflective walk rather than an enumeration of its
+	// members: core may add one, and an enumeration here would silently stop
+	// covering it the day it does.
+	return validateProjectionText(reflect.ValueOf(*rejection), "rejection", inboxInvalid)
+}
+
+// validateInboxState enumerates the durable states and states, for each one,
+// which of the three optional members a record in it must and must not carry.
+// It is the durable half of the machine inbox_claim.go drives: the transitions
+// decide who may move a command, this decides what a command in each state IS.
+//
+// The rules follow from the machine's edges. A pending command has never been
+// claimed. A claimed or applying command is held by exactly one claim and has
+// no outcome yet. An applied command reached its outcome THROUGH a claim, so it
+// keeps the claim that applied it as the durable record of which lease did so.
+// A rejected command may or may not have been claimed — the deadline reconciler
+// rejects commands that never were — so its claim is optional.
+//
+// APPLIED AND REJECTED ARE MUTUALLY EXCLUSIVE, and this is where that is made
+// structural rather than merely sequenced: applied requires a result and forbids
+// a rejection, rejected requires a rejection and forbids a result. A record
+// carrying both is not a record this package will encode, decode, or return,
+// whichever writer produced it and however it came to disagree with itself.
+func validateInboxState(record InboxRecord) error {
+	claimed := !record.Claim.isZero()
+	applied := !record.Result.isZero()
+	rejected := record.Rejection != nil
+	switch record.State {
+	case InboxStatePending:
+		if claimed {
+			return inboxErr(InboxErrorInvalid, "claim", nil)
+		}
+	case InboxStateClaimed, InboxStateApplying:
+		if !claimed {
+			return inboxErr(InboxErrorInvalid, "claim", nil)
+		}
+	case InboxStateApplied:
+		if !claimed {
+			return inboxErr(InboxErrorInvalid, "claim", nil)
+		}
+		if !applied {
+			return inboxErr(InboxErrorInvalid, "result", nil)
+		}
+		if rejected {
+			return inboxErr(InboxErrorInvalid, "rejection", nil)
+		}
+		return nil
+	case InboxStateRejected:
+		if !rejected {
+			return inboxErr(InboxErrorInvalid, "rejection", nil)
+		}
+		if applied {
+			return inboxErr(InboxErrorInvalid, "result", nil)
+		}
+		return nil
+	default:
+		return inboxErr(InboxErrorInvalid, "state", nil)
+	}
+	// Every non-terminal state shares one rule: an outcome belongs to a
+	// terminal record, so a command still in flight carries neither.
+	if applied {
+		return inboxErr(InboxErrorInvalid, "result", nil)
+	}
+	if rejected {
+		return inboxErr(InboxErrorInvalid, "rejection", nil)
+	}
+	return nil
 }

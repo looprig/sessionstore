@@ -5,9 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"strings"
 	"sync"
 	"testing"
@@ -474,7 +471,12 @@ func TestInboxRecordAtItsPayloadCeilingEncodes(t *testing.T) {
 func TestInboxRecordRefusesARecordAboveTheStoredBound(t *testing.T) {
 	t.Parallel()
 
+	// A rejected record rather than the applied fixture: a rejection reason is
+	// the one member large enough to overrun the bound on its own, and
+	// validateInboxState refuses an applied record that also carries one.
 	record := testInboxRecord()
+	record.State = InboxStateRejected
+	record.Result = CommandResult{}
 	record.Rejection = &sessionwire.ErrorDetail{
 		Code:    sessionwire.ErrorCodeCommandRejected,
 		Message: strings.Repeat("m", MaxInboxRecordBytes),
@@ -745,6 +747,7 @@ func TestAdmitCommandDuplicateSucceedsAfterTheCommandProgressed(t *testing.T) {
 	}
 	applied := first.Record
 	applied.State = InboxStateApplied
+	applied.Claim = CommandClaim{LeaseEpoch: 4, ExpiresAt: inboxDeadline}
 	applied.Result = CommandResult{CompletedAt: inboxAcceptedAt, EventID: "event-9", JournalSeq: 9}
 	value, _, err := encodeInboxRecord(applied)
 	if err != nil {
@@ -1477,36 +1480,6 @@ func TestAdmitCommandClassifiesProviderFailures(t *testing.T) {
 
 var _ func(*Store, context.Context, AdmitCommandRequest) (InboxEntry, bool, error) = (*Store).AdmitCommand
 
-// declaredInboxOperations enumerates inbox.go's public Store operations from
-// the source, for the same reason declaredGateOperations does it for gates.go:
-// the file that declares an operation is the file the close test enumerates, so
-// a new one cannot be added without being exercised here.
-func declaredInboxOperations(t *testing.T) map[string]bool {
-	t.Helper()
-	file, err := parser.ParseFile(token.NewFileSet(), "inbox.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse inbox.go: %v", err)
-	}
-	operations := map[string]bool{}
-	for _, declaration := range file.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if !ok || function.Recv == nil || !function.Name.IsExported() {
-			continue
-		}
-		receiver, ok := function.Recv.List[0].Type.(*ast.StarExpr)
-		if !ok {
-			continue
-		}
-		if name, ok := receiver.X.(*ast.Ident); ok && name.Name == "Store" {
-			operations[function.Name.Name] = true
-		}
-	}
-	if len(operations) == 0 {
-		t.Fatal("no public Store operations were found in inbox.go; the enumerator is not reaching the declarations")
-	}
-	return operations
-}
-
 func TestInboxOperationsRefuseAfterClose(t *testing.T) {
 	store, err := Open(context.Background(), memstore.New())
 	if err != nil {
@@ -1524,7 +1497,7 @@ func TestInboxOperationsRefuseAfterClose(t *testing.T) {
 		},
 	}
 
-	declared := declaredInboxOperations(t)
+	declared := declaredStoreOperations(t, "inbox.go")
 	for name := range declared {
 		if operations[name] == nil {
 			t.Errorf("inbox.go declares the public operation %s and this test does not exercise it", name)

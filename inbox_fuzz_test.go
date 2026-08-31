@@ -52,6 +52,11 @@ func FuzzInboxRecordCodec(f *testing.F) {
 	referenced.Claim = CommandClaim{LeaseEpoch: 7, ExpiresAt: inboxDeadline}
 	f.Add(seed(referenced))
 
+	claimed := pending
+	claimed.State = InboxStateClaimed
+	claimed.Claim = CommandClaim{LeaseEpoch: 5, ExpiresAt: inboxAcceptedAt}
+	f.Add(seed(claimed))
+
 	rejected := pending
 	rejected.State = InboxStateRejected
 	rejected.Rejection = &sessionwire.ErrorDetail{
@@ -88,6 +93,31 @@ func FuzzInboxRecordCodec(f *testing.F) {
 		},
 		func(m map[string]json.RawMessage) { m["rejection"] = json.RawMessage(`{"code":"","message":"x"}`) },
 		func(m map[string]json.RawMessage) { m["payload_ref"] = json.RawMessage(`{"object_id":"object-a"}`) },
+		// The state/member coherence branches, each reached from a record that
+		// is otherwise a real applied encoding: a terminal record claiming both
+		// outcomes, and a state carrying a member it has no business holding.
+		func(m map[string]json.RawMessage) {
+			m["rejection"] = json.RawMessage(`{"code":"command_rejected","message":"no"}`)
+		},
+		func(m map[string]json.RawMessage) { m["state"] = json.RawMessage(`"pending"`) },
+		func(m map[string]json.RawMessage) { m["state"] = json.RawMessage(`"claimed"`) },
+		func(m map[string]json.RawMessage) {
+			m["state"] = json.RawMessage(`"claimed"`)
+			delete(m, "result")
+			m["rejection"] = json.RawMessage(`{"code":"command_rejected","message":"no"}`)
+		},
+		func(m map[string]json.RawMessage) {
+			m["state"] = json.RawMessage(`"claimed"`)
+			delete(m, "result")
+			delete(m, "claim")
+		},
+		func(m map[string]json.RawMessage) { m["state"] = json.RawMessage(`"rejected"`) },
+		func(m map[string]json.RawMessage) {
+			m["state"] = json.RawMessage(`"rejected"`)
+			m["rejection"] = json.RawMessage(`{"code":"command_rejected","message":"no"}`)
+		},
+		func(m map[string]json.RawMessage) { delete(m, "claim") },
+		func(m map[string]json.RawMessage) { delete(m, "result") },
 		func(m map[string]json.RawMessage) { m["apply_deadline"] = json.RawMessage(`"0000-01-01T00:00:00Z"`) },
 	} {
 		copied := make(map[string]json.RawMessage, len(members))
@@ -140,8 +170,20 @@ func FuzzInboxRecordCodec(f *testing.F) {
 			}
 			return
 		}
-		if due.State != storage.DueAt || due.UnixMillis != record.ApplyDeadline.UnixMilli() {
+		// The horizon is restated here rather than delegated to inboxDue,
+		// which would only assert that a function equals itself.
+		horizon := record.ApplyDeadline
+		if !record.Claim.isZero() && record.Claim.ExpiresAt.Before(horizon) {
+			horizon = record.Claim.ExpiresAt
+		}
+		if due.State != storage.DueAt || due.UnixMillis != horizon.UnixMilli() {
 			t.Fatalf("accepted a command with an underivable due state: %+v", due)
+		}
+		// The property the derivation exists to keep: whatever a claim says, a
+		// non-terminal command is due no later than the deadline that settles
+		// it, so the reconciler's page cannot miss it.
+		if due.UnixMillis > record.ApplyDeadline.UnixMilli() {
+			t.Fatalf("a non-terminal command is due at %d, after its own deadline %d", due.UnixMillis, record.ApplyDeadline.UnixMilli())
 		}
 	})
 }

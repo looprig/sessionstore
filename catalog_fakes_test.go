@@ -50,6 +50,15 @@ func (o *recordingOrdered) add(call orderedCall) {
 	o.calls = append(o.calls, call)
 }
 
+// reset forgets what has been recorded so far, so a test can build its fixture
+// through the real operations and still assert on the calls ONE later operation
+// makes rather than on the whole history.
+func (o *recordingOrdered) reset() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.calls = nil
+}
+
 func (o *recordingOrdered) snapshot() []orderedCall {
 	o.mu.Lock()
 	defer o.mu.Unlock()
