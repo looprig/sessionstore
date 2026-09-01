@@ -113,6 +113,33 @@ func TestProductionImportScanHonorsModuleOwnership(t *testing.T) {
 			t.Errorf("violations = %q, want a violation for %s", violations, suffix)
 		}
 	}
+	// The scan is driven a SECOND time at a RELATIVE root, and the two answers
+	// must agree. This is the shape that hid a defect for a whole task: the live
+	// guard passes ".", modfiles.Files returns ABSOLUTE paths, and the only
+	// exercise of the root-relative classification was this fixture — rooted at
+	// an already-absolute t.TempDir(), the one shape the live call never uses.
+	// Every real internal/testkit file was consequently scanned as production
+	// while this test passed.
+	working, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("working directory: %v", err)
+	}
+	relativeRoot, err := filepath.Rel(working, root)
+	if err != nil {
+		t.Fatalf("relative root: %v", err)
+	}
+	if filepath.IsAbs(relativeRoot) {
+		t.Fatalf("relative root %q is absolute, so this case would only repeat the absolute one", relativeRoot)
+	}
+	relativeFiles, relativeViolations, err := productionImportViolations(relativeRoot)
+	if err != nil {
+		t.Fatalf("productionImportViolations(%q): %v", relativeRoot, err)
+	}
+	if relativeFiles != productionFiles || !slices.Equal(relativeViolations, violations) {
+		t.Fatalf("relative root reported %d files %q; absolute root reported %d files %q. The scan's answer must not depend on how its root is spelled",
+			relativeFiles, relativeViolations, productionFiles, violations)
+	}
+
 	for _, allowed := range []struct{ file, why string }{
 		{filepath.Join("internal", "testkit", "allowed.go"), "storage/memstore must be allowed in internal/testkit"},
 		{filepath.Join("internal", "testkit", "sibling.go"), "a testkit file must be allowed to import a sibling testkit package"},
@@ -122,6 +149,54 @@ func TestProductionImportScanHonorsModuleOwnership(t *testing.T) {
 		}) {
 			t.Fatalf("violations = %q, %s", violations, allowed.why)
 		}
+	}
+}
+
+// TestInternalTestSupportClassificationHoldsAtTheLiveRoot drives the ROOT SHAPE
+// the live guard actually passes, which is the whole reason it exists.
+//
+// isInternalTestSupport compared modfiles.Files' absolute paths against the
+// caller's root, and TestProductionImportsStayWithinBoundary passes ".". Rel
+// errors on that pair, the classifier answered false, and every real
+// internal/testkit file was scanned under the production rule — which forbids
+// storage/memstore, the one import the boundary explicitly grants test support.
+// Fail-closed, so nothing unsafe shipped; but the first person to add the
+// package would have been told the mandated arrangement was a breach.
+//
+// The PREMISE that broke is asserted here rather than assumed: that the live
+// enumerator returns absolute paths for a relative root. A guard about a
+// subject that does not exist yet is probed by taking the subject's path shape
+// from the enumerator that will produce it, not by inventing one.
+func TestInternalTestSupportClassificationHoldsAtTheLiveRoot(t *testing.T) {
+	t.Parallel()
+
+	// Exactly what TestProductionImportsStayWithinBoundary passes.
+	const liveRoot = "."
+
+	files, err := modfiles.Files(liveRoot)
+	if err != nil {
+		t.Fatalf("modfiles.Files(%q): %v", liveRoot, err)
+	}
+	if len(files) == 0 {
+		t.Fatal("the live enumerator returned no files, so this test would be vacuous")
+	}
+	for _, path := range files {
+		if !filepath.IsAbs(path) {
+			t.Fatalf("modfiles.Files(%q) returned the relative path %q; the classification below rests on absolute ones", liveRoot, path)
+		}
+	}
+
+	root, err := filepath.Abs(liveRoot)
+	if err != nil {
+		t.Fatalf("absolute live root: %v", err)
+	}
+	testkit := filepath.Join(root, "internal", "testkit", "kit.go")
+	if !isInternalTestSupport(liveRoot, testkit) {
+		t.Fatalf("isInternalTestSupport(%q, %q) = false; a real test-support file would be scanned as production and the storage/memstore allowance would never apply",
+			liveRoot, testkit)
+	}
+	if isInternalTestSupport(liveRoot, filepath.Join(root, "inbox.go")) {
+		t.Fatalf("isInternalTestSupport(%q) classified a root production file as test support", liveRoot)
 	}
 }
 
@@ -251,8 +326,26 @@ func allowedTestSupportImport(importPath string) bool {
 	return allowedProductionImport(importPath)
 }
 
+// isInternalTestSupport reports whether path is one of the module's test-support
+// files, and it resolves the ROOT before comparing.
+//
+// That resolution is the whole of it. modfiles.Files calls filepath.Abs on its
+// root and returns ABSOLUTE paths, and the live guard passes ".", so Rel(".",
+// "/abs/…/internal/testkit/kit.go") ERRORS and this returned false. Every real
+// test-support file was therefore scanned under the production rule, and a
+// testkit file importing storage/memstore — which the boundary explicitly
+// permits — was reported as a forbidden production import.
+//
+// It went unnoticed because the only exercise of the classification was a
+// fixture rooted at t.TempDir(), which is already absolute, so Rel succeeded on
+// the one root shape the live guard never uses. The regression test drives ".";
+// see TestInternalTestSupportClassificationHoldsAtTheLiveRoot.
 func isInternalTestSupport(root, path string) bool {
-	relative, err := filepath.Rel(root, path)
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	relative, err := filepath.Rel(absoluteRoot, path)
 	if err != nil {
 		return false
 	}

@@ -1175,15 +1175,14 @@ func TestCursorScopeDomainsAreDistinct(t *testing.T) {
 			if !ok {
 				return true
 			}
-			if named, ok := composite.Type.(*ast.Ident); !ok || named.Name != "sweepCursorKind" {
-				return true
+			for _, literal := range sweepCursorLiteralsIn(composite) {
+				text, ok := unquote(name, sweepCursorLiteralField(t, name, literal, "domain", domainField))
+				if !ok {
+					t.Fatalf("%s declares a sweepCursorKind whose domain is not a string literal", name)
+				}
+				domains[text] = append(domains[text], name)
+				carried++
 			}
-			text, ok := unquote(name, sweepCursorLiteralField(t, name, composite, "domain", domainField))
-			if !ok {
-				t.Fatalf("%s declares a sweepCursorKind whose domain is not a string literal", name)
-			}
-			domains[text] = append(domains[text], name)
-			carried++
 			return true
 		})
 	}
@@ -2340,4 +2339,58 @@ func sweepCursorLiteralField(
 			filename, len(composite.Elts), field, index)
 	}
 	return composite.Elts[index]
+}
+
+// sweepCursorLiteralsIn returns the sweepCursorKind composite literals a node IS
+// or DIRECTLY CONTAINS, and it exists because "is one" was too narrow twice.
+//
+// A literal that names its type is the ordinary spelling. An ELEMENT literal
+// ELIDES it — `[]sweepCursorKind{{magic: "LRDG", ...}}`, and the map and array
+// forms alongside it, are legal Go whose CompositeLit.Type is nil — so matching
+// only on `composite.Type.(*ast.Ident)` skipped it SILENTLY rather than failing
+// closed, and a duplicate magic and a duplicate domain in that form both passed
+// their guards. The container's element type is what names it, so that is what
+// is read.
+//
+// An element that DOES name its own type is deliberately not collected here:
+// ast.Inspect reaches it on its own, and collecting it twice would report a
+// literal as colliding with itself.
+//
+// WHAT THIS STILL CANNOT SEE, named rather than left to be rediscovered: the
+// element type is resolved SYNTACTICALLY, so a container behind a named type or
+// an alias — `type cursorKinds []sweepCursorKind`, then `cursorKinds{{...}}` —
+// carries elements this reader does not attribute to sweepCursorKind. Resolving
+// that needs go/types and a package load, which these guards deliberately do
+// not take on. Introducing such a type means extending this function.
+func sweepCursorLiteralsIn(composite *ast.CompositeLit) []*ast.CompositeLit {
+	if named, ok := composite.Type.(*ast.Ident); ok {
+		if named.Name != "sweepCursorKind" {
+			return nil
+		}
+		return []*ast.CompositeLit{composite}
+	}
+	var element ast.Expr
+	switch container := composite.Type.(type) {
+	case *ast.ArrayType: // slices and arrays alike
+		element = container.Elt
+	case *ast.MapType:
+		element = container.Value
+	default:
+		return nil
+	}
+	if named, ok := element.(*ast.Ident); !ok || named.Name != "sweepCursorKind" {
+		return nil
+	}
+	var found []*ast.CompositeLit
+	for _, elt := range composite.Elts {
+		if pair, ok := elt.(*ast.KeyValueExpr); ok {
+			elt = pair.Value
+		}
+		// Only the ELIDED spelling: one that names its type is visited in its
+		// own right by the walk that called this.
+		if inner, ok := elt.(*ast.CompositeLit); ok && inner.Type == nil {
+			found = append(found, inner)
+		}
+	}
+	return found
 }

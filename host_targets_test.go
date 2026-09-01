@@ -2530,18 +2530,28 @@ func worstCaseEndpoint() sessionwire.InternalEndpoint {
 //
 // WHAT "DERIVED FROM SOURCE" DOES AND DOES NOT COVER, stated exactly, because
 // an unqualified exhaustiveness claim in a guard is worse than no claim: a
-// reader stops looking. Two SPELLINGS are read — a four-byte string constant,
-// and the magic field of a sweepCursorKind composite literal in either the
-// keyed or the positional form. A kind added in either spelling is covered
-// whether or not anyone updates this test. A magic spelled any OTHER way is
-// not silently skipped, but neither is it collected: a sweepCursorKind literal
-// whose magic is not a four-byte string literal FAILS here, and an argument to
-// encodeCursorEnvelope that is neither a declared constant nor a cursor kind
-// field FAILS in the use-guard below. The gap that remains, named so it is not
-// rediscovered as a surprise: a SECOND kind type, one that is not
-// sweepCursorKind and carries its own field called magic, would be waved
-// through by the use-guard's selector branch and would contribute nothing to
-// the distinctness set. Adding one means extending this scan.
+// reader stops looking. This header has now been narrowed twice, each time
+// after a spelling it claimed to cover turned out to escape it.
+//
+// READ: a four-byte string constant; and the magic field of a sweepCursorKind
+// composite literal, keyed or positional, whether the literal NAMES its type or
+// ELIDES it as an element of a directly-spelled slice, array or map of that
+// type. A kind added in any of those is covered whether or not anyone updates
+// this test.
+//
+// NOT COLLECTED, BUT NOT SKIPPED EITHER: a sweepCursorKind literal whose magic
+// is not a four-byte string literal FAILS here, and an argument to
+// encodeCursorEnvelope that is neither a declared constant nor a cursor kind's
+// field FAILS in the use-guard below.
+//
+// THE TWO GAPS THAT REMAIN, named so neither is rediscovered as a surprise.
+// (A) A SECOND kind type — not sweepCursorKind, carrying its own field called
+// magic — would be waved through by the use-guard's selector branch and would
+// contribute nothing to this set. (B) A sweepCursorKind literal reachable only
+// through a NAMED container type or an alias — `type cursorKinds
+// []sweepCursorKind`, then `cursorKinds{{...}}` — is not attributed, because
+// sweepCursorLiteralsIn resolves element types syntactically rather than
+// through go/types. Either one means extending this scan.
 func TestCursorMagicsAreDistinct(t *testing.T) {
 	t.Parallel()
 
@@ -2606,19 +2616,18 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 			if !ok {
 				return true
 			}
-			if named, ok := composite.Type.(*ast.Ident); !ok || named.Name != "sweepCursorKind" {
-				return true
+			for _, kind := range sweepCursorLiteralsIn(composite) {
+				literal, ok := sweepCursorLiteralField(t, name, kind, "magic", magicField).(*ast.BasicLit)
+				if !ok || literal.Kind != token.STRING {
+					t.Fatalf("%s declares a sweepCursorKind whose magic is not a string literal", name)
+				}
+				text, err := strconv.Unquote(literal.Value)
+				if err != nil || len(text) != cursorMagicBytes {
+					t.Fatalf("%s declares a sweepCursorKind whose magic is not %d bytes", name, cursorMagicBytes)
+				}
+				carried++
+				magics[name+"#carried-"+strconv.Itoa(carried)] = text
 			}
-			literal, ok := sweepCursorLiteralField(t, name, composite, "magic", magicField).(*ast.BasicLit)
-			if !ok || literal.Kind != token.STRING {
-				t.Fatalf("%s declares a sweepCursorKind whose magic is not a string literal", name)
-			}
-			text, err := strconv.Unquote(literal.Value)
-			if err != nil || len(text) != cursorMagicBytes {
-				t.Fatalf("%s declares a sweepCursorKind whose magic is not %d bytes", name, cursorMagicBytes)
-			}
-			carried++
-			magics[name+"#carried-"+strconv.Itoa(carried)] = text
 			return true
 		})
 	}
