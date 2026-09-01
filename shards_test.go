@@ -2896,3 +2896,63 @@ func TestCursorKindReadabilityAcceptsLegalShapesAndRejectsUnreadableOnes(t *test
 		})
 	}
 }
+
+// TestSweepRequestsCannotSpellATenantOrSession guards the SHAPE the
+// service-only rule at the top of shards.go rests on.
+//
+// This package authorizes nothing, so "service-only" cannot be an enforcement
+// here; what it can be, and is, is a structural hint — a sweep names no tenant
+// and no session, so a tenant-scoped handler has no identity to forward into
+// one and nothing to build one from. The shape is correct today and, until this
+// guard, was held by nothing: adding a TenantID to either request was a
+// compiling, passing change that quietly turned a cross-tenant control query
+// into something a tenant principal could be aimed at.
+//
+// The third sweep request, ReconcileHostTargetsRequest, is deliberately NOT
+// repeated here. TestHostTargetsCannotSpellSessionOwnership walks every struct
+// in host_targets.go, so that type is already covered, and a second guard over
+// it would be the redundancy this one exists to replace.
+//
+// RetireGateDeadlineIntentRequest is excluded for the opposite reason, stated
+// in shards.go: it MUST name the session whose intent it retires, and what
+// protects it is revalidation against the durable projection rather than shape.
+func TestSweepRequestsCannotSpellATenantOrSession(t *testing.T) {
+	t.Parallel()
+
+	forbidden := []string{"TenantID", "SessionID"}
+	sweeps := map[string]string{
+		"ListDueGatesRequest":    "gates.go",
+		"ListDueCommandsRequest": "shards.go",
+	}
+	seen := map[string]int{}
+	for typeName, filename := range sweeps {
+		fields := structFieldSpellings(t, filename, func(name string) bool { return name == typeName })
+		seen[typeName] = len(fields)
+		for _, field := range fields {
+			for _, word := range forbidden {
+				if strings.Contains(field.Spelling, word) {
+					t.Errorf("%s.%s names %s; a sweep is cross-tenant control work and must give a handler no identity to forward",
+						field.TypeName, field.Spelling, word)
+				}
+			}
+		}
+	}
+
+	// Anti-vacuity, and it is the whole reason this reads BY TYPE NAME rather
+	// than by file: both files also declare requests that must name a session,
+	// so the predicate has to be narrow — and a narrow predicate matches
+	// nothing at all once the type is renamed or moved, at which point the
+	// guard passes while guarding nothing.
+	//
+	// The condition is "reached the declaration" and not a field count. A floor
+	// pinned at today's four members would also fail when a member is
+	// legitimately removed, which is a false alarm this guard has no business
+	// raising: it has an opinion about what a sweep request may NAME, not about
+	// how many things it carries.
+	for typeName, filename := range sweeps {
+		if seen[typeName] == 0 {
+			t.Fatalf("no fields of %s were inspected; it is no longer declared in %s and this guard is vacuous",
+				typeName, filename)
+		}
+	}
+}

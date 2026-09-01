@@ -30,8 +30,8 @@ call out public API or persisted-format changes explicitly.
 
 These are known, deliberately left out of the `v0.1.0` release, and recorded here
 so they are picked up by intent rather than rediscovered. Items 1 and 2 were
-raised in review and judged non-blocking by an independent reviewer; item 3 was
-raised during documentation review and has not been reviewed.
+raised in review and judged non-blocking by an independent reviewer; item 3 is a
+testing gap noted during release review.
 
 1. **The sweep-cursor reconciliation is held by redundancy, not by structure.**
    `assertSweepCursorKindRolesAreUnderstood` is called from two cursor guards
@@ -53,16 +53,23 @@ raised during documentation review and has not been reviewed.
    obscure shape than the `(*T)(nil)` conversion already handled, and it adds
    state to the most intricate walk in the file.
 
-3. **The sweeps' "service-only" shape is documented, not guarded.**
-   `ListDueCommandsRequest`, `ListDueGatesRequest` and
-   `ReconcileHostTargetsRequest` name no tenant and no session, and `shards.go`
-   states plainly that this is a
-   structural HINT rather than an enforcement — this package authorizes nothing.
-   Unlike `HostTarget` and the reconciliation claim, whose families have source
-   guards (`TestHostTargetsCannotSpellSessionOwnership`,
-   `TestReconciliationClaimCannotSpellSessionOwnership`), nothing fails if a
-   tenant member is added to a sweep request later. Adding the equivalent source
-   guard would make the shape as durable as the prose claims it is.
+3. **Three claims that hold but nothing pins.** None is a correctness fault
+   today; each is a place where a regression would be silent.
+   - A stale Host incarnation that re-publishes over a row a newer incarnation
+     withdrew is handled by `hostGenerationFence`, but nothing drives that
+     interleaving. Impact if it regressed is liveness — capacity advertised for
+     a Host that has drained — not correctness.
+   - `TestUnmarkedBackendDoesNotProbeLegacyData` holds the OUTCOME (an unmarked
+     backend holding `sessions/<uuid>` data opens as `tenant-v1`) rather than
+     the absence of a probe. Sufficient for the guarantee as stated, but a probe
+     that read legacy data and then ignored it would still pass. Asserting zero
+     provider reads before the marker write would close it.
+   - README documents that `ReadPublicJournalRequest.FromSeq` is the one route
+     past a journal record that fails to decode. That was verified by hand
+     against a corrupt frame — a walk from the start returns
+     `JournalErrorIntegrity`, and a walk positioned above the bad sequence
+     succeeds — but no committed test pins it, so the documented escape hatch
+     could be removed without a failure.
 
 ## Code of conduct
 

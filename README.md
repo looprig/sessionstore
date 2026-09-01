@@ -125,14 +125,25 @@ SessionStore does not close it.
 
 ## Logical keys: every name is derived, and no derived name is trusted alone
 
-Under `tenant-v1` no caller identity appears in a provider key. A tenant's
+Under `tenant-v1` the TENANT never appears in a provider name. A tenant's
 physical namespace is `tenants/<token>`, where the token is a domain-separated
 digest of the TenantID; a session's is that namespace plus `/sessions/<token>`
 over `(tenant, session)`. Every other name a session has is derived from those
 two in one pure function that touches no provider — its journal ledger, its
-lease, its catalog key and its blob prefix. The catalog record's ORDERING and
-RANKING scope is the tenant namespace, which is what makes a recent-first tenant
-page one provider query rather than a filter over a wider one.
+lease, its catalog key and its blob prefix.
+
+Be precise about what that does and does not hide, because the difference
+matters to anyone reading a provider's keys. What is digested is what selects a
+NAMESPACE. Inside a namespace that is already tenant- or session-scoped, a
+record's `StableKey` is the raw identity: `catalogID` files a catalog record
+under the `SessionID`, `gateIntentID` under the `GateID`, `inboxID` under the
+`CommandID`. That is deliberate — those keys are named reads within a scope the
+derivation has already established — but it means a session, gate or command id
+IS legible at the provider, and only the tenant id is not.
+
+The catalog record's ORDERING and RANKING scope is the tenant namespace, which
+is what makes a recent-first tenant page one provider query rather than a filter
+over a wider one.
 
 Outstanding records — inbox commands and gate deadline intents — are additionally
 FILED in a control shard namespace while keeping the session namespace as their
@@ -202,13 +213,51 @@ the cursor, so a walk covers exactly the snapshot that first page named; the
 ledger is append-only, so nothing inside that range can move. A cursor carrying
 an inflated captured tip cannot widen the snapshot.
 
-**No single row fails a bounded page, anywhere.** Every per-row refusal is
-counted and stepped over — `SessionPage.UnreadableSkipped`,
-`DueGatePage.Unreadable`, `HostTargetPage.LapsedSkipped` and
-`UnreadableSkipped`. A failure returned from one of these queries is always
-about the query itself: a bad limit, a foreign cursor, a provider that could not
-answer. The reasoning, and why a page budget is not a substitute for a
-continuation, is in the Host target section.
+**No single row fails a COUNTED page.** In the weak views above, and only there,
+every per-row refusal is counted and stepped over —
+`SessionPage.UnreadableSkipped`, `DueGatePage.Unreadable`,
+`HostTargetPage.LapsedSkipped` and `UnreadableSkipped`. A failure returned from
+one of THOSE four queries is about the query itself: a bad limit, a foreign
+cursor, a provider that could not answer. The reasoning, and why a page budget
+is not a substitute for a continuation, is in the Host target section.
+
+**The journal readers are the exception here too, and they fail closed
+deliberately.** `ReadPublicJournal` and `ReadRuntimeJournal` STOP the walk on
+any record they cannot decode and return `*JournalError` with code `integrity`.
+There is nowhere for them to do anything else: neither
+`sessionwire.JournalPage` nor `RuntimePage` carries a skip counter, so a skipped
+record could not be reported, and a page that silently omitted one would be
+indistinguishable from a complete one.
+`TestJournalReadsFailClosedOnACorruptStoredFrame` and
+`TestJournalReadsFailClosedOnATruncatedStream` hold it, and the first states the
+rule outright: a ledger record this package did not write, or one damaged in
+place, must stop the walk rather than be skipped or zero-valued. That is the
+opposite trade from a capacity row on purpose — omitting one advertisement costs
+a candidate, while omitting one journal record corrupts the state every reader
+reconstructs from the sequence.
+
+Two consequences of that are sharp enough to plan for:
+
+- The decode happens BEFORE the public/runtime selection, so one corrupt
+  *runtime* record fails a *public* page that would never have published it.
+- `ReadPublicJournal` resolves an object-backed public body through the ordinary
+  verified object path, so a missing or reclaimed journal blob is likewise an
+  error and not an omission.
+
+In both cases a failed page issues no `NextCursor`, so a walk cannot continue
+through the bad record, and this package has no repair API for it. That is the
+same head-of-line shape `ListSessions` and `ListDueGates` were changed to avoid,
+kept here because the alternative is handing a caller a history with a hole in
+it that the caller cannot see.
+
+**A caller must therefore handle `JournalErrorIntegrity` as its own case,
+distinct from a cursor or limit failure.** It means a stored record is
+unreadable, and no retry, cursor reset or different limit will move past it. One
+thing does: `ReadPublicJournalRequest.FromSeq` positions a walk directly, so a
+caller that has identified the bad sequence can resume above it. That is
+deliberately the only route past, and it is not a repair — it skips a record
+that is really there, and it is the CALLER that decides to, having been told.
+Skipping silently inside the reader is what would have been unsafe.
 
 ## Objects first, references second
 
