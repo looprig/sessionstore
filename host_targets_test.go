@@ -2568,13 +2568,77 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 		}
 	}
 
+	// A magic reaches the envelope two ways, and BOTH are scanned. Most kinds
+	// declare one as a constant; the two sweep cursor kinds CARRY theirs in a
+	// sweepCursorKind value, because their codecs are one hoisted
+	// implementation parameterized by kind. When that hoist happened the
+	// constants went away, and a scan that only reads constants would have
+	// stopped covering the two newest kinds without failing — so the grammar is
+	// extended rather than the kinds exempted.
+	carried := 0
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		for _, declaration := range file.Decls {
+			generic, ok := declaration.(*ast.GenDecl)
+			if !ok || generic.Tok != token.VAR {
+				continue
+			}
+			for _, spec := range generic.Specs {
+				value, ok := spec.(*ast.ValueSpec)
+				if !ok || len(value.Names) != 1 || len(value.Values) != 1 {
+					continue
+				}
+				composite, ok := value.Values[0].(*ast.CompositeLit)
+				if !ok {
+					continue
+				}
+				if named, ok := composite.Type.(*ast.Ident); !ok || named.Name != "sweepCursorKind" {
+					continue
+				}
+				for _, element := range composite.Elts {
+					pair, ok := element.(*ast.KeyValueExpr)
+					if !ok {
+						continue
+					}
+					if key, ok := pair.Key.(*ast.Ident); !ok || key.Name != "magic" {
+						continue
+					}
+					literal, ok := pair.Value.(*ast.BasicLit)
+					if !ok || literal.Kind != token.STRING {
+						t.Fatalf("%s declares a sweepCursorKind whose magic is not a string literal", name)
+					}
+					text, err := strconv.Unquote(literal.Value)
+					if err != nil || len(text) != cursorMagicBytes {
+						t.Fatalf("%s declares a sweepCursorKind whose magic is not %d bytes", name, cursorMagicBytes)
+					}
+					magics[value.Names[0].Name] = text
+					carried++
+				}
+			}
+		}
+	}
+
 	// Anti-vacuity: the scan must reach the kinds this package is known to
-	// have, or a broken walk would report a vacuous pass.
-	if len(magics) < 5 {
+	// have, or a broken walk would report a vacuous pass. Both halves are named
+	// — a declared constant and a carried field — because a walk that reached
+	// only one would leave the other's kinds unchecked, which is exactly what
+	// happened when the sweep codecs were hoisted.
+	if carried < 2 {
+		t.Fatalf("found %d carried cursor magics; the sweepCursorKind scan is not reaching them", carried)
+	}
+	if len(magics) < 7 {
 		t.Fatalf("found %d cursor magics (%v); the scan is not reaching the declarations", len(magics), magics)
 	}
-	if magics["hostTargetSweepCursorMagic"] == "" {
-		t.Fatalf("the scan did not reach a magic it is known to cover: %v", magics)
+	for _, known := range []string{"hostTargetSweepCursorMagic", "dueGateCursor"} {
+		if magics[known] == "" {
+			t.Fatalf("the scan did not reach %s, a magic it is known to cover: %v", known, magics)
+		}
 	}
 
 	seen := map[string]string{}

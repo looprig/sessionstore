@@ -174,40 +174,94 @@ func (s *Store) ControlShards() int { return int(s.keys.shards) }
 // tenant could aim it at productively — and the service-only rule for it is
 // prose alone.
 
+// A SWEEP CONTINUATION, STATED ONCE FOR BOTH KINDS.
+//
+// Its payload is the due bound this sweep is querying at, followed by the
+// provider's own due token carried verbatim.
+//
+// THE BOUND IS IN THE TOKEN because it has to be: the ordered index binds a due
+// cursor to the exact bound that issued it, so a resumed call that recomputed
+// the bound from a fresh request would present a token for a different query
+// and be refused.
+//
+// Carrying it costs nothing in safety. The bound only selects WHICH rows a page
+// contains; neither sweep WRITES, so the worst a caller presenting a bound this
+// store never issued can do is look at rows that are not due — every one of
+// which is still held to its own stored filing before it is reported. The
+// retirement a remnant enables is a SEPARATE call that revalidates from scratch
+// against its own clock reading and its own read of the projection, so no part
+// of it rests on the bound this token carries.
+//
+// WHY ONE TYPE AND NOT TWO COPIES. The two kinds differ in a magic, a digest
+// domain, and an error vocabulary, and in nothing else; written out, their
+// encoders, decoders and position resolvers were byte-identical but for those
+// three. This package has hoisted that exact shape twice already — epochFence
+// found its fourth copy only after three were merged, and checkFiledScope
+// records that "what each copy was free to do was drift" — and the drift here
+// has a specific shape: one copy quietly stops enforcing the ceiling on ISSUE,
+// or starts accepting a position with no provider bytes, on a path that only
+// runs when something is already wrong and where a weakened check looks exactly
+// like a passing one.
+type sweepCursorKind struct {
+	// magic is the envelope's kind tag. cursor.go states what it buys, and
+	// TestCursorMagicsAreDistinct derives the set from source.
+	magic   string
+	version byte
+
+	// domain separates this kind's scope digest from every other derivation in
+	// this keyspace; TestCursorScopeDomainsAreDistinct derives that set too.
+	domain string
+
+	// invalid and backend are the kind's own error vocabulary. They are
+	// FUNCTIONS rather than codes because the two vocabularies are different
+	// types, and a shared type would have forced one of the two families to
+	// borrow the other's — which is the drift this hoist exists to prevent,
+	// reintroduced at the error boundary.
+	cursorErr  func() error
+	invalidErr func(field string) error
+	backendErr func(field string) error
+}
+
 const (
-	// The due-commands continuation. Its payload is the due bound this sweep is
-	// querying at, followed by the provider's own due token carried verbatim.
-	//
-	// THE BOUND IS IN THE TOKEN for the reason the host target sweep's is: the
-	// ordered index binds a due cursor to the exact bound that issued it, so a
-	// resumed call that recomputed the bound from a fresh request would present
-	// a token for a different query and be refused.
-	//
-	// Carrying it costs nothing in safety. The bound only selects WHICH rows a
-	// page contains; this sweep WRITES NOTHING, so the worst a caller
-	// presenting a bound this store never issued can do is look at rows that
-	// are not due — every one of which is still held to its own stored filing
-	// before it is reported. The envelope's kind tag and shard-bound scope stop
-	// a token being replayed into another query or another shard; neither
-	// confers authority, as cursor.go states.
-	dueCommandCursorMagic        = "LRDC"
-	dueCommandCursorVersion byte = 1
+	// sweepCursorBoundBytes is the big-endian due bound every sweep
+	// continuation carries ahead of the provider's own token.
+	sweepCursorBoundBytes = 8
 
-	dueCommandBoundBytes = 8
-
-	// maxDueCommandCursorBytes bounds a decoded continuation, and
-	// maxDueCommandCursorPayload is the largest bound-plus-provider-token the
-	// envelope can carry. The ceiling is enforced on ISSUE as well as on
-	// presentation, so a token this store hands out is always one it will
-	// accept back — and for a sweep that is sharper than usual, because a
-	// continuation it cannot reissue is a sweep that silently reverts to making
-	// no progress at the head of the view.
-	maxDueCommandCursorBytes   = 4 << 10
-	maxDueCommandCursorPayload = maxDueCommandCursorBytes - cursorPayloadAt
+	// maxSweepCursorBytes bounds a decoded continuation and
+	// maxSweepCursorPayload the bound-plus-provider-token inside it. The
+	// ceiling is enforced on ISSUE as well as on presentation, so a token this
+	// store hands out is always one it will accept back — and for a sweep that
+	// is sharper than usual, because a continuation it cannot reissue is a
+	// sweep that silently reverts to making no progress at the head of the
+	// view.
+	maxSweepCursorBytes   = 4 << 10
+	maxSweepCursorPayload = maxSweepCursorBytes - cursorPayloadAt
 )
 
-// dueCommandCursorScope binds a continuation to this cursor KIND and to the
-// SHARD it was issued for, and to nothing else.
+// The two kinds. Declaring them here rather than beside their callers is what
+// makes "these differ in exactly three things" checkable by reading one screen.
+var (
+	dueCommandCursor = sweepCursorKind{
+		magic:      "LRDC",
+		version:    1,
+		domain:     "looprig/sessionstore/duecommand/cursor/v1",
+		cursorErr:  func() error { return inboxErr(InboxErrorCursor, "cursor", nil) },
+		invalidErr: func(field string) error { return inboxErr(InboxErrorInvalid, field, nil) },
+		backendErr: func(field string) error { return inboxErr(InboxErrorBackend, field, nil) },
+	}
+
+	dueGateCursor = sweepCursorKind{
+		magic:      "LRDG",
+		version:    1,
+		domain:     "looprig/sessionstore/duegate/cursor/v1",
+		cursorErr:  func() error { return catalogErr(CatalogErrorCursor, "cursor", nil) },
+		invalidErr: func(field string) error { return catalogErr(CatalogErrorInvalid, field, nil) },
+		backendErr: func(field string) error { return catalogErr(CatalogErrorBackend, field, nil) },
+	}
+)
+
+// scope binds a continuation to this cursor KIND and to the SHARD it was issued
+// for, and to nothing else.
 //
 // The shard is in the scope rather than in the payload because it is an
 // identity the token is FOR, not a value the sweep carries forward.
@@ -225,35 +279,60 @@ const (
 // A sweep names no tenant and no session, so there is nothing else to bind it
 // to; inventing an identity would suggest a scoping this operation does not
 // have.
-func (s *Store) dueCommandCursorScope(shard uint32) [cursorScopeBytes]byte {
-	return s.keys.digest(digestFrame(
-		"looprig/sessionstore/duecommand/cursor/v1", binary.BigEndian.AppendUint32(nil, shard)))
+func (k sweepCursorKind) scope(s *Store, shard uint32) [cursorScopeBytes]byte {
+	return s.keys.digest(digestFrame(k.domain, binary.BigEndian.AppendUint32(nil, shard)))
 }
 
-func (s *Store) encodeDueCommandCursor(shard uint32, bound int64, after storage.DueCursor) (sessionwire.Cursor, error) {
-	payload := make([]byte, dueCommandBoundBytes, dueCommandBoundBytes+len(after))
+func (k sweepCursorKind) encode(s *Store, shard uint32, bound int64, after storage.DueCursor) (sessionwire.Cursor, error) {
+	payload := make([]byte, sweepCursorBoundBytes, sweepCursorBoundBytes+len(after))
 	binary.BigEndian.PutUint64(payload, uint64(bound)) // #nosec G115 -- a signed bound round-trips through the same width
 	payload = append(payload, after...)
-	if len(payload) > maxDueCommandCursorPayload {
-		return "", inboxErr(InboxErrorBackend, "next_cursor", nil)
+	if len(payload) > maxSweepCursorPayload {
+		return "", k.backendErr("next_cursor")
 	}
-	token := encodeCursorEnvelope(
-		dueCommandCursorMagic, dueCommandCursorVersion, s.dueCommandCursorScope(shard), payload)
-	return sessionwire.Cursor(token), nil
+	return sessionwire.Cursor(encodeCursorEnvelope(k.magic, k.version, k.scope(s, shard), payload)), nil
 }
 
-// decodeDueCommandCursor unwraps a continuation this store issued for this
-// shard. One this sweep issued always carries at least one provider byte beyond
-// the bound, because an exhausted view returns no cursor at all.
-func (s *Store) decodeDueCommandCursor(shard uint32, cursor sessionwire.Cursor) (int64, storage.DueCursor, error) {
+// decode unwraps a continuation this store issued for this kind and this shard.
+// One a sweep issued always carries at least one provider byte beyond the
+// bound, because an exhausted view returns no cursor at all.
+func (k sweepCursorKind) decode(s *Store, shard uint32, cursor sessionwire.Cursor) (int64, storage.DueCursor, error) {
 	payload, ok := decodeCursorEnvelope(
-		dueCommandCursorMagic, dueCommandCursorVersion, s.dueCommandCursorScope(shard),
-		string(cursor), dueCommandBoundBytes+1, maxDueCommandCursorPayload)
+		k.magic, k.version, k.scope(s, shard),
+		string(cursor), sweepCursorBoundBytes+1, maxSweepCursorPayload)
 	if !ok {
-		return 0, "", inboxErr(InboxErrorCursor, "cursor", nil)
+		return 0, "", k.cursorErr()
 	}
-	bound := int64(binary.BigEndian.Uint64(payload[:dueCommandBoundBytes])) // #nosec G115 -- the inverse of the encode above
-	return bound, storage.DueCursor(payload[dueCommandBoundBytes:]), nil
+	bound := int64(binary.BigEndian.Uint64(payload[:sweepCursorBoundBytes])) // #nosec G115 -- the inverse of the encode above
+	return bound, storage.DueCursor(payload[sweepCursorBoundBytes:]), nil
+}
+
+// position resolves one request to the (bound, provider position) a page is
+// read at, refusing a request that states the bound twice.
+//
+// A request may not carry both a continuation and a bound. Preferring either
+// silently is how a resumed sweep starts querying a bound it was never bound to
+// — the provider would refuse the token, and the sweep would restart at the
+// head of the view every time, which looks like liveness and is starvation.
+func (k sweepCursorKind) position(
+	s *Store,
+	shard uint32,
+	cursor sessionwire.Cursor,
+	dueAtOrBefore time.Time,
+) (int64, storage.DueCursor, error) {
+	if cursor == "" {
+		// rankableTime already refuses the zero Time, which is earlier than
+		// every representable instant; a separate IsZero check would be a
+		// second statement of one rule.
+		if !rankableTime(dueAtOrBefore) {
+			return 0, "", k.invalidErr("due_at_or_before")
+		}
+		return dueAtOrBefore.UnixMilli(), "", nil
+	}
+	if !dueAtOrBefore.IsZero() {
+		return 0, "", k.invalidErr("due_at_or_before")
+	}
+	return k.decode(s, shard, cursor)
 }
 
 // ListDueCommandsRequest positions one bounded page of one shard's outstanding
@@ -291,17 +370,35 @@ type DueCommand struct {
 }
 
 // DueCommandPage is one bounded page of outstanding commands together with what
-// producing it cost.
+// producing it cost. It is where the three cost members both sweeps carry are
+// defined; DueGatePage refers here rather than restating them.
 //
-// Examined, Limit and Unreadable carry the meanings DueGatePage documents, and
-// for the same reasons. Unreadable counts rows this reader could not decode, or
-// that disagreed with the filing they were found under, or that belong in a
-// different shard; each is SKIPPED rather than failing the page, because this
-// view is ascending by an instant that never moves and nothing rewrites such a
-// row — a reader that failed on one would switch reconciliation off for every
-// tenant in the shard until someone repaired the row by hand.
+// EXAMINED is the number of rows the provider returned, and LIMIT is the
+// EFFECTIVE limit after a zero request limit has been resolved to the store's
+// page size, so the comparison is available to a caller that named no limit.
+// Together they answer a question the results alone cannot: Examined == Limit
+// with nothing reported means this page was full and none of it said anything,
+// which is a different state from "nothing is due".
 //
-// NextCursor is what keeps that skipping from becoming starvation. An
+// UNREADABLE counts rows this reader could not decode, that disagreed with the
+// filing they were found under, or that belong in a different shard. Each is
+// SKIPPED rather than failing the page, and that is the strongest rule here
+// rather than leniency: this view is ascending by an instant that never moves
+// and nothing rewrites such a row, so a reader that failed on one would switch
+// reconciliation off for every tenant in the shard until someone repaired the
+// row by hand.
+//
+// LOCATING AN UNREADABLE ROW IS OUT OF BAND, and that is a real limitation
+// rather than an oversight to be discovered. Unreadable is a count; this
+// package has no logger and no channel to report a row's identity through, and
+// adding one is public surface a later task should design rather than something
+// to bolt on here. What an operator has instead is the SHARD and the DUE BOUND
+// the page was read at, which narrow the row to one namespace and one prefix of
+// an ordered view. The row's stable key and ordering scope are in hand at both
+// skip sites, so a reporting channel is cheap to add when something exists to
+// receive it.
+//
+// NEXTCURSOR is what keeps that skipping from becoming starvation. An
 // unreadable row is stepped over by the provider's own continuation, which
 // resumes from the tuple the page ended on, so a row left in place is passed
 // rather than met again on the next page.
@@ -347,7 +444,7 @@ func (s *Store) ListDueCommands(ctx context.Context, req ListDueCommandsRequest)
 	if !ok {
 		return DueCommandPage{}, inboxErr(InboxErrorInvalid, "limit", nil)
 	}
-	bound, after, err := s.dueCommandPosition(shard, req)
+	bound, after, err := dueCommandCursor.position(s, shard, req.Cursor, req.DueAtOrBefore)
 	if err != nil {
 		return DueCommandPage{}, err
 	}
@@ -377,29 +474,11 @@ func (s *Store) ListDueCommands(ctx context.Context, req ListDueCommandsRequest)
 		page.Commands = append(page.Commands, DueCommand{Entry: entry})
 	}
 	if provider.NextCursor != "" {
-		if page.NextCursor, err = s.encodeDueCommandCursor(shard, bound, provider.NextCursor); err != nil {
+		if page.NextCursor, err = dueCommandCursor.encode(s, shard, bound, provider.NextCursor); err != nil {
 			return DueCommandPage{}, err
 		}
 	}
 	return page, nil
-}
-
-// dueCommandPosition resolves one request to the (bound, provider position) the
-// page is read at, refusing a request that states the bound twice.
-func (s *Store) dueCommandPosition(shard uint32, req ListDueCommandsRequest) (int64, storage.DueCursor, error) {
-	if req.Cursor == "" {
-		// rankableTime already refuses the zero Time, which is earlier than
-		// every representable instant; a separate IsZero check would be a
-		// second statement of one rule.
-		if !rankableTime(req.DueAtOrBefore) {
-			return 0, "", inboxErr(InboxErrorInvalid, "due_at_or_before", nil)
-		}
-		return req.DueAtOrBefore.UnixMilli(), "", nil
-	}
-	if !req.DueAtOrBefore.IsZero() {
-		return 0, "", inboxErr(InboxErrorInvalid, "due_at_or_before", nil)
-	}
-	return s.decodeDueCommandCursor(shard, req.Cursor)
 }
 
 // dueCommandFor reads one row of a due page, reporting whether this store can
@@ -469,8 +548,18 @@ func (s *Store) validateShard(shard int, invalid func(string, error) error) (uin
 // the two costs are not symmetric. Waiting too long leaves a remnant row in a
 // due page for longer; the continuation steps past it, so the cost is a row per
 // page, not a stalled sweep. Waiting too little destroys a live gate's
-// deadline. So the window is set far above any plausible interval between two
-// writes of one operation rather than close to it.
+// deadline. So the window is set far above any plausible span of the interval it
+// actually covers, rather than close to it.
+//
+// THE INTERVAL IS THE CLOCK READING TO THE PROJECTION COMMIT, not "between two
+// writes". OpenGate reads the clock at the top, before it is admitted and
+// before it reads the catalog, because this package reads the clock once ahead
+// of any provider work. So the exposed span is a mutex acquisition, the
+// session-scope verification and catalog read, the intent write and the
+// projection write — several round trips rather than the gap between two of
+// them. Leaving the reading where it is remains right: moving it after the
+// catalog read would buy a shorter interval by breaking the rule that keeps
+// every operation's decisions evaluated at one instant.
 //
 // WHICH CLOCK, AND WHAT THAT DOES NOT BUY. RecordedAt is stamped by the store
 // that opened the gate and the age is evaluated by the store that sweeps —
@@ -488,6 +577,10 @@ const MinGateIntentRemnantAge = 5 * time.Minute
 // RemnantGateIntent from ListDueGates. The write is a compare-and-swap onto it,
 // so a row that moved between the page and this call is refused rather than
 // retired on stale evidence.
+//
+// It is the counterpart of RemnantGateIntent, which is what a sweep reports and
+// what a caller builds this from; the two are deliberately separate types for
+// the reason stated there.
 //
 // It names a tenant and a session because it must: the intent is filed under
 // the session's scope and there is no way to reach it without them. So this

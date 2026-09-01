@@ -1754,11 +1754,14 @@ func TestGateOperationsRefuseAfterClose(t *testing.T) {
 }
 
 // TestListDueGatesStepsOverARowItCannotRead is the critical property of a
-// deadline view that has no continuation: one row must never be able to disable
-// it. The view is ascending by deadline, a row this build cannot decode has a
-// deadline in the past that never changes, and nothing rewrites such a row — so
-// a reader that failed the page on one would switch gate expiry off for EVERY
-// TENANT, permanently, with no limit and no bound able to reach past it.
+// deadline view whose head cannot be skipped past within a pass: one row must
+// never be able to disable it. The view is ascending by deadline, a row this
+// build cannot decode has a deadline in the past that never changes, and
+// nothing rewrites such a row — so a reader that FAILED the page on one would
+// switch gate expiry off for EVERY TENANT in the shard until someone repaired
+// the row by hand. The continuation added later steps past a row that reports
+// nothing; it cannot step past a page that returned an error instead of a
+// position, which is why this rule is not weakened by it.
 //
 // Unreadable is what keeps that from being silent, and it is a different signal
 // from Examined: a remnant is a row that was read and reported nothing, while

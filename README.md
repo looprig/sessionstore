@@ -588,8 +588,8 @@ row.
 `ListDueGates` and `ListSessions` obey the same rule, and they were changed to.
 Both used to fail the whole page on one row, and both were reachable states with
 no way out: a single undecodable gate intent sits at the head of an ascending
-deadline view that has no cursor at all, so it disabled gate expiry for *every
-tenant* permanently; a single undecodable catalog row made a tenant unlistable
+deadline view whose head could not be skipped past within a pass, so it disabled
+gate expiry for *every tenant* permanently; a single undecodable catalog row made a tenant unlistable
 and, because a failed page issues no continuation, took every session ranked
 behind it too. They report `DueGatePage.Unreadable` and
 `SessionPage.UnreadableSkipped`. `SessionPage` is this package's own type
@@ -761,9 +761,11 @@ the tip in both cases. Elapsed time is the only discriminator, which is why the
 intent carries `RecordedAt`, stamped by the store. Retiring inside that window
 would tombstone a live gate's deadline under an identity that can never be
 reused. The comparison spans two processes' clocks and is skew-relative; five
-minutes is chosen far above any plausible interval between two writes of one
-operation, and shrinking it without a real shared clock is how it becomes
-unsafe.
+minutes is chosen far above any plausible span of the interval it covers —
+between the clock reading `OpenGate` takes and its projection commit: a mutex
+acquisition, a session-scope verification, a catalog read, the intent write and
+the projection write — and shrinking it without a real shared clock is how it
+becomes unsafe.
 
 **Every attempt re-stamps, and that is a safety requirement rather than
 bookkeeping.** The first version stamped once, at creation, so a retry inherited

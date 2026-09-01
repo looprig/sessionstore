@@ -2,7 +2,6 @@ package sessionstore
 
 import (
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"time"
@@ -239,6 +238,16 @@ type ListDueGatesRequest struct {
 // The revision travels with it so the retirement is a compare-and-swap onto the
 // row this page actually saw. Without it a sweeper would have to re-read, and a
 // re-read is a second decision point at which a gate could have been reopened.
+//
+// IT IS DELIBERATELY NOT RetireGateDeadlineIntentRequest, though the two spell
+// the same four members today and staticcheck reports the conversion (S1016).
+// One is a SWEEP RESULT and the other an OPERATION REQUEST, and collapsing them
+// would make the request hostage to whatever a future page decides to report: a
+// member added here for a caller's convenience would silently become a member
+// the operation accepts. The conversion is used once, in the test that drives
+// the whole sweeper path, which is the right place for it — it holds the two
+// shapes together where they are meant to line up, and stops compiling if they
+// ever diverge, which is the loud failure rather than a silent one.
 type RemnantGateIntent struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
@@ -259,31 +268,16 @@ type DueGate struct {
 // DueGatePage is one bounded page of due gates together with what producing it
 // cost.
 //
-// Examined and Limit exist because Gates alone cannot be read. A page whose
-// rows were all remnant intents returns no gates and no error, which is
-// indistinguishable from a deployment where nothing is due. Examined == Limit
-// with no gates says this page was full and none of it reported a live gate —
-// which the continuation now makes transient rather than permanent, but which
-// a caller still wants to see, because it is the difference between "nothing is
-// due" and "this shard is accumulating rows that report nothing".
+// Examined, Limit and Unreadable are defined on DueCommandPage, including why
+// an unreadable row is skipped rather than failing the page and why locating
+// one is out of band. They mean the same things here.
 //
-// Limit is the EFFECTIVE limit, after a zero request limit has been resolved to
-// the store's page size, so the comparison is available to a caller that did
-// not name one.
-//
-// Unreadable counts rows this reader could not decode, that disagreed with the
-// filing they were found under, or that belong in a different shard. It is a
-// DIFFERENT signal from a remnant, and the difference is what a caller can DO:
-// a remnant is a row that was read, understood, and can be retired, and it is
-// reported in Remnants for exactly that; an unreadable row is one nothing in
-// this package can vouch for, so it is counted and left alone.
-//
-// Such a row is skipped rather than failing the page, and that is the strongest
-// rule here rather than leniency. This view is ascending by deadline, an
-// unreadable row's deadline is in the past and never changes, and nothing in
-// this package rewrites it — so a reader that failed the page on one would
-// switch gate expiry off for every tenant in the shard until someone repaired
-// the row by hand. The continuation steps past it; failing would not.
+// What is specific to this page is the distinction between the two ways a row
+// can report no gate. A REMNANT was read and understood and can be retired, so
+// it is reported in Remnants with the revision a retirement names; an
+// UNREADABLE row is one nothing in this package can vouch for, so it is counted
+// and left alone. Reporting the second as the first would aim a retirement at a
+// row whose gate may well be open in a record nobody could decode.
 type DueGatePage struct {
 	Gates      []DueGate
 	Remnants   []RemnantGateIntent
@@ -572,7 +566,7 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) (DueG
 	if !ok {
 		return DueGatePage{}, catalogErr(CatalogErrorInvalid, "limit", nil)
 	}
-	bound, after, err := s.dueGatePosition(shard, req)
+	bound, after, err := dueGateCursor.position(s, shard, req.Cursor, req.DueAtOrBefore)
 	if err != nil {
 		return DueGatePage{}, err
 	}
@@ -597,195 +591,152 @@ func (s *Store) ListDueGates(ctx context.Context, req ListDueGatesRequest) (DueG
 	// delivers is that a session's record is read at most once per page
 	// whatever order its rows arrive in, which is why it is a map and not a
 	// one-entry last-seen cache — that would reintroduce a re-read per row.
+	// TestListDueGatesReadsEachSessionOncePerPage measures that rather than
+	// leaving this paragraph to stand for it: this is the ONE per-session
+	// provider read either sweep performs, so it is the one a regression could
+	// turn back into a read per row.
 	//
 	// It retains a scope and the session's open-gate projections rather than
 	// whole catalog records, so a page holds at most its own row count times
 	// MaxCatalogOpenGates projections instead of that many 256 KiB records.
+	// Caching the "does not exist" case matters as much as caching a record: a
+	// page full of remnant intents for one deleted session would otherwise
+	// re-read it once per row.
 	sessions := make(map[dueSessionKey]dueSession, len(page.Records))
 	for _, stored := range page.Records {
-		intent, err := gateIntentFor(stored)
+		row, ok, err := s.dueGateRowFor(opCtx, stored, shard, sessions)
 		if err != nil {
+			return DueGatePage{}, err
+		}
+		if !ok {
 			due.Unreadable++
 			continue
 		}
-		key := dueSessionKey{tenant: intent.TenantID, session: intent.SessionID}
-		session, cached := sessions[key]
-		if !cached {
-			// Deriving a scope is pure, so a row's filing is settled before any
-			// provider work is done on its behalf: a misfiled row costs no
-			// round trip.
-			if session.scope, err = s.deriveSessionScope(intent.TenantID, intent.SessionID); err != nil {
-				due.Unreadable++
-				continue
-			}
-		}
-		// THE SHARD IS PART OF THE FILING. This reader did not name the row; it
-		// learned the row's identity from the row, and the shard is a function
-		// of that identity — so a row whose bytes hash elsewhere is filed where
-		// it does not belong. Reporting it would let one shard's sweep answer
-		// for a shard it was not asked about while the shard that owns the row
-		// never sees it, and reporting it as a REMNANT would aim a retirement
-		// at a row a correct sweep is still responsible for.
-		if session.scope.ControlShard != shard {
-			due.Unreadable++
+		if row.gate != nil {
+			due.Gates = append(due.Gates, DueGate{
+				TenantID: row.intent.TenantID, SessionID: row.intent.SessionID, Gate: *row.gate})
 			continue
 		}
-		// The intent must be FILED as its own bytes say it should be. It is
-		// checked for every row rather than once per session: what is being
-		// verified belongs to the ROW, and a cached session would otherwise let
-		// a misfiled intent through behind a well-filed one.
-		if err := verifyGateIntentFiling(stored, intent, session.scope); err != nil {
-			due.Unreadable++
-			continue
-		}
-		if !cached {
-			entry, err := s.readCatalogEntry(opCtx, session.scope, intent.TenantID, intent.SessionID)
-			if err != nil {
-				// A session that has no durable existence cannot have a
-				// durably open gate, so its remnant intents are reported as
-				// remnants rather than failing the whole page. That is a narrow
-				// list on purpose: an absent record, a tombstoned one, and an
-				// unbound session witness each mean "there is no such session",
-				// while every other failure — a collision, a corrupt record, a
-				// provider error — is a reason to stop rather than to conclude
-				// anything about this gate.
-				if !noSuchSession(err) {
-					if !rowLocalCatalogFailure(err) {
-						// Reported WITHOUT a row position, deliberately. This
-						// branch has just decided the failure is not about this
-						// row — it is a provider fault or an ambiguous outcome
-						// — so labelling it "due_gates[3]" would point an
-						// operator at a row that is very likely fine. Every
-						// failure that IS about a row is counted above and
-						// never returned at all, which is what left this the
-						// only path out and made the label wrong.
-						return DueGatePage{}, err
-					}
-					// The session's own record is unreadable, which is a fact
-					// about THIS row's session rather than about the view. It
-					// is counted and stepped over for the reason Unreadable
-					// documents; a provider failure is not, because it says
-					// nothing about any row and continuing would turn an
-					// outage into a page of silent zeroes.
-					due.Unreadable++
-					continue
-				}
-			} else {
-				session.exists = true
-				session.gates = entry.Record.OpenGates
-			}
-			sessions[key] = session
-		}
-		// The validation this reader exists for: an intent is only reported as
-		// a due GATE when the session's durable record really does project that
-		// gate as open, with the same opening event and the same deadline. An
-		// intent written for an open that never committed matches nothing.
-		matched := false
-		for _, gate := range session.gates {
-			if intent.matches(gate) {
-				due.Gates = append(due.Gates, DueGate{TenantID: intent.TenantID, SessionID: intent.SessionID, Gate: gate})
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			due.Remnants = append(due.Remnants, RemnantGateIntent{
-				TenantID: intent.TenantID, SessionID: intent.SessionID,
-				GateID: intent.GateID, Revision: stored.Revision})
-		}
+		due.Remnants = append(due.Remnants, RemnantGateIntent{
+			TenantID: row.intent.TenantID, SessionID: row.intent.SessionID,
+			GateID: row.intent.GateID, Revision: stored.Revision})
 	}
 	if page.NextCursor != "" {
-		if due.NextCursor, err = s.encodeDueGateCursor(shard, bound, page.NextCursor); err != nil {
+		if due.NextCursor, err = dueGateCursor.encode(s, shard, bound, page.NextCursor); err != nil {
 			return DueGatePage{}, err
 		}
 	}
 	return due, nil
 }
 
-// The due gates continuation. Its payload is the due bound this sweep is
-// querying at, followed by the provider's own due token carried verbatim.
-//
-// THE BOUND IS IN THE TOKEN because the ordered index binds a due cursor to the
-// exact bound that issued it, so a resumed call that recomputed the bound would
-// present a token for a different query and be refused. Carrying it costs
-// nothing in safety: ListDueGates WRITES NOTHING, and every row it reports is
-// held to its own stored filing and to the session's durable projection before
-// it is reported at all — so a caller presenting a bound this store never
-// issued can at worst make the reader look at rows that are not due.
-//
-// The retirement a remnant enables is a SEPARATE call that revalidates from
-// scratch against its own clock reading and its own read of the projection, so
-// no part of it rests on the bound this token carries.
-const (
-	dueGateCursorMagic        = "LRDG"
-	dueGateCursorVersion byte = 1
-
-	dueGateBoundBytes = 8
-
-	// The ceiling is enforced on ISSUE as well as on presentation, so a token
-	// this store hands out is always one it will accept back — and a
-	// continuation it could not reissue is a sweep that silently reverts to
-	// making no progress at the head of the view.
-	maxDueGateCursorBytes   = 4 << 10
-	maxDueGateCursorPayload = maxDueGateCursorBytes - cursorPayloadAt
-)
-
-// dueGateCursorScope binds a continuation to this cursor KIND and to the SHARD
-// it was issued for, and to nothing else; see dueCommandCursorScope for why the
-// shard is in the scope rather than in the payload, for why that binding is
-// defence in depth over the provider's own namespace check rather than the only
-// barrier, and cursor.go for why the scope is a binding tag and not a MAC.
-func (s *Store) dueGateCursorScope(shard uint32) [cursorScopeBytes]byte {
-	return s.keys.digest(digestFrame(
-		"looprig/sessionstore/duegate/cursor/v1", binary.BigEndian.AppendUint32(nil, shard)))
+// dueGateRow is one due row this reader can vouch for: the intent it decoded
+// and, when the session's durable record still projects that gate as open, the
+// projection itself. A nil gate is a remnant — read, understood, and
+// retireable — which is a different fact from a row that could not be read.
+type dueGateRow struct {
+	intent gateIntent
+	gate   *sessionwire.GateProjection
 }
 
-func (s *Store) encodeDueGateCursor(shard uint32, bound int64, after storage.DueCursor) (sessionwire.Cursor, error) {
-	payload := make([]byte, dueGateBoundBytes, dueGateBoundBytes+len(after))
-	binary.BigEndian.PutUint64(payload, uint64(bound)) // #nosec G115 -- a signed bound round-trips through the same width
-	payload = append(payload, after...)
-	if len(payload) > maxDueGateCursorPayload {
-		return "", catalogErr(CatalogErrorBackend, "next_cursor", nil)
+// dueGateRowFor decides one row of a due page, reporting whether this store can
+// vouch for it.
+//
+// It is the gates twin of dueCommandFor and differs in exactly one way, which
+// is the reason it takes a context and returns an error at all: this sweep
+// performs one PROVIDER READ per distinct session, so it has a failure that is
+// about the store rather than about the row. That failure is returned and ends
+// the page; every failure that is about the row is reported as false and
+// counted by the caller.
+//
+// The sessions map is threaded through rather than rebuilt, because the read it
+// caches is the only per-session cost either sweep has.
+func (s *Store) dueGateRowFor(
+	ctx context.Context,
+	stored storage.OrderedRecord,
+	shard uint32,
+	sessions map[dueSessionKey]dueSession,
+) (dueGateRow, bool, error) {
+	intent, err := gateIntentFor(stored)
+	if err != nil {
+		return dueGateRow{}, false, nil
 	}
-	return sessionwire.Cursor(encodeCursorEnvelope(
-		dueGateCursorMagic, dueGateCursorVersion, s.dueGateCursorScope(shard), payload)), nil
-}
-
-// decodeDueGateCursor unwraps a continuation this store issued for this shard.
-// One this reader issued always carries at least one provider byte beyond the
-// bound, because an exhausted view returns no cursor at all.
-func (s *Store) decodeDueGateCursor(shard uint32, cursor sessionwire.Cursor) (int64, storage.DueCursor, error) {
-	payload, ok := decodeCursorEnvelope(
-		dueGateCursorMagic, dueGateCursorVersion, s.dueGateCursorScope(shard),
-		string(cursor), dueGateBoundBytes+1, maxDueGateCursorPayload)
-	if !ok {
-		return 0, "", catalogErr(CatalogErrorCursor, "cursor", nil)
-	}
-	bound := int64(binary.BigEndian.Uint64(payload[:dueGateBoundBytes])) // #nosec G115 -- the inverse of the encode above
-	return bound, storage.DueCursor(payload[dueGateBoundBytes:]), nil
-}
-
-// dueGatePosition resolves one request to the (bound, provider position) the
-// page is read at, refusing a request that states the bound twice.
-//
-// A request may not carry both a continuation and a bound. Preferring either
-// silently is how a resumed sweep starts querying a bound it was never bound to
-// — the provider would refuse the token, and the sweep would restart at the
-// head of the view every time, which looks like liveness and is starvation.
-func (s *Store) dueGatePosition(shard uint32, req ListDueGatesRequest) (int64, storage.DueCursor, error) {
-	if req.Cursor == "" {
-		// rankableTime already refuses the zero Time, which is earlier than
-		// every representable instant; a separate IsZero check would be a
-		// second statement of one rule.
-		if !rankableTime(req.DueAtOrBefore) {
-			return 0, "", catalogErr(CatalogErrorInvalid, "due_at_or_before", nil)
+	key := dueSessionKey{tenant: intent.TenantID, session: intent.SessionID}
+	session, cached := sessions[key]
+	if !cached {
+		// Deriving a scope is pure, so a row's filing is settled before any
+		// provider work is done on its behalf: a misfiled row costs no round
+		// trip.
+		if session.scope, err = s.deriveSessionScope(intent.TenantID, intent.SessionID); err != nil {
+			return dueGateRow{}, false, nil
 		}
-		return req.DueAtOrBefore.UnixMilli(), "", nil
 	}
-	if !req.DueAtOrBefore.IsZero() {
-		return 0, "", catalogErr(CatalogErrorInvalid, "due_at_or_before", nil)
+	// THE SHARD IS PART OF THE FILING. This reader did not name the row; it
+	// learned the row's identity from the row, and the shard is a function of
+	// that identity — so a row whose bytes hash elsewhere is filed where it does
+	// not belong. Reporting it would let one shard's sweep answer for a shard it
+	// was not asked about while the shard that owns the row never sees it, and
+	// reporting it as a REMNANT would aim a retirement at a row a correct sweep
+	// is still responsible for.
+	if session.scope.ControlShard != shard {
+		return dueGateRow{}, false, nil
 	}
-	return s.decodeDueGateCursor(shard, req.Cursor)
+	// The intent must be FILED as its own bytes say it should be. It is checked
+	// for every row rather than once per session: what is being verified belongs
+	// to the ROW, and a cached session would otherwise let a misfiled intent
+	// through behind a well-filed one.
+	if err := verifyGateIntentFiling(stored, intent, session.scope); err != nil {
+		return dueGateRow{}, false, nil
+	}
+	if !cached {
+		entry, err := s.readCatalogEntry(ctx, session.scope, intent.TenantID, intent.SessionID)
+		if err != nil {
+			// A session that has no durable existence cannot have a durably
+			// open gate, so its remnant intents are reported as remnants rather
+			// than failing the whole page. That is a narrow list on purpose: an
+			// absent record, a tombstoned one, and an unbound session witness
+			// each mean "there is no such session", while every other failure —
+			// a collision, a corrupt record, a provider error — is a reason to
+			// stop rather than to conclude anything about this gate.
+			if !noSuchSession(err) {
+				if !rowLocalCatalogFailure(err) {
+					// Reported WITHOUT a row position, deliberately. This
+					// branch has just decided the failure is not about this row
+					// — it is a provider fault or an ambiguous outcome — so
+					// labelling it "due_gates[3]" would point an operator at a
+					// row that is very likely fine. Every failure that IS about
+					// a row is reported as false and never returned at all,
+					// which is what left this the only path out and made the
+					// label wrong.
+					return dueGateRow{}, false, err
+				}
+				// The session's own record is unreadable, which is a fact about
+				// THIS row's session rather than about the view. It is counted
+				// and stepped over for the reason Unreadable documents; a
+				// provider failure is not, because it says nothing about any
+				// row and continuing would turn an outage into a page of silent
+				// zeroes.
+				//
+				// The session is NOT cached here. A row-local failure is a fact
+				// about the record this read found, and caching it would make
+				// one bad read decide every later row of the same session in
+				// this page as a remnant — which is a retirement candidate.
+				return dueGateRow{}, false, nil
+			}
+		} else {
+			session.gates = entry.Record.OpenGates
+		}
+		sessions[key] = session
+	}
+	// The validation this reader exists for: an intent is only reported as a
+	// due GATE when the session's durable record really does project that gate
+	// as open, with the same opening event and the same deadline. An intent
+	// written for an open that never committed matches nothing.
+	for i, gate := range session.gates {
+		if intent.matches(gate) {
+			return dueGateRow{intent: intent, gate: &session.gates[i]}, true, nil
+		}
+	}
+	return dueGateRow{intent: intent}, true, nil
 }
 
 // verifyGateIntentFiling holds every provider-supplied key component of one
@@ -834,18 +785,23 @@ type dueSessionKey struct {
 }
 
 // dueSession is what a due page remembers about one session it has already
-// resolved: the scope every row filed under that session must match, whether
-// the session durably exists, and its open-gate projections.
+// resolved: the scope every row filed under that session must match, and its
+// open-gate projections.
 //
 // It holds the projections rather than the CatalogEntry so a page retains the
 // gates it actually matches against instead of whole catalog records, whose
 // bound is three orders of magnitude larger. Caching the "does not exist" case
 // matters as much as caching a record: a page full of remnant intents for one
-// deleted session would otherwise re-read it once per row.
+// deleted session would otherwise re-read it once per row. A session that does
+// not exist is cached as an entry with NO GATES, which is the same thing to
+// every reader — it matches nothing — and needs no marker of its own. An
+// earlier version carried an `exists` flag that nothing read, which invited the
+// conclusion that this loop distinguishes "no such session" from "session with
+// no matching gate". It does not, and neither reader needs it to: both are
+// remnants.
 type dueSession struct {
-	scope  sessionScope
-	exists bool
-	gates  []sessionwire.GateProjection
+	scope sessionScope
+	gates []sessionwire.GateProjection
 }
 
 // noSuchSession reports whether err means the named session has no durable
@@ -862,8 +818,8 @@ func noSuchSession(err error) bool {
 	return errors.As(err, &keyspace) && keyspace.Code == KeyspaceBindingNotFound
 }
 
-// commitGateIntent makes one gate's deadline durable, and RE-STAMPS an
-// existing one with this attempt's instant.
+// commitGateIntent makes one gate's deadline durable, and ADVANCES an existing
+// one to this attempt's instant when this attempt's is later.
 //
 // Create is idempotent by identity, so a retry of an interrupted open finds its
 // own intent; what it must not do is silently adopt a DIFFERENT gate's intent
@@ -880,13 +836,15 @@ func noSuchSession(err error) bool {
 // gate about to become publicly open. No clock skew and no stalled process is
 // needed for that; the age simply describes the wrong attempt.
 //
-// Every attempt is a new in-flight open, so every attempt restarts the window.
-// That does make the window a rate limit on retries — an intent cannot be
-// retired while opens keep arriving for it — and that is the correct trade:
-// opens arriving for a gate mean the gate is being opened, which is exactly
-// when the deadline must not be removed. TestAnOpenGateRetryDoesNotInheritThe
-// FirstAttemptsRemnantWindow drives the scenario rather than leaving this
-// paragraph to stand for it.
+// Every attempt is a new in-flight open, so every attempt restarts the window —
+// FORWARD ONLY. That does make the window a rate limit on retries — an intent
+// cannot be retired while opens keep arriving for it — and that is the correct
+// trade: opens arriving for a gate mean the gate is being opened, which is
+// exactly when the deadline must not be removed.
+// TestAnOpenGateRetryDoesNotInheritTheFirstAttemptsRemnantWindow drives the
+// forward direction and TestTheIntentsRecordedInstantNeverMovesBackward the
+// other, because the two failures look nothing alike: one leaves the window
+// already elapsed, the other retracts it after the fact.
 //
 // A LOST COMPARE-AND-SWAP IS RETURNED, not absorbed. The only writers of this
 // row are this function and the two retirement paths, and both of those DELETE
@@ -921,12 +879,21 @@ func (s *Store) commitGateIntent(
 	if !existing.matches(gate) {
 		return catalogErr(CatalogErrorConflict, "gate_intent", nil)
 	}
-	// The stored instant is already this attempt's when a caller repeats
-	// within one clock reading. Skipping the write there is not a shortcut
-	// past a check — the record is byte-identical to what the write would
-	// store, because canonicalization is a fixed point and every other member
-	// has just been compared through matches.
-	if existing.RecordedAt.Equal(intent.RecordedAt) {
+	// THE STORED INSTANT IS A MAXIMUM OVER ATTEMPTS, NOT A LAST WRITER'S VALUE.
+	// An attempt whose own reading is not later than the stored one has nothing
+	// to add and must not write, and the direction is what matters: this
+	// predicate is not an optimization with an equality shortcut, it is the
+	// rule.
+	//
+	// The reading comes from the top of OpenGate, before the session-scope
+	// verification and the catalog read, so attempts COMMIT in an order that
+	// has nothing to do with the order they READ THE CLOCK in. A slower
+	// attempt holding an older reading routinely arrives last, and it arrives
+	// holding a CURRENT revision — so the compare-and-swap below is no barrier
+	// to it. Letting it win would retract the window onto an attempt that has
+	// already finished, which is precisely the state the re-stamp exists to
+	// prevent, reached from the other side.
+	if !intent.RecordedAt.After(existing.RecordedAt) {
 		return nil
 	}
 	// The rank and due state are the ones this file files on every path, so
@@ -1048,15 +1015,16 @@ type gateIntent struct {
 	// a start, which is this member. See MinGateIntentRemnantAge for the window
 	// and for what a skewed clock costs.
 	//
-	// IT IS STAMPED BY EVERY ATTEMPT, not once. matches deliberately ignores
-	// it, so an intent stays the same intent across a retry — but the retry
-	// re-stamps it under a compare-and-swap, because the window has to describe
-	// the attempt that is in flight NOW. Inheriting the first attempt's instant
-	// is a live defect, not a theoretical one: it needs no clock skew and no
-	// stalled process, only the ordinary restart path. See commitGateIntent,
-	// which performs the re-stamp and argues the trade, and
-	// TestAnOpenGateRetryDoesNotInheritTheFirstAttemptsRemnantWindow, which
-	// drove the failure before the re-stamp existed.
+	// IT IS THE LATEST ATTEMPT'S READING, not the first's and not the last
+	// writer's. matches deliberately ignores it, so an intent stays the same
+	// intent across a retry — but each attempt ADVANCES it under a
+	// compare-and-swap, never retracts it, because the window has to describe
+	// the attempt in flight now and an attempt that cannot advance it has
+	// nothing to add. Both directions are live defects rather than theoretical
+	// ones: inheriting the first attempt's instant needs only the ordinary
+	// restart path, and retracting onto a stale reading needs only two attempts
+	// overlapping. See commitGateIntent, which holds the rule and argues the
+	// trade.
 	RecordedAt time.Time
 }
 
