@@ -2700,6 +2700,24 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 	// — a declared constant and a carried field — because a walk that reached
 	// only one would leave the other's kinds unchecked, which is exactly what
 	// happened when the sweep codecs were hoisted.
+	// DISTINCTNESS IS COMPARED BEFORE THE COUNTS, and the order is the whole
+	// of what makes an exact count safe. A sixth magic that duplicates LRHT is
+	// both a collision and a count change, and whichever assertion runs first
+	// names the failure: with the counts first it read "found 6 declared cursor
+	// magics, want 5; add or remove one deliberately rather than letting a
+	// count drift" — a real collision reported as bookkeeping, which is exactly
+	// the objection that made the carried count a floor. Comparing first means
+	// a duplicate is reported as a duplicate and a genuine drift, which has no
+	// duplicate, still reports as a drift. Exactness costs nothing once the
+	// ordering is right.
+	seen := map[string]string{}
+	for name, magic := range magics {
+		if other, ok := seen[magic]; ok {
+			t.Fatalf("%s and %s share the magic %q", other, name, magic)
+		}
+		seen[magic] = name
+	}
+
 	// The two halves are counted SEPARATELY and EXACTLY, which the previous
 	// floor could not do. `len(magics) < 7` was met by five declared magics,
 	// two carried ones and THREE non-magics the collector should never have
@@ -2780,11 +2798,4 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 		}
 	}
 
-	seen := map[string]string{}
-	for name, magic := range magics {
-		if other, ok := seen[magic]; ok {
-			t.Fatalf("%s and %s share the magic %q", other, name, magic)
-		}
-		seen[magic] = name
-	}
 }

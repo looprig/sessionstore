@@ -2453,9 +2453,216 @@ func sweepCursorLiteralsIn(composite *ast.CompositeLit) []*ast.CompositeLit {
 	return found
 }
 
-// assertSweepCursorKindRolesAreUnderstood is the guard on the guards: it fails
-// when sweepCursorKind is NAMED anywhere the literal readers above cannot
-// decode a literal from.
+// cursorKindReadabilityViolations reports every way one parsed production file
+// defeats the readers the two cursor guards depend on, and returns the count of
+// occurrences and whether the declaration was seen so the caller can prove the
+// walk was not vacuous.
+//
+// It returns violations rather than failing, for the reason
+// productionImportViolations does: the same logic then serves the LIVE package
+// and a table of parsed source. That table is not a convenience. Three roles
+// this reconciliation rejected — the (*T)(nil) interface assertion, a method
+// expression, an explicit type argument — were legal, literal-free code, and
+// they were found by hand-probing rather than by anything in the suite. Driving
+// them here means a re-break is a test failure instead of a discovery.
+func cursorKindReadabilityViolations(name string, fileSet *token.FileSet, file *ast.File) (int, bool, []string) {
+	const kind = "sweepCursorKind"
+	occurrences := 0
+	declared := false
+	var violations []string
+	accounted := map[*ast.Ident]bool{}
+	markAll := func(node ast.Node) {
+		if node == nil {
+			return
+		}
+		ast.Inspect(node, func(inner ast.Node) bool {
+			if named, ok := inner.(*ast.Ident); ok && named.Name == kind {
+				accounted[named] = true
+			}
+			return true
+		})
+	}
+	markOne := func(expr ast.Expr) {
+		if named, ok := expr.(*ast.Ident); ok && named.Name == kind {
+			accounted[named] = true
+		}
+	}
+	// markTypeOperand accounts a type NAMED where a value is expected: a
+	// conversion's callee, a generic call's type argument, a method
+	// expression's receiver. It unwraps parentheses and pointers, and
+	// markOne MUST NOT — the two are shared with the composite-literal arm,
+	// where `[]*sweepCursorKind{{...}}` has a StarExpr element type that
+	// elides legally. Unwrapping there would account that literal and
+	// reopen a live escape, so the unwrapping lives here and only here.
+	markTypeOperand := func(expr ast.Expr) {
+		for {
+			switch inner := expr.(type) {
+			case *ast.ParenExpr:
+				expr = inner.X
+				continue
+			case *ast.StarExpr:
+				expr = inner.X
+				continue
+			case *ast.IndexExpr:
+				// A generic instantiation's type argument.
+				markAll(inner.Index)
+				return
+			case *ast.IndexListExpr:
+				for _, index := range inner.Indices {
+					markAll(index)
+				}
+				return
+			case *ast.SelectorExpr:
+				// A method expression, sweepCursorKind.scope: the receiver
+				// TYPE is named where a value would be.
+				markOne(inner.X)
+				return
+			}
+			markOne(expr)
+			return
+		}
+	}
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.TypeSpec:
+			// The declaration names itself; its right-hand side does not
+			// get the same pass, which is what catches a named container.
+			if typed.Name.Name == kind {
+				accounted[typed.Name] = true
+				declared = true
+			}
+		case *ast.FuncDecl:
+			if typed.Recv != nil {
+				for _, field := range typed.Recv.List {
+					markAll(field.Type)
+				}
+			}
+			markAll(typed.Type)
+		case *ast.ValueSpec:
+			markAll(typed.Type)
+		case *ast.TypeAssertExpr:
+			markAll(typed.Type)
+		case *ast.StructType:
+			// A STRUCT FIELD cannot hide an elided literal, and that is a
+			// fact about Go rather than a judgement: elision is permitted
+			// only inside an array, slice or map literal, so
+			// `zzHolder{k: {magic: "LRDG"}}` does not compile — "missing
+			// type in composite literal". A literal reaching a struct field
+			// must therefore name its type, which the decoder reads. Not
+			// accounting these made the reconciliation reject an ordinary
+			// struct that holds a cursor kind.
+			for _, field := range typed.Fields.List {
+				markAll(field.Type)
+			}
+		case *ast.FuncType:
+			// Interface methods and func-typed fields, for the same reason
+			// a FuncDecl's signature is accounted: a signature holds no
+			// composite literal.
+			markAll(typed)
+		case *ast.CaseClause:
+			// A type switch's case names types. Only a BARE identifier is
+			// accounted, so a composite literal appearing in a value switch
+			// still reaches the CompositeLit arm below.
+			for _, item := range typed.List {
+				markOne(item)
+			}
+		case *ast.SelectorExpr:
+			// A method expression, `sweepCursorKind.scope`. Only an X that
+			// IS the identifier is accounted, so `k.magic` on a value is
+			// untouched.
+			markOne(typed.X)
+		case *ast.CallExpr:
+			// A conversion names the type in Fun — including the
+			// `(*T)(nil)` spelling of the interface-satisfaction assertion,
+			// which is the most common assertion in Go and which this
+			// reconciliation rejected until it read through the parentheses
+			// and the pointer. make and new name it in an argument, and a
+			// generic call names it as a type argument. None can carry a
+			// composite literal of this type, and all are ordinary enough
+			// that failing on them is the same false alarm the empty-literal
+			// arm was: legal, literal-free code reported as a breach.
+			markTypeOperand(typed.Fun)
+			if callee, ok := typed.Fun.(*ast.Ident); ok && (callee.Name == "make" || callee.Name == "new") {
+				for _, argument := range typed.Args {
+					markAll(argument)
+				}
+			}
+		case *ast.CompositeLit:
+			switch container := typed.Type.(type) {
+			case *ast.Ident:
+				markOne(container)
+			case *ast.ArrayType:
+				markOne(container.Elt)
+			case *ast.MapType:
+				markOne(container.Key)
+				markOne(container.Value)
+			}
+		}
+		return true
+	})
+
+	// THE FIELDS MAY ONLY BE SET IN A LITERAL, and this is the other half of
+	// what makes the readers above sufficient. Skipping a literal with no
+	// magic was justified on the ground that a zero-valued kind cannot be
+	// used — encode panics on cursor.go's length invariant — and that
+	// justification is FALSE the moment the field is assigned afterwards:
+	//
+	//	k := sweepCursorKind{}
+	//	k.magic = "LRDG"
+	//
+	// carried a duplicate magic and a duplicate domain past both guards
+	// once the empty literal became a skip. The skip is still right; what
+	// was missing is that it is only safe while the fields stay where the
+	// readers look. Both fields are set today in exactly two literals and
+	// read only as k.magic, so this is satisfied on arrival.
+	ast.Inspect(file, func(node ast.Node) bool {
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		for _, target := range assign.Lhs {
+			selector, ok := target.(*ast.SelectorExpr)
+			if !ok {
+				continue
+			}
+			if selector.Sel.Name != "magic" && selector.Sel.Name != "domain" {
+				continue
+			}
+			position := fileSet.Position(selector.Pos())
+			violations = append(violations, fmt.Sprintf(
+				"%s:%d assigns .%s outside a composite literal, where neither distinctness guard can read it: "+
+					"a kind built as a zero value and then filled in carries a magic and a domain that are compared against nothing. "+
+					"Build the kind in one literal, which both guards read.",
+				name, position.Line, selector.Sel.Name))
+		}
+		return true
+	})
+
+	ast.Inspect(file, func(node ast.Node) bool {
+		named, ok := node.(*ast.Ident)
+		if !ok || named.Name != kind {
+			return true
+		}
+		occurrences++
+		if accounted[named] {
+			return true
+		}
+		position := fileSet.Position(named.Pos())
+		violations = append(violations, fmt.Sprintf(
+			"%s:%d names %s in a role the cursor guards do not decode, so a composite literal reachable through it would be attributed to nothing and its magic and domain would go uncompared. "+
+				"If that role can carry a literal — a named container type, an alias, a nested container, a pointer or generic element — extend sweepCursorLiteralsIn to decode it. "+
+				"If it provably cannot, add the role to the accounted set here and say why.",
+			name, position.Line, kind))
+		return true
+	})
+	return occurrences, declared, violations
+}
+
+// assertSweepCursorKindRolesAreUnderstood is the guard on the guards, and it
+// holds TWO assumptions the readers above rest on. ATTRIBUTION: sweepCursorKind
+// is never named anywhere those readers cannot decode a literal from. LOCALITY:
+// a magic and a domain are only ever set INSIDE a literal, never assigned onto
+// a value afterwards, because a reader of literals cannot see an assignment.
 //
 // WHY A RULE RATHER THAN A LIST OF GAPS. The header of TestCursorMagicsAreDistinct
 // twice enumerated the spellings that escaped it, and both enumerations were
@@ -2490,7 +2697,6 @@ func sweepCursorLiteralsIn(composite *ast.CompositeLit) []*ast.CompositeLit {
 func assertSweepCursorKindRolesAreUnderstood(t *testing.T, files []string) {
 	t.Helper()
 
-	const kind = "sweepCursorKind"
 	occurrences := 0
 	declared := false
 	for _, name := range files {
@@ -2502,119 +2708,24 @@ func assertSweepCursorKindRolesAreUnderstood(t *testing.T, files []string) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", name, err)
 		}
-
-		accounted := map[*ast.Ident]bool{}
-		markAll := func(node ast.Node) {
-			if node == nil {
-				return
-			}
-			ast.Inspect(node, func(inner ast.Node) bool {
-				if named, ok := inner.(*ast.Ident); ok && named.Name == kind {
-					accounted[named] = true
-				}
-				return true
-			})
+		found, declaredHere, violations := cursorKindReadabilityViolations(name, fileSet, file)
+		occurrences += found
+		declared = declared || declaredHere
+		for _, violation := range violations {
+			t.Error(violation)
 		}
-		markOne := func(expr ast.Expr) {
-			if named, ok := expr.(*ast.Ident); ok && named.Name == kind {
-				accounted[named] = true
-			}
+		if len(violations) > 0 {
+			t.FailNow()
 		}
-		ast.Inspect(file, func(node ast.Node) bool {
-			switch typed := node.(type) {
-			case *ast.TypeSpec:
-				// The declaration names itself; its right-hand side does not
-				// get the same pass, which is what catches a named container.
-				if typed.Name.Name == kind {
-					accounted[typed.Name] = true
-					declared = true
-				}
-			case *ast.FuncDecl:
-				if typed.Recv != nil {
-					for _, field := range typed.Recv.List {
-						markAll(field.Type)
-					}
-				}
-				markAll(typed.Type)
-			case *ast.ValueSpec:
-				markAll(typed.Type)
-			case *ast.TypeAssertExpr:
-				markAll(typed.Type)
-			case *ast.StructType:
-				// A STRUCT FIELD cannot hide an elided literal, and that is a
-				// fact about Go rather than a judgement: elision is permitted
-				// only inside an array, slice or map literal, so
-				// `zzHolder{k: {magic: "LRDG"}}` does not compile — "missing
-				// type in composite literal". A literal reaching a struct field
-				// must therefore name its type, which the decoder reads. Not
-				// accounting these made the reconciliation reject an ordinary
-				// struct that holds a cursor kind.
-				for _, field := range typed.Fields.List {
-					markAll(field.Type)
-				}
-			case *ast.FuncType:
-				// Interface methods and func-typed fields, for the same reason
-				// a FuncDecl's signature is accounted: a signature holds no
-				// composite literal.
-				markAll(typed)
-			case *ast.CaseClause:
-				// A type switch's case names types. Only a BARE identifier is
-				// accounted, so a composite literal appearing in a value switch
-				// still reaches the CompositeLit arm below.
-				for _, item := range typed.List {
-					markOne(item)
-				}
-			case *ast.CallExpr:
-				// A conversion names the type in Fun; make and new name it in
-				// an argument. None of the three can carry a composite literal
-				// of this type, and all three are plausible enough that failing
-				// on them would be the same false alarm the empty-literal arm
-				// was: legal, literal-free code reported as a breach.
-				markOne(typed.Fun)
-				if callee, ok := typed.Fun.(*ast.Ident); ok && (callee.Name == "make" || callee.Name == "new") {
-					for _, argument := range typed.Args {
-						markAll(argument)
-					}
-				}
-			case *ast.CompositeLit:
-				switch container := typed.Type.(type) {
-				case *ast.Ident:
-					markOne(container)
-				case *ast.ArrayType:
-					markOne(container.Elt)
-				case *ast.MapType:
-					markOne(container.Key)
-					markOne(container.Value)
-				}
-			}
-			return true
-		})
-
-		ast.Inspect(file, func(node ast.Node) bool {
-			named, ok := node.(*ast.Ident)
-			if !ok || named.Name != kind {
-				return true
-			}
-			occurrences++
-			if accounted[named] {
-				return true
-			}
-			position := fileSet.Position(named.Pos())
-			t.Fatalf("%s:%d names %s in a role the cursor guards do not decode, so a composite literal reachable through it would be attributed to nothing and its magic and domain would go uncompared. "+
-				"If that role can carry a literal — a named container type, an alias, a nested container, a struct field — extend sweepCursorLiteralsIn to decode it. "+
-				"If it provably cannot, add the role to the accounted set here and say why.",
-				name, position.Line, kind)
-			return true
-		})
 	}
 
 	// Anti-vacuity, both halves: a walk that found no occurrence, or that never
 	// reached the declaration, would report a clean bill on nothing at all.
 	if !declared {
-		t.Fatalf("no production file declares %s; this reconciliation examined nothing", kind)
+		t.Fatalf("no production file declares sweepCursorKind; this reconciliation examined nothing")
 	}
 	if occurrences == 0 {
-		t.Fatalf("found no occurrence of %s; the reconciliation is vacuous", kind)
+		t.Fatal("found no occurrence of sweepCursorKind; the reconciliation is vacuous")
 	}
 }
 
@@ -2694,6 +2805,81 @@ func TestSweepCursorLiteralsInDecodesEachContainerShape(t *testing.T) {
 			text, err := strconv.Unquote(literal.Value)
 			if err != nil || text != tt.first {
 				t.Fatalf("decoded magic %q (%v) from %q, want %q", text, err, tt.decl, tt.first)
+			}
+		})
+	}
+}
+
+// TestCursorKindReadabilityAcceptsLegalShapesAndRejectsUnreadableOnes drives the
+// reconciliation over parsed source, in BOTH polarities, because the two
+// polarities are confirmed by opposite results and a suite that only checks one
+// of them is half a guard.
+//
+// The rejected rows are shapes that carried a duplicate magic and a duplicate
+// domain past both guards. Each payload here is a REAL duplicate for that
+// reason: an escape probe given a fresh magic reports the same clean result as
+// a closed escape, so a non-duplicate payload silently disarms the row.
+//
+// The accepted rows are the more valuable half. Every one of them is legal,
+// literal-free Go that this reconciliation rejected at some point in its life —
+// make, the (*T)(nil) interface assertion, a method expression, a type argument,
+// a struct field — and each was found by hand rather than by the suite. A guard
+// that reports a legal arrangement as a breach is the one that gets deleted, so
+// the shapes it must not reject are pinned as firmly as the ones it must catch.
+func TestCursorKindReadabilityAcceptsLegalShapesAndRejectsUnreadableOnes(t *testing.T) {
+	t.Parallel()
+
+	const dup = `magic: "LRDG", domain: "looprig/sessionstore/duegate/cursor/v1"`
+	tests := []struct {
+		name   string
+		source string
+		reject bool
+	}{
+		{name: "the declaration itself", source: "type sweepCursorKind struct{ magic, domain string }"},
+		{name: "literal naming its type", source: `var v = sweepCursorKind{` + dup + `}`},
+		{name: "slice element elides", source: `var v = []sweepCursorKind{{` + dup + `}}`},
+		{name: "map value elides", source: `var v = map[string]sweepCursorKind{"k": {` + dup + `}}`},
+		{name: "method receiver", source: "func (k sweepCursorKind) scope() string { return k.magic }"},
+		{name: "signature", source: "func f(a sweepCursorKind, b []sweepCursorKind) (*sweepCursorKind, error) { _, _ = a, b; return nil, nil }"},
+		{name: "declared variable", source: "var v []sweepCursorKind"},
+		{name: "make", source: "func f() { _ = make([]sweepCursorKind, 0, 2) }"},
+		{name: "new", source: "func f() { _ = new(sweepCursorKind) }"},
+		{name: "conversion", source: "func f(v sweepCursorKind) sweepCursorKind { return sweepCursorKind(v) }"},
+		{name: "interface satisfaction via (*T)(nil)", source: "type s interface{ scope() string }\n\nvar _ s = (*sweepCursorKind)(nil)"},
+		{name: "method expression", source: "var m = sweepCursorKind.scope"},
+		{name: "explicit type argument", source: "func id[T any](v T) T { return v }\n\nvar v = id[sweepCursorKind](x)"},
+		{name: "struct field", source: "type holder struct{ k sweepCursorKind }"},
+		{name: "interface method", source: "type i interface{ pick() sweepCursorKind }"},
+		{name: "type assertion", source: "func f(v any) { _, _ = v.(sweepCursorKind) }"},
+		{name: "type switch", source: "func f(v any) {\n\tswitch v.(type) {\n\tcase sweepCursorKind:\n\t}\n}"},
+
+		{name: "named container type", reject: true, source: "type kinds []sweepCursorKind\n\nvar v = kinds{{" + dup + "}}"},
+		{name: "alias", reject: true, source: "type alias = sweepCursorKind\n\nvar v = []alias{{" + dup + "}}"},
+		{name: "nested container", reject: true, source: "var v = [][]sweepCursorKind{{{" + dup + "}}}"},
+		{name: "map of containers", reject: true, source: `var v = map[string][]sweepCursorKind{"a": {{` + dup + `}}}`},
+		{name: "pointer element", reject: true, source: "var v = []*sweepCursorKind{{" + dup + "}}"},
+		{name: "generic container instantiation", reject: true, source: "type box[T any] []T\n\nvar v = box[sweepCursorKind]{{" + dup + "}}"},
+		{name: "magic assigned outside a literal", reject: true, source: "func f() sweepCursorKind {\n\tk := sweepCursorKind{}\n\tk.magic = \"LRDG\"\n\treturn k\n}"},
+		{name: "domain assigned outside a literal", reject: true, source: "func f() sweepCursorKind {\n\tk := sweepCursorKind{version: 1}\n\tk.domain = \"looprig/sessionstore/duegate/cursor/v1\"\n\treturn k\n}"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fileSet := token.NewFileSet()
+			file, err := parser.ParseFile(fileSet, "probe.go", "package probe\n\n"+tt.source+"\n", 0)
+			if err != nil {
+				t.Fatalf("parse %q: %v", tt.source, err)
+			}
+			occurrences, _, violations := cursorKindReadabilityViolations("probe.go", fileSet, file)
+			if occurrences == 0 {
+				t.Fatalf("no occurrence of the type in %q; this row would pass whatever the rule did", tt.source)
+			}
+			switch {
+			case tt.reject && len(violations) == 0:
+				t.Fatalf("%q is not readable by the cursor guards but was accepted; a duplicate magic in it would go uncompared", tt.source)
+			case !tt.reject && len(violations) > 0:
+				t.Fatalf("%q is legal, literal-free code and was rejected: %q", tt.source, violations)
 			}
 		})
 	}
