@@ -76,7 +76,19 @@ func TestCrashPrefixInboxCreateReturnsTheOriginalAdmission(t *testing.T) {
 	store := openStore(t, memstore.New())
 	first := mustAdmit(t, store, testAdmitRequest())
 
-	retry, created, err := store.AdmitCommand(context.Background(), testAdmitRequest())
+	// The retry PROPOSES A DIFFERENT RUNTIME ID, and that is what makes the
+	// assertion below able to fail at all. Retrying with testAdmitRequest()'s
+	// fixed proposal meant "returned the winner's stored mapping" and "handed
+	// the caller back its own proposal" were the same value, so a duplicate
+	// path that did the second would have passed unchallenged — the row this
+	// test underwrites claims the ORIGINAL identity is returned, and an
+	// identical proposal cannot witness that.
+	retryRequest := testAdmitRequest()
+	retryRequest.ProposedRuntimeCommandID = inboxRetryRuntime
+	if first.Record.RuntimeCommandID == retryRequest.ProposedRuntimeCommandID {
+		t.Fatal("the retry proposes the admitted runtime id, so the carry-forward assertion cannot fail")
+	}
+	retry, created, err := store.AdmitCommand(context.Background(), retryRequest)
 	if err != nil {
 		t.Fatalf("AdmitCommand retry: %v", err)
 	}
@@ -116,6 +128,17 @@ func TestCrashPrefixesClaimApplyAndTerminalLicenseOnlyTheirNextTransitions(t *te
 	applying, err := store.BeginApplyingCommand(context.Background(), begin)
 	if err != nil {
 		t.Fatalf("claimed prefix did not license begin-applying: %v", err)
+	}
+	// "Do not start a new claim" is DRIVEN rather than asserted in prose. The
+	// attempt is made BEFORE the clock is advanced, and that placement is the
+	// point: at this instant the deadline is open and the epoch is the claim's
+	// own, so state is the ONLY thing that can refuse it. Made after the
+	// advance, the deadline would refuse it too and the state gate could be
+	// removed without this test noticing.
+	if _, err := store.ClaimCommand(context.Background(), testClaimRequest(applying, inboxNextEpoch)); err == nil {
+		t.Fatal("an applying record licensed a new claim")
+	} else {
+		assertInboxCode(t, err, InboxErrorState)
 	}
 	clock.set(inboxAfterDue)
 	completed, err := store.CompleteCommand(context.Background(), testCompleteRequest(applying, inboxNextEpoch))
@@ -181,6 +204,19 @@ func TestCrashPrefixesPointerReplaceAndClearRetainBothHighWaters(t *testing.T) {
 			} else {
 				assertPointerField(PointerErrorEpoch, "lease_epoch")(t, err)
 			}
+			// The OTHER half of what the tombstone's two high-waters license,
+			// which the epoch attempt above cannot witness: a LIVE lease
+			// carrying an older capture. It is driven one below the retained
+			// sequence rather than far below it, so an off-by-one in the fence
+			// — admitting the sequence it must refuse — fails here.
+			if _, err := ops.Set(store, context.Background(), ops.testSetRequest(t, pointerEpoch, pointerSequence, 3)); err == nil {
+				t.Fatal("clear licensed an older sequence to replace the pointer")
+			} else {
+				got := assertPointerCode(t, err, PointerErrorSequence)
+				if got.Field != "sequence" || got.Epoch != pointerEpoch || got.Sequence != pointerSequence+1 {
+					t.Fatalf("older-sequence refusal = %+v, want the retained epoch and sequence high-waters", got)
+				}
+			}
 			retry, err := ops.Clear(store, context.Background(), testClearPointerRequest(pointerEpoch))
 			if err != nil || retry.Revision != cleared.Revision {
 				t.Fatalf("clear retry = %+v, %v; want the durable tombstone", retry, err)
@@ -200,13 +236,41 @@ func TestCrashPrefixesGateIntentAndOpenProjectionLicenseDifferentSweepActions(t 
 		gate := gateWithDeadline(testGate("gate-crashed", 5), catalogDeadline)
 		interruptOpenAfterItsIntent(t, store, ordered, gate, 10)
 
-		clock.set(catalogActiveAt.Add(MinGateIntentRemnantAge))
-		page, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
-			Shard: 0, DueAtOrBefore: catalogDeadline, Limit: 10,
-		})
-		if err != nil || len(page.Remnants) != 1 || len(page.Gates) != 0 {
-			t.Fatalf("intent-only prefix reads as %+v, %v; want one remnant", page, err)
+		// WHICH OPERATION HOLDS THE AGE. ListDueGates has no age filter and
+		// reads no clock: it reports the remnant as soon as the intent is
+		// durable, and it is asserted here at the intent's OWN instant to say
+		// so. An earlier account of this prefix read "after
+		// MinGateIntentRemnantAge, the due query reports one remnant", which
+		// credited the reporting operation with a fence it does not have and
+		// left the operation that DOES have it — RetireGateDeadlineIntent —
+		// described as unconditional.
+		listed := func(t *testing.T) DueGatePage {
+			t.Helper()
+			page, err := store.ListDueGates(context.Background(), ListDueGatesRequest{
+				Shard: 0, DueAtOrBefore: catalogDeadline, Limit: 10,
+			})
+			if err != nil || len(page.Remnants) != 1 || len(page.Gates) != 0 {
+				t.Fatalf("intent-only prefix reads as %+v, %v; want one remnant", page, err)
+			}
+			return page
 		}
+		page := listed(t)
+
+		// The age gate is driven AT THE THRESHOLD, from BOTH sides, one
+		// nanosecond apart. MinGateIntentRemnantAge is half-open — an intent
+		// exactly that old is retirable and one nanosecond younger is not — and
+		// a pair of attempts further apart than that leaves the comparison's
+		// boundary untested in both directions, which is how an off-by-one on a
+		// fence survives a suite that looks thorough.
+		clock.set(catalogActiveAt.Add(MinGateIntentRemnantAge - time.Nanosecond))
+		if younger := listed(t); len(younger.Remnants) != 1 {
+			t.Fatalf("the due query withheld the remnant inside the retirement window: %+v", younger)
+		}
+		assertCatalogField(t,
+			store.RetireGateDeadlineIntent(context.Background(), RetireGateDeadlineIntentRequest(page.Remnants[0])),
+			CatalogErrorTooSoon, "recorded_at")
+
+		clock.set(catalogActiveAt.Add(MinGateIntentRemnantAge))
 		if err := store.RetireGateDeadlineIntent(context.Background(), RetireGateDeadlineIntentRequest(page.Remnants[0])); err != nil {
 			t.Fatalf("aged remnant did not license retirement: %v", err)
 		}

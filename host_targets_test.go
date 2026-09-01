@@ -2526,9 +2526,22 @@ func worstCaseEndpoint() sessionwire.InternalEndpoint {
 // The set is DERIVED FROM SOURCE rather than listed here, for the reason
 // orderedRecordMembers is: a hand-written list covers the kinds its author
 // remembered. This one covered three of five, so the two journal kinds could
-// have been collided with by a fourth without anything failing. Every kind this
-// package has is a four-byte string constant, so that is what the scan looks
-// for; a kind added later is covered whether or not anyone updates this test.
+// have been collided with by a fourth without anything failing.
+//
+// WHAT "DERIVED FROM SOURCE" DOES AND DOES NOT COVER, stated exactly, because
+// an unqualified exhaustiveness claim in a guard is worse than no claim: a
+// reader stops looking. Two SPELLINGS are read — a four-byte string constant,
+// and the magic field of a sweepCursorKind composite literal in either the
+// keyed or the positional form. A kind added in either spelling is covered
+// whether or not anyone updates this test. A magic spelled any OTHER way is
+// not silently skipped, but neither is it collected: a sweepCursorKind literal
+// whose magic is not a four-byte string literal FAILS here, and an argument to
+// encodeCursorEnvelope that is neither a declared constant nor a cursor kind
+// field FAILS in the use-guard below. The gap that remains, named so it is not
+// rediscovered as a surprise: a SECOND kind type, one that is not
+// sweepCursorKind and carries its own field called magic, would be waved
+// through by the use-guard's selector branch and would contribute nothing to
+// the distinctness set. Adding one means extending this scan.
 func TestCursorMagicsAreDistinct(t *testing.T) {
 	t.Parallel()
 
@@ -2573,6 +2586,16 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 	// sweepCursorKind value, including values returned by constructors. Walking
 	// only top-level vars missed that second spelling while its carried count
 	// stayed satisfied by the two declarations it could still see.
+	//
+	// It reads the field FAIL-CLOSED, through sweepCursorLiteralField: a
+	// sweepCursorKind literal whose magic this scan cannot read is an error
+	// rather than a literal it skips. That is not hypothetical tightening. This
+	// walk read only KEYED elements, so a POSITIONAL literal —
+	// `sweepCursorKind{"LRDG", 1, ...}`, legal Go that vet and staticcheck
+	// accept — contributed nothing to the set and SURVIVED as a duplicate,
+	// while reaching encodeCursorEnvelope as k.magic through a selector the
+	// use-guard below accepts.
+	magicField := sweepCursorFieldIndex(t, files, "magic")
 	carried := 0
 	for _, name := range files {
 		if strings.HasSuffix(name, "_test.go") {
@@ -2586,25 +2609,16 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 			if named, ok := composite.Type.(*ast.Ident); !ok || named.Name != "sweepCursorKind" {
 				return true
 			}
-			for _, element := range composite.Elts {
-				pair, ok := element.(*ast.KeyValueExpr)
-				if !ok {
-					continue
-				}
-				if key, ok := pair.Key.(*ast.Ident); !ok || key.Name != "magic" {
-					continue
-				}
-				literal, ok := pair.Value.(*ast.BasicLit)
-				if !ok || literal.Kind != token.STRING {
-					t.Fatalf("%s declares a sweepCursorKind whose magic is not a string literal", name)
-				}
-				text, err := strconv.Unquote(literal.Value)
-				if err != nil || len(text) != cursorMagicBytes {
-					t.Fatalf("%s declares a sweepCursorKind whose magic is not %d bytes", name, cursorMagicBytes)
-				}
-				carried++
-				magics[name+"#carried-"+strconv.Itoa(carried)] = text
+			literal, ok := sweepCursorLiteralField(t, name, composite, "magic", magicField).(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				t.Fatalf("%s declares a sweepCursorKind whose magic is not a string literal", name)
 			}
+			text, err := strconv.Unquote(literal.Value)
+			if err != nil || len(text) != cursorMagicBytes {
+				t.Fatalf("%s declares a sweepCursorKind whose magic is not %d bytes", name, cursorMagicBytes)
+			}
+			carried++
+			magics[name+"#carried-"+strconv.Itoa(carried)] = text
 			return true
 		})
 	}

@@ -25,6 +25,15 @@ const (
 	inboxCommand = sessionwire.CommandID("command-a")
 	inboxRuntime = RuntimeCommandID("2f1c7d1e-0f3a-4c5b-9f21-000000000001")
 	inboxKind    = CommandKind("input")
+
+	// inboxRetryRuntime is the id a RETRY proposes. It exists because a retry
+	// that proposes the same id as the original cannot distinguish "returned
+	// the winner's mapping" from "returned the caller's own proposal": both
+	// spellings produce the same value, so the carry-forward assertion is
+	// unfalsifiable. AdmitCommandRequest documents racing replicas proposing
+	// different runtime identities for one CommandID, so a second proposal is
+	// the ordinary case rather than a contrived one.
+	inboxRetryRuntime = RuntimeCommandID("2f1c7d1e-0f3a-4c5b-9f21-000000000002")
 )
 
 var (

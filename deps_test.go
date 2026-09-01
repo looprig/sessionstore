@@ -90,6 +90,7 @@ func TestProductionImportScanHonorsModuleOwnership(t *testing.T) {
 	writeGoFixture(t, root, "nested/support_test.go", "package fixture\n\nimport _ \"github.com/looprig/harness\"\n")
 	writeGoFixture(t, root, "nested/imports_testkit.go", "package fixture\n\nimport _ \"github.com/looprig/sessionstore/internal/testkit\"\n")
 	writeGoFixture(t, root, "internal/testkit/allowed.go", "package testkit\n\nimport _ \"github.com/looprig/storage/memstore\"\n")
+	writeGoFixture(t, root, "internal/testkit/sibling.go", "package testkit\n\nimport _ \"github.com/looprig/sessionstore/internal/testkit/fake\"\n")
 	writeGoFixture(t, root, "internal/testkit/forbidden.go", "package testkit\n\nimport _ \"github.com/looprig/harness\"\n")
 	writeGoFixture(t, root, "nested-module/go.mod", "module example.com/nested\n")
 	writeGoFixture(t, root, "nested-module/forbidden.go", "package fixture\n\nimport _ \"github.com/looprig/harness\"\n")
@@ -112,10 +113,15 @@ func TestProductionImportScanHonorsModuleOwnership(t *testing.T) {
 			t.Errorf("violations = %q, want a violation for %s", violations, suffix)
 		}
 	}
-	if slices.ContainsFunc(violations, func(violation string) bool {
-		return strings.Contains(violation, filepath.Join("internal", "testkit", "allowed.go"))
-	}) {
-		t.Fatalf("violations = %q, storage/memstore must be allowed in internal/testkit", violations)
+	for _, allowed := range []struct{ file, why string }{
+		{filepath.Join("internal", "testkit", "allowed.go"), "storage/memstore must be allowed in internal/testkit"},
+		{filepath.Join("internal", "testkit", "sibling.go"), "a testkit file must be allowed to import a sibling testkit package"},
+	} {
+		if slices.ContainsFunc(violations, func(violation string) bool {
+			return strings.Contains(violation, allowed.file)
+		}) {
+			t.Fatalf("violations = %q, %s", violations, allowed.why)
+		}
 	}
 }
 
@@ -223,8 +229,23 @@ func allowedProductionImport(importPath string) bool {
 	return !strings.Contains(first, ".")
 }
 
+// allowedTestSupportImport is the rule for a file INSIDE internal/testkit. It
+// is the production rule plus what test support is additionally allowed to
+// reach: a storage provider, and its own tree.
+//
+// The second exemption is not decoration. Falling straight through to
+// allowedProductionImport reported a testkit file importing a SIBLING testkit
+// package as a violation, because the production rule forbids that tree BY
+// DESIGN — the direction being forbidden is production reaching IN, not test
+// support moving within itself. A guard that reports a legal arrangement as a
+// breach is wrong in the direction that gets guards deleted, so the two rules
+// are stated apart even though no internal/testkit package exists yet.
 func allowedTestSupportImport(importPath string) bool {
 	if importPath == "github.com/looprig/storage/memstore" {
+		return true
+	}
+	if importPath == "github.com/looprig/sessionstore/internal/testkit" ||
+		strings.HasPrefix(importPath, "github.com/looprig/sessionstore/internal/testkit/") {
 		return true
 	}
 	return allowedProductionImport(importPath)

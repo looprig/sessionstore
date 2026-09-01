@@ -1159,6 +1159,12 @@ func TestCursorScopeDomainsAreDistinct(t *testing.T) {
 	// failure mode this test exists for — so the grammar is EXTENDED to cover
 	// it, exactly as TestOrderedNamespacesAreDistinct was extended for sharded
 	// namespaces.
+	//
+	// It reads the field FAIL-CLOSED, through the shared reader below: a
+	// sweepCursorKind literal whose domain this scan cannot read is an error
+	// rather than a literal it skips. Reading only KEYED elements, which is
+	// what this walk did, let a positional literal past unexamined.
+	domainField := sweepCursorFieldIndex(t, files, "domain")
 	carried := 0
 	for _, name := range files {
 		if strings.HasSuffix(name, "_test.go") {
@@ -1172,21 +1178,12 @@ func TestCursorScopeDomainsAreDistinct(t *testing.T) {
 			if named, ok := composite.Type.(*ast.Ident); !ok || named.Name != "sweepCursorKind" {
 				return true
 			}
-			for _, element := range composite.Elts {
-				pair, ok := element.(*ast.KeyValueExpr)
-				if !ok {
-					continue
-				}
-				if key, ok := pair.Key.(*ast.Ident); !ok || key.Name != "domain" {
-					continue
-				}
-				text, ok := unquote(name, pair.Value)
-				if !ok {
-					t.Fatalf("%s declares a sweepCursorKind whose domain is not a string literal", name)
-				}
-				domains[text] = append(domains[text], name)
-				carried++
+			text, ok := unquote(name, sweepCursorLiteralField(t, name, composite, "domain", domainField))
+			if !ok {
+				t.Fatalf("%s declares a sweepCursorKind whose domain is not a string literal", name)
 			}
+			domains[text] = append(domains[text], name)
+			carried++
 			return true
 		})
 	}
@@ -2252,4 +2249,95 @@ func TestListDueGatesDoesNotCacheAnUnreadableSessionAsARemnant(t *testing.T) {
 		t.Fatalf("page = unreadable %d, remnants %d, gates %d; want all %d rows unreadable and none retireable",
 			page.Unreadable, len(page.Remnants), len(page.Gates), gates)
 	}
+}
+
+// sweepCursorFieldIndex reports the position the named field occupies in the
+// sweepCursorKind declaration, which is where a POSITIONAL literal spells it.
+//
+// The position is DERIVED from the type rather than assumed, so reordering the
+// struct cannot quietly point a positional read at the neighbouring field —
+// which would be a guard reading one value and reporting on another, the worst
+// of the failures available to it. Not finding the declaration at all is a
+// failure for the ordinary anti-vacuity reason: a scan that cannot locate the
+// type it is about would otherwise report on nothing.
+func sweepCursorFieldIndex(t *testing.T, files []string, field string) int {
+	t.Helper()
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		index := -1
+		ast.Inspect(parseProductionFile(t, name), func(node ast.Node) bool {
+			spec, ok := node.(*ast.TypeSpec)
+			if !ok || spec.Name.Name != "sweepCursorKind" {
+				return true
+			}
+			structure, ok := spec.Type.(*ast.StructType)
+			if !ok {
+				t.Fatalf("%s declares sweepCursorKind as something other than a struct", name)
+			}
+			position := 0
+			for _, member := range structure.Fields.List {
+				if len(member.Names) == 0 {
+					// An embedded field still occupies one position.
+					position++
+					continue
+				}
+				for _, memberName := range member.Names {
+					if memberName.Name == field {
+						index = position
+					}
+					position++
+				}
+			}
+			return false
+		})
+		if index >= 0 {
+			return index
+		}
+	}
+	t.Fatalf("no production file declares sweepCursorKind with a %s field; a positional literal's %s could not be located", field, field)
+	return -1
+}
+
+// sweepCursorLiteralField returns the expression a sweepCursorKind literal
+// gives the named field, in EITHER spelling, and FAILS when it cannot find one.
+//
+// The fail-closed half is the point. Both cursor guards read only
+// *ast.KeyValueExpr elements, so a POSITIONAL literal —
+// `sweepCursorKind{"LRDG", 1, ...}`, legal Go that both vet and staticcheck
+// accept — contributed nothing to either set and SURVIVED as a duplicate. It
+// still reaches encodeCursorEnvelope as k.magic, which the use-guard's selector
+// branch waves through. A literal this reader cannot read is therefore an
+// error, not a literal it passes over: the one it cannot read is exactly the
+// one nothing else is looking at.
+func sweepCursorLiteralField(
+	t *testing.T,
+	filename string,
+	composite *ast.CompositeLit,
+	field string,
+	index int,
+) ast.Expr {
+	t.Helper()
+	if len(composite.Elts) == 0 {
+		t.Fatalf("%s declares an empty sweepCursorKind literal, whose %s this scan cannot read", filename, field)
+	}
+	if _, keyed := composite.Elts[0].(*ast.KeyValueExpr); keyed {
+		for _, element := range composite.Elts {
+			pair, ok := element.(*ast.KeyValueExpr)
+			if !ok {
+				t.Fatalf("%s mixes keyed and positional elements in a sweepCursorKind literal", filename)
+			}
+			if key, ok := pair.Key.(*ast.Ident); ok && key.Name == field {
+				return pair.Value
+			}
+		}
+		t.Fatalf("%s declares a keyed sweepCursorKind literal that omits %s", filename, field)
+		return nil
+	}
+	if index >= len(composite.Elts) {
+		t.Fatalf("%s declares a positional sweepCursorKind literal with %d elements, too few to carry %s at position %d",
+			filename, len(composite.Elts), field, index)
+	}
+	return composite.Elts[index]
 }
