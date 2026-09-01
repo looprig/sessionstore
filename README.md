@@ -495,8 +495,9 @@ no tuple in any of the three: a router cannot bind to a Host this store will not
 vouch for. `expired` and `released` do carry the retained lease epoch on the
 error, because those two codes are the whole public account of a session with no
 route — they are what a retention decision is made from, and the fence is the
-one durable fact left to check that decision against. Every write instead reads the RAW record, expired and released ones
-included, because a writer that believed the public reader would create a fresh
+one durable fact left to check that decision against. Every write instead reads
+the RAW record, expired and released ones included, because a writer that
+believed the public reader would create a fresh
 record over a row it could not see — and creating a fresh record is exactly how
 a fencing high-water mark gets reset to whatever a superseded lease named. A
 stored record that cannot be decoded is likewise a failure and never an absence,
@@ -589,8 +590,9 @@ row.
 Both used to fail the whole page on one row, and both were reachable states with
 no way out: a single undecodable gate intent sits at the head of an ascending
 deadline view whose head could not be skipped past within a pass, so it disabled
-gate expiry for *every tenant* permanently; a single undecodable catalog row made a tenant unlistable
-and, because a failed page issues no continuation, took every session ranked
+gate expiry for *every tenant* permanently; a single undecodable catalog row
+made a tenant unlistable and, because a failed page issues no continuation,
+took every session ranked
 behind it too. They report `DueGatePage.Unreadable` and
 `SessionPage.UnreadableSkipped`. `SessionPage` is this package's own type
 embedding Core's, added for exactly that count.
@@ -767,19 +769,19 @@ acquisition, a session-scope verification, a catalog read, the intent write and
 the projection write — and shrinking it without a real shared clock is how it
 becomes unsafe.
 
-**Every attempt re-stamps, and that is a safety requirement rather than
-bookkeeping.** The first version stamped once, at creation, so a retry inherited
-the first attempt's instant — and the ordinary restart path (crash between the
-two writes, supervisor restarts the Host, retry arrives minutes later) began
-with the window already elapsed. A sweep landing in the retry's own gap could
-then tombstone the deadline of a gate about to become public, with no clock skew
-and no stalled process involved. `commitGateIntent` therefore re-stamps under a
-compare-and-swap when it finds a matching live row. It does make the window a
-rate limit on retries, and that is the right trade: opens arriving for a gate
-mean the gate is being opened, which is exactly when its deadline must not be
-removed. The other interleaving — a retirement landing *before* the retry's
-intent write — is covered by a different mechanism: the retry meets a tombstone
-and fails closed.
+**Every attempt re-stamps forward-only, and that is a safety requirement rather
+than bookkeeping.** The first version stamped once, at creation, so a retry
+inherited the first attempt's instant — and the ordinary restart path (crash
+between the two writes, supervisor restarts the Host, retry arrives minutes
+later) began with the window already elapsed. A sweep landing in the retry's
+own gap could then tombstone the deadline of a gate about to become public,
+with no clock skew and no stalled process involved. `commitGateIntent` therefore
+re-stamps under a compare-and-swap when it finds a matching live row. It does
+make the window a rate limit on retries, and that is the right trade: opens
+arriving for a gate mean the gate is being opened, which is exactly when its
+deadline must not be removed. The other interleaving — a retirement landing
+*before* the retry's intent write — is covered by a different mechanism: the
+retry meets a tombstone and fails closed.
 
 **The ordering that was not chosen.** The alternative is unarmed intent, then
 projection, then arm. It is genuinely safer in one respect: a due intent with no

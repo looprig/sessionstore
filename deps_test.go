@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -28,6 +29,7 @@ func TestAllowedProductionImport(t *testing.T) {
 		{name: "Core package", importPath: "github.com/looprig/core/sessionwire/v1", want: true},
 		{name: "Storage root", importPath: "github.com/looprig/storage", want: true},
 		{name: "SessionStore internal package", importPath: "github.com/looprig/sessionstore/internal/codec", want: true},
+		{name: "SessionStore test support", importPath: "github.com/looprig/sessionstore/internal/testkit", want: false},
 		{name: "Storage memory provider", importPath: "github.com/looprig/storage/memstore", want: false},
 		{name: "cgo pseudo-package", importPath: "C", want: false},
 		{name: "Harness", importPath: "github.com/looprig/harness", want: false},
@@ -86,6 +88,9 @@ func TestProductionImportScanHonorsModuleOwnership(t *testing.T) {
 		writeGoFixture(t, root, path, "//go:build fixturetag\n\npackage fixture\n\nimport _ \"github.com/looprig/harness\"\n")
 	}
 	writeGoFixture(t, root, "nested/support_test.go", "package fixture\n\nimport _ \"github.com/looprig/harness\"\n")
+	writeGoFixture(t, root, "nested/imports_testkit.go", "package fixture\n\nimport _ \"github.com/looprig/sessionstore/internal/testkit\"\n")
+	writeGoFixture(t, root, "internal/testkit/allowed.go", "package testkit\n\nimport _ \"github.com/looprig/storage/memstore\"\n")
+	writeGoFixture(t, root, "internal/testkit/forbidden.go", "package testkit\n\nimport _ \"github.com/looprig/harness\"\n")
 	writeGoFixture(t, root, "nested-module/go.mod", "module example.com/nested\n")
 	writeGoFixture(t, root, "nested-module/forbidden.go", "package fixture\n\nimport _ \"github.com/looprig/harness\"\n")
 	writeGoFixture(t, root, "nested-repository/.git/HEAD", "ref: refs/heads/main\n")
@@ -95,11 +100,22 @@ func TestProductionImportScanHonorsModuleOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatalf("productionImportViolations: %v", err)
 	}
-	if productionFiles != 1 {
-		t.Fatalf("production files = %d, want 1", productionFiles)
+	if productionFiles != 2 {
+		t.Fatalf("production files = %d, want 2", productionFiles)
 	}
-	if len(violations) != 1 || !strings.Contains(violations[0], filepath.Join("nested", "forbidden.go")) {
-		t.Fatalf("violations = %q, want only real nested package violation", violations)
+	for _, suffix := range []string{
+		filepath.Join("nested", "forbidden.go"),
+		filepath.Join("nested", "imports_testkit.go"),
+		filepath.Join("internal", "testkit", "forbidden.go"),
+	} {
+		if !slices.ContainsFunc(violations, func(violation string) bool { return strings.Contains(violation, suffix) }) {
+			t.Errorf("violations = %q, want a violation for %s", violations, suffix)
+		}
+	}
+	if slices.ContainsFunc(violations, func(violation string) bool {
+		return strings.Contains(violation, filepath.Join("internal", "testkit", "allowed.go"))
+	}) {
+		t.Fatalf("violations = %q, storage/memstore must be allowed in internal/testkit", violations)
 	}
 }
 
@@ -149,7 +165,10 @@ func productionImportViolations(root string) (int, []string, error) {
 		if !isProductionGoFile(filepath.Base(path)) {
 			continue
 		}
-		productionFiles++
+		testSupport := isInternalTestSupport(root, path)
+		if !testSupport {
+			productionFiles++
+		}
 		parsed, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.ImportsOnly)
 		if err != nil {
 			return 0, nil, err
@@ -159,8 +178,14 @@ func productionImportViolations(root string) (int, []string, error) {
 			if err != nil {
 				return 0, nil, err
 			}
-			if !allowedProductionImport(importPath) {
-				violations = append(violations, "production file "+path+" imports forbidden package "+strconv.Quote(importPath))
+			allowed := allowedProductionImport(importPath)
+			kind := "production file "
+			if testSupport {
+				allowed = allowedTestSupportImport(importPath)
+				kind = "test-support file "
+			}
+			if !allowed {
+				violations = append(violations, kind+path+" imports forbidden package "+strconv.Quote(importPath))
 			}
 		}
 	}
@@ -188,11 +213,30 @@ func allowedProductionImport(importPath string) bool {
 	if importPath == "github.com/looprig/storage" {
 		return true
 	}
+	if importPath == "github.com/looprig/sessionstore/internal/testkit" || strings.HasPrefix(importPath, "github.com/looprig/sessionstore/internal/testkit/") {
+		return false
+	}
 	if importPath == "github.com/looprig/sessionstore" || strings.HasPrefix(importPath, "github.com/looprig/sessionstore/") {
 		return true
 	}
 	first, _, _ := strings.Cut(importPath, "/")
 	return !strings.Contains(first, ".")
+}
+
+func allowedTestSupportImport(importPath string) bool {
+	if importPath == "github.com/looprig/storage/memstore" {
+		return true
+	}
+	return allowedProductionImport(importPath)
+}
+
+func isInternalTestSupport(root, path string) bool {
+	relative, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	relative = filepath.ToSlash(relative)
+	return strings.HasPrefix(relative, "internal/testkit/")
 }
 
 func isProductionGoFile(name string) bool {

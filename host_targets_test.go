@@ -2569,59 +2569,44 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 	}
 
 	// A magic reaches the envelope two ways, and BOTH are scanned. Most kinds
-	// declare one as a constant; the two sweep cursor kinds CARRY theirs in a
-	// sweepCursorKind value, because their codecs are one hoisted
-	// implementation parameterized by kind. When that hoist happened the
-	// constants went away, and a scan that only reads constants would have
-	// stopped covering the two newest kinds without failing — so the grammar is
-	// extended rather than the kinds exempted.
+	// declare one as a constant; sweep cursor kinds CARRY theirs in a
+	// sweepCursorKind value, including values returned by constructors. Walking
+	// only top-level vars missed that second spelling while its carried count
+	// stayed satisfied by the two declarations it could still see.
 	carried := 0
 	for _, name := range files {
 		if strings.HasSuffix(name, "_test.go") {
 			continue
 		}
-		file, err := parser.ParseFile(token.NewFileSet(), name, nil, 0)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		for _, declaration := range file.Decls {
-			generic, ok := declaration.(*ast.GenDecl)
-			if !ok || generic.Tok != token.VAR {
-				continue
+		ast.Inspect(parseProductionFile(t, name), func(node ast.Node) bool {
+			composite, ok := node.(*ast.CompositeLit)
+			if !ok {
+				return true
 			}
-			for _, spec := range generic.Specs {
-				value, ok := spec.(*ast.ValueSpec)
-				if !ok || len(value.Names) != 1 || len(value.Values) != 1 {
-					continue
-				}
-				composite, ok := value.Values[0].(*ast.CompositeLit)
+			if named, ok := composite.Type.(*ast.Ident); !ok || named.Name != "sweepCursorKind" {
+				return true
+			}
+			for _, element := range composite.Elts {
+				pair, ok := element.(*ast.KeyValueExpr)
 				if !ok {
 					continue
 				}
-				if named, ok := composite.Type.(*ast.Ident); !ok || named.Name != "sweepCursorKind" {
+				if key, ok := pair.Key.(*ast.Ident); !ok || key.Name != "magic" {
 					continue
 				}
-				for _, element := range composite.Elts {
-					pair, ok := element.(*ast.KeyValueExpr)
-					if !ok {
-						continue
-					}
-					if key, ok := pair.Key.(*ast.Ident); !ok || key.Name != "magic" {
-						continue
-					}
-					literal, ok := pair.Value.(*ast.BasicLit)
-					if !ok || literal.Kind != token.STRING {
-						t.Fatalf("%s declares a sweepCursorKind whose magic is not a string literal", name)
-					}
-					text, err := strconv.Unquote(literal.Value)
-					if err != nil || len(text) != cursorMagicBytes {
-						t.Fatalf("%s declares a sweepCursorKind whose magic is not %d bytes", name, cursorMagicBytes)
-					}
-					magics[value.Names[0].Name] = text
-					carried++
+				literal, ok := pair.Value.(*ast.BasicLit)
+				if !ok || literal.Kind != token.STRING {
+					t.Fatalf("%s declares a sweepCursorKind whose magic is not a string literal", name)
 				}
+				text, err := strconv.Unquote(literal.Value)
+				if err != nil || len(text) != cursorMagicBytes {
+					t.Fatalf("%s declares a sweepCursorKind whose magic is not %d bytes", name, cursorMagicBytes)
+				}
+				carried++
+				magics[name+"#carried-"+strconv.Itoa(carried)] = text
 			}
-		}
+			return true
+		})
 	}
 
 	// Anti-vacuity: the scan must reach the kinds this package is known to
@@ -2635,9 +2620,59 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 	if len(magics) < 7 {
 		t.Fatalf("found %d cursor magics (%v); the scan is not reaching the declarations", len(magics), magics)
 	}
-	for _, known := range []string{"hostTargetSweepCursorMagic", "dueGateCursor"} {
-		if magics[known] == "" {
-			t.Fatalf("the scan did not reach %s, a magic it is known to cover: %v", known, magics)
+	if magics["hostTargetSweepCursorMagic"] == "" {
+		t.Fatalf("the scan did not reach hostTargetSweepCursorMagic, a declared magic it is known to cover: %v", magics)
+	}
+	foundCarried := false
+	for _, magic := range magics {
+		foundCarried = foundCarried || magic == "LRDG"
+	}
+	if !foundCarried {
+		t.Fatalf("the scan did not reach LRDG, a carried magic it is known to cover: %v", magics)
+	}
+
+	uses := map[string]int{}
+	for _, name := range files {
+		if strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		ast.Inspect(parseProductionFile(t, name), func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || len(call.Args) == 0 {
+				return true
+			}
+			callee, ok := call.Fun.(*ast.Ident)
+			if !ok || (callee.Name != "encodeCursorEnvelope" && callee.Name != "decodeCursorEnvelope") {
+				return true
+			}
+			uses[callee.Name]++
+			switch magic := call.Args[0].(type) {
+			case *ast.Ident:
+				if _, ok := magics[magic.Name]; !ok {
+					t.Fatalf("%s calls %s with %s, which is not a declared cursor magic", name, callee.Name, magic.Name)
+				}
+			case *ast.SelectorExpr:
+				if magic.Sel.Name != "magic" {
+					t.Fatalf("%s calls %s with an unrecognized selector %s", name, callee.Name, magic.Sel.Name)
+				}
+			case *ast.CallExpr:
+				conversion, ok := magic.Fun.(*ast.Ident)
+				var argument *ast.Ident
+				if len(magic.Args) == 1 {
+					argument, _ = magic.Args[0].(*ast.Ident)
+				}
+				if !ok || conversion.Name != "string" || argument == nil || argument.Name != "kind" {
+					t.Fatalf("%s calls %s with an unrecognized magic conversion", name, callee.Name)
+				}
+			default:
+				t.Fatalf("%s calls %s with a magic that is neither a declared constant nor a cursor kind's field", name, callee.Name)
+			}
+			return true
+		})
+	}
+	for _, callee := range []string{"encodeCursorEnvelope", "decodeCursorEnvelope"} {
+		if uses[callee] == 0 {
+			t.Fatalf("the walk found no calls to %s; its magic-use check would be vacuous", callee)
 		}
 	}
 
