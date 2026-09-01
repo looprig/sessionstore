@@ -6,14 +6,85 @@ with canonical records from
 [`github.com/looprig/core/sessionwire/v1`](https://github.com/looprig/core) so durable
 session state can be shared without coupling Factory, Host, or Harness to one another.
 
-The module will own journal fencing and replay, catalog and gate projections, durable
+The module owns journal fencing and replay, catalog and gate projections, durable
 command admission, host and placement records, fenced pointers, reconciliation
 claims, and session-scoped object references. Concrete storage providers are selected
 by the product composition root.
 
-Production imports are intentionally limited to the Go standard library, Core, and
-Storage. Published module files use exact released versions and contain no local
-`replace` directives or vendor tree.
+Production imports are limited to the Go standard library, Core, and Storage, and
+that limit is a test rather than a convention:
+`TestProductionImportsStayWithinBoundary` parses every production file's import
+block and fails on anything else, and fails as vacuous if it found no files.
+`go.mod` names exact released versions and contains no `replace` directive; nothing
+here is vendored, so `GOWORK=off go test ./...` verifies the module against the
+versions it actually pins.
+
+## Composing a Store
+
+A composition root picks one provider, hands its complete Storage composite to
+`Open`, and closes the `Store` when it is done:
+
+```go
+func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Store, error)
+func (s *Store) Close(ctx context.Context) error
+```
+
+```go
+store, err := sessionstore.Open(ctx, memstore.New())
+if err != nil {
+	return err
+}
+defer store.Close(ctx)
+
+if _, created, err := store.CreateCatalogEntry(ctx, sessionstore.CreateCatalogEntryRequest{
+	TenantID:               "tenant-a",
+	SessionID:              "session-a",
+	AgentID:                "agent-a",
+	RuntimeCompatibilityID: "runtime-v1",
+	CreatedAt:              now,
+	LastActiveAt:           now,
+	State:                  sessionwire.SessionStateIdle,
+	Residency:              sessionwire.SessionResidencyCold,
+	DesiredPlacement:       sessionwire.HostPlacementPooled,
+	IdempotencyKey:         "create-1",
+}); err != nil {
+	return err
+}
+
+page, err := store.ListSessions(ctx, sessionstore.ListSessionsRequest{TenantID: "tenant-a", Limit: 10})
+```
+
+`ExampleOpen` in `example_test.go` runs this same flow under `go test` with its
+output checked, so the API these calls name cannot change without a test
+failing. The snippet above is prose and is held to the example by review; the
+example is what the build holds.
+
+`memstore` is Storage's in-process oracle; it is used above because it satisfies
+`Open`'s provider requirement and needs no setup, and a product substitutes a
+durable provider at exactly that one call. Nothing else in the snippet changes
+with the provider.
+
+The composite must carry all five primitives — `Ledger`, `Leaser`, `KV`, `Blobs`
+and `OrderedIndex`. A nil composite or a missing primitive is refused before any
+provider I/O with `*InvalidBackendError` naming the component
+(`TestOpenRejectsMissingPrimitive`).
+
+The options are `WithControlShards`, `WithLegacySingleTenant`, `WithLimits`,
+`WithShutdownTimeout`, `WithClock`, `WithLogger`, `WithProviderOwnership` and
+`WithIOProviderOwnership`. Two of them are not runtime settings: the control
+shard count and the layout choice are persisted in the backend's layout marker
+at the first `Open` and are compared on every later one, so changing either for
+a populated backend is an offline migration rather than a redeploy.
+
+Provider lifecycle is not assumed. Without `WithProviderOwnership` or
+`WithIOProviderOwnership`, `Close` never closes caller-supplied storage; with one
+of them, ownership transfers only after `Open` has SUCCEEDED, so a provider
+passed to a failed `Open` is still the caller's to close.
+
+There is no caching layer here and none is wanted: every read in this package is
+a direct provider read or a bounded provider query, and a cache in front of it
+would serve a revision a compare-and-swap has already invalidated, which is the
+one thing the fences exist to prevent.
 
 ## Provider compatibility
 
@@ -29,7 +100,13 @@ rejected with `*InvalidBackendError` naming `BlobReaderLifecycle`. Any other
 provider is compatible only after it implements the capability and its
 provider-specific blocked-I/O proof. Capability rejection happens before layout
 marker or other provider I/O; a provider passed to a failed `Open` remains
-caller-owned.
+caller-owned. `TestOpenRejectsInvalidBlobReaderLifecycleBeforeProviderIO` drives
+all four refusal shapes — absent capability, dynamically nil capability, zero
+bound and negative bound — and asserts on each that no provider call was made,
+that no layout marker was written, and that a transferred closer was not
+closed. It names no provider: production code here cannot import one, so the
+capability is what is tested and the named versions above are stated from those
+modules' own sources.
 
 ## Layout compatibility
 
@@ -45,6 +122,120 @@ the composition root; do not rewrite a live backend's immutable layout marker.
 Provider ownership options take effect only after `Open` has successfully validated
 and bound the backend layout. If `Open` fails, the provider remains caller-owned and
 SessionStore does not close it.
+
+## Logical keys: every name is derived, and no derived name is trusted alone
+
+Under `tenant-v1` no caller identity appears in a provider key. A tenant's
+physical namespace is `tenants/<token>`, where the token is a domain-separated
+digest of the TenantID; a session's is that namespace plus `/sessions/<token>`
+over `(tenant, session)`. Every other name a session has is derived from those
+two in one pure function that touches no provider — its journal ledger, its
+lease, its catalog key and its blob prefix. The catalog record's ORDERING and
+RANKING scope is the tenant namespace, which is what makes a recent-first tenant
+page one provider query rather than a filter over a wider one.
+
+Outstanding records — inbox commands and gate deadline intents — are additionally
+FILED in a control shard namespace while keeping the session namespace as their
+ordering scope; see the control shard section for why those are two different
+things.
+
+Because a derived name is a digest, two identities could in principle collide.
+`CreateCatalogEntry` therefore binds create-only collision WITNESSES — one under
+the tenant token, one under the session token, each holding the identity it was
+derived from — and every session-scoped read and write verifies them before
+touching the session's data: those paths funnel through helpers that call
+`verifySessionScope` first, and
+`TestBindingFailurePrecedesEverySessionDataPrimitive` asserts that a binding
+failure touches the witness KV and none of the four session-data primitives. A
+witness holding a different identity is a collision and fails closed.
+
+That produces a distinction a caller has to handle:
+a session whose witnesses were never bound is refused by the keyspace with
+`*KeyspaceError` and `binding_not_found` before any record of the kind asked for
+is consulted, while a bound session with no such record is that record's own
+`not_found`. `TestPointerWritesBindTheSessionsWitness` pins the CLASS of the
+refusal rather than merely that one occurred, because the two make different
+claims about the world.
+
+A listing binds and verifies no witness, and the asymmetry is deliberate: it
+names no session, so there is nothing to prove, and requiring a binding would
+answer "this tenant is empty" with a failure. Separation there comes from holding
+every returned record to the identity its own bytes claim.
+
+The legacy layout derives nothing. Its names are `sessions/<uuid>` verbatim, it
+has no witnesses at all, and a non-canonical session id or any tenant other than
+the one in the marker is refused before a provider is touched
+(`TestInvalidAndForeignLegacyIdentitiesTouchNoProviderPrimitive`,
+`TestLegacyLayoutRejectsForeignTenantAndNoncanonicalSession`).
+
+## What a page promises: records are strong, ranked and due views are weak
+
+Two different guarantees run through this package, and mixing them up is how a
+sweep silently loses work.
+
+**Strong — anything read by name.** `GetCatalogEntry`, `ReadGates`,
+`GetCommand`, `GetHostRegistration`, the pointer reads and the reconciliation
+claim read all fetch one authoritative record at its current revision, and the
+writes that UPDATE one of those records close their read-compare-write with a
+revision compare-and-swap. (`AdmitCommand` is the one write that is not an
+update: it is a single atomically idempotent `Create`, which is why a duplicate
+needs no read of its own.) There is no cache in front of any of them.
+`ReadGates` is in this group rather than the next one precisely because it has
+no cursor: a session holds at most `MaxCatalogOpenGates` gates, so the whole
+answer is one bounded record read.
+
+**Weak — anything paged.** `ListSessions` and `ListCompatibleHosts` are
+`ListRanked` queries; `ListDueGates`, `ListDueCommands` and
+`ReconcileHostTargets` are `ListDue` queries. Storage specifies both as keyset
+pagination over a LIVE view: a continuation resumes from the frozen
+`(rank | due_at, stable_key, ordering_scope)` tuple the cursor names, not from a
+snapshot, so a record whose rank or due time moves across that position between
+two pages is skipped or returned twice. `TestListSessionsSurvivesARankMoveBetweenPages`
+drives exactly that. A sweep that must see every record once therefore reconciles
+BY IDENTITY, not by page — and `ReconcileHostTargets` does: it revalidates each
+row's own stored expiry and compare-and-swaps onto the revision the page
+reported, so a Host that heartbeated since the page was read is left alone.
+
+**Journal pages are the exception, and they are strong.** `ReadPublicJournal`
+and `ReadRuntimeJournal` capture the ledger tip on the first page and pin it into
+the cursor, so a walk covers exactly the snapshot that first page named; the
+ledger is append-only, so nothing inside that range can move. A cursor carrying
+an inflated captured tip cannot widen the snapshot.
+
+**No single row fails a bounded page, anywhere.** Every per-row refusal is
+counted and stepped over — `SessionPage.UnreadableSkipped`,
+`DueGatePage.Unreadable`, `HostTargetPage.LapsedSkipped` and
+`UnreadableSkipped`. A failure returned from one of these queries is always
+about the query itself: a bad limit, a foreign cursor, a provider that could not
+answer. The reasoning, and why a page budget is not a substitute for a
+continuation, is in the Host target section.
+
+## Objects first, references second
+
+Every path in this package that stores bytes larger than a record persists and
+VERIFIES the object before writing anything that names it, and never the other
+way round. `PutObject` mints the identity, writes the blob, re-reads the
+persisted bytes and checks them against the declared length and digest, and only
+then returns a reference. A journal append whose body is over threshold uploads
+and verifies the object first and appends the reference second. `OpenGate`
+writes the deadline intent before it commits the open-gate projection, which is
+the same rule one level up.
+
+The rule is chosen for its crash polarity, and the crash tests in
+`crash_prefix_test.go` are what hold it. Interrupt any of these and the only
+state reachable is the first write with the second missing — a verified object
+nothing references, or a deadline intent with no matching open gate — never the
+inverse. `TestCrashPrefixObjectUploadWithoutReferenceReadsAsDeletableOrphan`
+drives the object case and
+`TestCrashPrefixesGateIntentAndOpenProjectionLicenseDifferentSweepActions` the
+gate case. Both leftovers are inert: every object key is content- and
+generation-addressed, so an orphan can never be served as another object, and a
+remnant intent is reported rather than acted on. A reference to an object that
+is not there would instead be a session that cannot be read, and a public gate
+with no deadline in any due view would be one nothing expires.
+
+The cost of that choice is stated rather than hidden: orphans accumulate, and
+reclaiming them is the operator's job. See the next section.
 
 ## Object orphans
 
@@ -220,7 +411,7 @@ with no durable deadline. `ListDueGates` is the reader that closes that: it
 validates every due intent against the session's durable open projection and
 drops the ones that match nothing. It is a bounded read that takes no action —
 what a Host does about an expired gate is gate continuation, which this package
-does not yet implement.
+deliberately does not implement; see "Gate continuation is deferred" below.
 
 `ListDueGates` reads ONE control shard and takes a continuation; see the shard
 section below. A remnant intent — one whose gate the session's durable record no
@@ -262,6 +453,43 @@ deliberately leaves intents alone: it is the Host's re-projection path, not an
 incremental gate edit. A gate projected only that way is readable but has no
 deadline index, and a gate dropped that way leaves a remnant intent the due
 reader discards.
+
+### Gate continuation is deferred, and that is a decision rather than an omission
+
+Say it plainly, because an omission here would read as a guarantee. **Multiple
+gate projections per session are durable and readable, and nothing in this
+package claims a continuation for any of them.**
+
+What IS implemented and tested: a session may hold up to `MaxCatalogOpenGates`
+open gates at once; `OpenGate` refuses the one past that ceiling
+(`TestOpenGateRefusesMoreThanTheProjectionHolds`); `ReadGates` returns all of
+them from the one catalog record in the record's canonical `(opened_seq,
+gate_id)` order, with no cursor and no limit
+(`TestReadGatesOrdersManySimultaneousGates`); every gate opened through
+`OpenGate` has a durable deadline intent, with the one exception stated
+immediately above — a gate projected only through `UpdateCatalogHostState` is
+readable but has no deadline index; and `ListDueGates` reports the intents whose
+deadline has passed, validated against the durable open projection.
+
+What is NOT implemented: anything that decides what happens next. `ListDueGates`
+is a READ — it takes no action, cancels nothing, suspends nothing and schedules
+nothing, and its doc comment says so at the function. `ResolveGateRequest`
+records only that a gate is no longer open and awaiting an answer: it carries no
+response, decides nothing about what the session does next, and starts no
+continuation. There is no "resume the session from gate G" call anywhere in this
+package, and no durable record of one.
+
+The one piece of scaffolding that exists is a NAME: `pointers.go` defines an
+active-continuation pointer role alongside the workspace and runtime checkpoint
+roles — the same `Set`/`Get`/`Clear` triple over an object reference, with the
+same two fences and nothing else. Nothing in this package reads it to decide
+anything; a caller that writes one gets durable storage and no behavior.
+
+So a Host that finds an expired gate has a durable, correctly ordered account of
+what is open and what has lapsed, and must supply the policy itself. Deciding
+what that policy needs is a later task, and the reason a record for it was not
+added early is that a half-specified continuation record is exactly the kind of
+second copy of the projection that the deadline index is deliberately not.
 
 ## Command admission: one create, one immutable acceptance order
 
@@ -597,11 +825,11 @@ behind it too. They report `DueGatePage.Unreadable` and
 `SessionPage.UnreadableSkipped`. `SessionPage` is this package's own type
 embedding Core's, added for exactly that count.
 
-Nothing here calls the provider's `Delete`, and it cannot: the ordered index
-promises an identity is never reusable after a tombstone, while a Host that
-drains at shutdown and advertises again at startup reuses this identity as a
-matter of course. A withdrawn row is therefore retained and REUSED, which is
-what makes a restart work.
+Nothing on this record's paths calls the provider's `Delete`, and it cannot:
+the ordered index promises an identity is never reusable after a tombstone,
+while a Host that drains at shutdown and advertises again at startup reuses this
+identity as a matter of course. A withdrawn row is therefore retained and
+REUSED, which is what makes a restart work.
 
 The reconciler revalidates each row's own stored expiry before writing anything
 and compare-and-swaps onto the revision the due page reported. The due view is
@@ -691,8 +919,10 @@ That is enforced structurally rather than documented, in three ways:
 
 The row's shape follows the Host registry's — one per session, filed in the
 session namespace, unranked, never due, read and written only by name — and it
-is never deleted, because this package writes no provider tombstones. There is
-no sweep, and therefore none of the head-of-line hazards a due view brings: a
+is never deleted. The only ordered-record tombstones this package writes
+anywhere are the ones that retire a gate deadline intent — `ResolveGate`'s and
+`RetireGateDeadlineIntent`'s — and this is not one of them. There
+is no sweep, and therefore none of the head-of-line hazards a due view brings: a
 claim stops being a claim at its expiry, from its own bytes, at the instant a
 reader asks, and the next acquisition overwrites it.
 

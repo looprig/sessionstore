@@ -26,6 +26,44 @@ Add tests before implementation, keep errors typed, and mutation-test dependency
 fencing, ordering, and tenant-boundary assertions. Keep one logical change per PR and
 call out public API or persisted-format changes explicitly.
 
+## Known follow-ups
+
+These are known, deliberately left out of the `v0.1.0` release, and recorded here
+so they are picked up by intent rather than rediscovered. Items 1 and 2 were
+raised in review and judged non-blocking by an independent reviewer; item 3 was
+raised during documentation review and has not been reviewed.
+
+1. **The sweep-cursor reconciliation is held by redundancy, not by structure.**
+   `assertSweepCursorKindRolesAreUnderstood` is called from two cursor guards
+   (`shards_test.go` and `host_targets_test.go`). Deleting either call leaves the
+   suite green, because the other call site still catches the escape. The
+   realistic future failure is a THIRD guard that reads cursor literals and
+   forgets to call it. The fix is about three lines: have the reconciliation
+   RETURN the file list both guards then walk, so removing the call stops
+   compiling instead of silently weakening the guard.
+
+2. **A bare uncalled generic instantiation is a known false positive.** A
+   declaration of the shape `var f = someFunc[sweepCursorKind]` is an occurrence
+   of the identifier that the role reconciliation does not account for, so it
+   would fail the guard although it introduces no composite literal to attribute.
+   A position-aware fix (roughly fourteen lines: record composite-literal type
+   nodes and exclude them; `ast.Inspect` is pre-order, so the `CompositeLit` arm
+   records its `Type` before the child is visited) was built and verified during
+   review, and review then recommended NOT taking it: it closes a far more
+   obscure shape than the `(*T)(nil)` conversion already handled, and it adds
+   state to the most intricate walk in the file.
+
+3. **The sweeps' "service-only" shape is documented, not guarded.**
+   `ListDueCommandsRequest`, `ListDueGatesRequest` and
+   `ReconcileHostTargetsRequest` name no tenant and no session, and `shards.go`
+   states plainly that this is a
+   structural HINT rather than an enforcement — this package authorizes nothing.
+   Unlike `HostTarget` and the reconciliation claim, whose families have source
+   guards (`TestHostTargetsCannotSpellSessionOwnership`,
+   `TestReconciliationClaimCannotSpellSessionOwnership`), nothing fails if a
+   tenant member is added to a sweep request later. Adding the equivalent source
+   guard would make the shape as durable as the prose claims it is.
+
 ## Code of conduct
 
 Be excellent to each other. Discussions stay technical and respectful; harassment

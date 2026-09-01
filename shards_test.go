@@ -2694,6 +2694,18 @@ func cursorKindReadabilityViolations(name string, fileSet *token.FileSet, file *
 // composite-literal type that is NOT one of those positions, and that is
 // precisely a case the readers cannot attribute, so it is unaccounted by
 // construction rather than by an added check.
+// TWO KNOWN GAPS, both raised in review, both judged non-blocking for v0.1.0 and
+// recorded in CONTRIBUTING.md so they are picked up by intent. First, this
+// reconciliation is held by REDUNDANCY rather than by structure: it is called
+// from two guards, and deleting either call leaves the suite green because the
+// other still catches the escape — a third guard that reads cursor literals and
+// forgets to call it is the realistic future failure, and the fix is to return
+// the file list both guards then walk, so removing the call stops compiling.
+// Second, a bare uncalled generic instantiation — `var f = someFunc[sweepCursorKind]`,
+// an IndexExpr that is not a call's callee, so markTypeOperand never sees it —
+// is an unaccounted occurrence that would fail this guard while introducing no
+// literal. A position-aware fix was built and verified in review and
+// deliberately not taken.
 func assertSweepCursorKindRolesAreUnderstood(t *testing.T, files []string) {
 	t.Helper()
 
