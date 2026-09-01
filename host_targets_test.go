@@ -2523,35 +2523,64 @@ func worstCaseEndpoint() sessionwire.InternalEndpoint {
 // under different domains too — which is exactly why nothing else would notice
 // a duplicate.
 //
+// HOW INDEPENDENT THE SECOND BARRIER ACTUALLY IS, since a reader will otherwise
+// assume more than is true: magics and domains are compared independently, but
+// since both guards were given the same reader pair they are now read from the
+// same literal by the same attribution. They are therefore correlated on
+// ATTRIBUTION and independent on COMPARISON — every spelling that has escaped
+// this guard escaped the domain guard in the same breath. Sharing was still the
+// right call, because the duplicated readers they replaced carried the SAME bug
+// in both copies and fixing one silently left the other; but the attribution is
+// a single point, which is why assertSweepCursorKindRolesAreUnderstood guards
+// it rather than the comparisons.
+//
 // The set is DERIVED FROM SOURCE rather than listed here, for the reason
 // orderedRecordMembers is: a hand-written list covers the kinds its author
 // remembered. This one covered three of five, so the two journal kinds could
 // have been collided with by a fourth without anything failing.
 //
-// WHAT "DERIVED FROM SOURCE" DOES AND DOES NOT COVER, stated exactly, because
-// an unqualified exhaustiveness claim in a guard is worse than no claim: a
-// reader stops looking. This header has now been narrowed twice, each time
-// after a spelling it claimed to cover turned out to escape it.
+// WHAT "DERIVED FROM SOURCE" COVERS. This header twice enumerated the spellings
+// it could read and, under each enumeration, a duplicate magic reached
+// production in a spelling the list had not thought of. A list maintained by
+// whoever is least likely to think of the next case is not a coverage claim, so
+// the enumeration is replaced by a RULE and a tripwire.
 //
-// READ: a four-byte string constant; and the magic field of a sweepCursorKind
-// composite literal, keyed or positional, whether the literal NAMES its type or
-// ELIDES it as an element of a directly-spelled slice, array or map of that
-// type. A kind added in any of those is covered whether or not anyone updates
-// this test.
+// READ: a four-byte string constant whose name contains Cursor; and the magic
+// field of a sweepCursorKind composite literal, keyed or positional, whether
+// the literal names its type or elides it inside a directly-spelled slice,
+// array, or map key or value.
 //
-// NOT COLLECTED, BUT NOT SKIPPED EITHER: a sweepCursorKind literal whose magic
-// is not a four-byte string literal FAILS here, and an argument to
-// encodeCursorEnvelope that is neither a declared constant nor a cursor kind's
-// field FAILS in the use-guard below.
+// NOT SILENTLY SKIPPED: a sweepCursorKind literal whose magic is not a
+// four-byte string literal FAILS; an argument to encodeCursorEnvelope that is
+// neither a collected constant nor a cursor kind's field FAILS; and — this is
+// what replaces the gap list — any occurrence of the identifier
+// sweepCursorKind in a role the readers cannot decode a literal from FAILS, in
+// assertSweepCursorKindRolesAreUnderstood, naming the file, the line and what
+// to extend. The type is unexported, so every container that could hold one is
+// spelled in this package and must pass that reconciliation. A named container,
+// an alias, a nested container, a pointer element and a struct field's elided
+// literal are all closed by that one rule; each was a live escape before it.
 //
-// THE TWO GAPS THAT REMAIN, named so neither is rediscovered as a surprise.
-// (A) A SECOND kind type — not sweepCursorKind, carrying its own field called
-// magic — would be waved through by the use-guard's selector branch and would
-// contribute nothing to this set. (B) A sweepCursorKind literal reachable only
-// through a NAMED container type or an alias — `type cursorKinds
-// []sweepCursorKind`, then `cursorKinds{{...}}` — is not attributed, because
-// sweepCursorLiteralsIn resolves element types syntactically rather than
-// through go/types. Either one means extending this scan.
+// EXCEPTION, deliberate and narrow: a literal with NO magic — the zero value
+// `sweepCursorKind{}` an error return is spelled with — is skipped rather than
+// failed, because an empty magic collides with nothing and a zero-valued kind
+// cannot be used at all: encode panics on cursor.go's length invariant.
+//
+// THE ONE GAP THAT REMAINS: a SECOND kind type, not sweepCursorKind, carrying
+// its own field called magic. The use-guard's selector branch would wave
+// through k.magic on it, and nothing here would collect it. The reconciliation
+// cannot see it either, since it reconciles occurrences of THIS type's name.
+// Adding a second kind type means extending this scan.
+//
+// WHY NOT go/types, stated as the real reason rather than a better-sounding
+// one: cost and simplicity. These guards parse; resolving types means loading
+// the package. It is NOT that a syntactic guard keeps reporting when the build
+// is broken — it does not. This test is in package sessionstore and uses
+// sweepCursorKind and cursorMagicBytes, so it cannot leave; a file that parses
+// but does not type-check yields [build failed] and the guard does not run.
+// That is also why the reader's mixed-elements and too-few-positional arms are
+// unreachable twice over, and they are kept as assertions about the walk rather
+// than as checks that fire on real input.
 func TestCursorMagicsAreDistinct(t *testing.T) {
 	t.Parallel()
 
@@ -2560,6 +2589,30 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 	if err != nil {
 		t.Fatalf("glob: %v", err)
 	}
+	// The reconciliation first: everything below rests on being able to
+	// ATTRIBUTE a literal to sweepCursorKind, and it is that attribution rather
+	// than any comparison here that the escaping spellings defeated.
+	assertSweepCursorKindRolesAreUnderstood(t, files)
+
+	// THE COLLECTOR IS NARROWED BY NAME, and the narrowing is a correctness fix
+	// rather than tidying. "Every four-byte string constant" is not "every
+	// cursor magic": it also caught ObjectErrorSize "size", EnvelopeErrorKind
+	// "kind" and ReconcileErrorHeld "held". errors.go DELIBERATELY repeats code
+	// strings across families, so adding a four-byte code another family
+	// already has — the package's own idiom — failed this test with
+	// "ObjectErrorSize and ZZInboxErrorSize share the magic \"size\"": two error
+	// codes reported as a cursor-magic collision, a message that misteaches
+	// whoever reads it.
+	//
+	// The convention is real and checked below: every magic this package
+	// declares has Cursor in its name and no error code does. NARROWING HERE
+	// FAILS CLOSED, which is why it is the right direction — a magic that
+	// slipped the filter would not go unnoticed, because the use-guard further
+	// down fatals on an argument to encodeCursorEnvelope that is not a
+	// collected constant. The width, by contrast, failed OPEN into false
+	// alarms. TestCursorScopeDomainsAreDistinct defines its set by USE, which
+	// has no such surface, and this guard is the odd one out.
+	declared := 0
 	for _, name := range files {
 		if strings.HasSuffix(name, "_test.go") {
 			continue
@@ -2578,6 +2631,9 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 				if !ok || len(value.Names) != 1 || len(value.Values) != 1 {
 					continue
 				}
+				if !strings.Contains(value.Names[0].Name, "Cursor") {
+					continue
+				}
 				literal, ok := value.Values[0].(*ast.BasicLit)
 				if !ok || literal.Kind != token.STRING {
 					continue
@@ -2587,6 +2643,7 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 					continue
 				}
 				magics[value.Names[0].Name] = text
+				declared++
 			}
 		}
 	}
@@ -2617,7 +2674,13 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 				return true
 			}
 			for _, kind := range sweepCursorLiteralsIn(composite) {
-				literal, ok := sweepCursorLiteralField(t, name, kind, "magic", magicField).(*ast.BasicLit)
+				expr, present := sweepCursorLiteralField(t, name, kind, "magic", magicField)
+				if !present {
+					// A zero-valued magic collides with nothing and cannot be
+					// used; see the reader for why the skip is safe.
+					continue
+				}
+				literal, ok := expr.(*ast.BasicLit)
 				if !ok || literal.Kind != token.STRING {
 					t.Fatalf("%s declares a sweepCursorKind whose magic is not a string literal", name)
 				}
@@ -2637,11 +2700,29 @@ func TestCursorMagicsAreDistinct(t *testing.T) {
 	// — a declared constant and a carried field — because a walk that reached
 	// only one would leave the other's kinds unchecked, which is exactly what
 	// happened when the sweep codecs were hoisted.
+	// The two halves are counted SEPARATELY and EXACTLY, which the previous
+	// floor could not do. `len(magics) < 7` was met by five declared magics,
+	// two carried ones and THREE non-magics the collector should never have
+	// held, so it had three entries of slack: dropping a real magic could be
+	// absorbed by junk. With the collector narrowed the count is exactly the
+	// set, and stating it exactly means adding or removing a cursor kind forces
+	// a conscious edit here rather than sliding under a floor.
+	if declared != 5 {
+		t.Fatalf("found %d declared cursor magics (%v), want 5; add or remove one deliberately rather than letting a count drift", declared, magics)
+	}
+	// carried stays a FLOOR while declared is exact, and the asymmetry is
+	// deliberate. The slack the previous floor had was in the CONSTANT half —
+	// three non-magics padding it — and narrowing the collector removed it. An
+	// exact carried count would instead misreport the ordinary case: a third
+	// sweep cursor kind is a legitimate addition, and a duplicate magic in it
+	// must be reported as the collision it is, not as "the scan is not reaching
+	// them", which is what an exact count says and is untrue.
 	if carried < 2 {
 		t.Fatalf("found %d carried cursor magics; the sweepCursorKind scan is not reaching them", carried)
 	}
-	if len(magics) < 7 {
-		t.Fatalf("found %d cursor magics (%v); the scan is not reaching the declarations", len(magics), magics)
+	if len(magics) != declared+carried {
+		t.Fatalf("collected %d magics from %d declared and %d carried (%v); two entries collided on one key and one magic went uncompared",
+			len(magics), declared, carried, magics)
 	}
 	if magics["hostTargetSweepCursorMagic"] == "" {
 		t.Fatalf("the scan did not reach hostTargetSweepCursorMagic, a declared magic it is known to cover: %v", magics)
