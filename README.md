@@ -114,6 +114,34 @@ previously unused scopes. The legacy single-tenant layout refuses disposition
 sessions. Old binaries must be excluded from stores serving disposition sessions:
 they do not know this witness and cannot be fenced by it.
 
+## Residency-only grants
+
+`AcquireResidency(ctx, AcquireResidencyRequest{TenantID, SessionID})` requires
+an existing, valid disposition-mode catalog binding. A protocol witness alone
+does not authorize acquisition. It acquires the session's separate
+`/residency/lease` namespace without opening, reading or appending its journal.
+The returned `ResidencyGrant` exposes `Epoch() ResidencyEpoch`, `Lost()` and
+`Release(ctx)`. Never compare or substitute a residency epoch for a journal
+epoch. This prerequisite does not implement disposition journal writers,
+attempts, settlement or Host adoption; legacy `OpenJournal` continues to refuse
+disposition sessions.
+
+`Lost()` is the actual Storage provider signal. The acquire context bounds only
+acquisition; Store shutdown attempts release of outstanding grants. Liveness
+depends on the provider: memstore has no TTL or crash takeover, and residency
+loss alone never fences the independent journal grant.
+
+Release is idempotent after success. Failed release retains the Store admission
+and can be retried; `Store.Close` may reach its caller's deadline while cleanup
+remains unresolved. Each release attempt, including its wait for a concurrent
+attempt, is bounded by its caller context and the Store shutdown timeout,
+assuming the provider honors cancellation. No background retry loop runs.
+Acquisition errors always return a nil grant. If acquisition is canceled after
+the provider grants ownership and rollback fails, use `errors.As` to retain the
+`*ResidencyAcquireCleanupError` and retry its `Release(ctx)` method. That cleanup
+handle exposes no usable ownership epoch. Its cause includes both the original
+refusal and cleanup failure.
+
 ## Provider compatibility
 
 `Open` requires the backend's `Blobs` primitive to implement Storage's optional
