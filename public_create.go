@@ -89,6 +89,10 @@ type catalogPublicCreateWire struct {
 // for absence; payload_size is present even at zero. Canonical re-encoding rejects
 // omitted members and alternate empty spellings. Only these unpublished codecs
 // use this shape; released catalog v1/v2 representations are unchanged.
+// A member added here must also be added to the domain struct and mapped by hand
+// in both conversions below; TestWireDTOsMirrorExportedRecords and
+// TestWireConversionsCarryEveryMember fail when it is not, because the compiler
+// does not check a member-by-member conversion for totality.
 type publicCreateReservationWire struct {
 	Identity         publicCreateIdentityWire `json:"identity"`
 	RuntimeCommandID RuntimeCommandID         `json:"runtime_command_id"`

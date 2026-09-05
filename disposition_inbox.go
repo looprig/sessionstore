@@ -315,15 +315,22 @@ type dispositionDescriptorWire struct {
 	PayloadObject    *sessionwire.ObjectMetadata `json:"payload_object,omitempty"`
 }
 
-// Taking staticcheck's S1016 advice here would defeat the point. A conversion
-// only compiles while the DTO's field NAMES still match the exported struct's,
-// so the two would be renamed together — reintroducing exactly the coupling
-// these member names are being bought independence from. Written out, each
-// member is assigned once and the golden literals pin the result.
+// staticcheck's S1016 advice — replace both composite literals with a whole
+// struct conversion — is refused, and not because a conversion would move a
+// stored byte: Go ignores struct tags in conversions, so the durable spelling
+// stays pinned by the DTO either way. What a conversion couples is the Go field
+// names, order and types. It is refused because a conversion is a single
+// statement, so the drop-a-field mutation probes that prove these conversions
+// exhaustive become inexpressible and their totality rests on the compiler
+// alone. Written out, each member is assigned once, every single-member drop is
+// killed by a test, and the golden literals pin the result. The cost of the
+// trade is that a member added to BOTH structs is not carried automatically and
+// the compiler will not say so; TestWireDTOsMirrorExportedRecords and
+// TestWireConversionsCarryEveryMember are what say so instead.
 func dispositionInboxToWire(r DispositionInboxRecord) dispositionInboxRecordWire {
 	d := r.Descriptor
 	return dispositionInboxRecordWire{
-		//lint:ignore S1016 durable member names must stay independent of the exported struct
+		//lint:ignore S1016 written out so each member drop stays a killable mutation
 		Descriptor: dispositionDescriptorWire{
 			PublicCreate: d.PublicCreate, TenantID: d.TenantID, SessionID: d.SessionID, CommandID: d.CommandID,
 			Binding: d.Binding, RuntimeCommandID: d.RuntimeCommandID, Kind: d.Kind,

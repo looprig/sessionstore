@@ -264,3 +264,87 @@ settlement, no new mode claim, nothing that would lift the Host hold.
 This is one further repository-local commit on local `main`. Nothing is pushed,
 tagged, released or accepted; the release decision, version bump and tag remain
 root's.
+
+## Conversion-totality guard and the corrected S1016 reason (2026-09-05, over `7aeec70e`)
+
+The independent quality gate of `7aeec70e` passed with no blocking findings and
+two advisories, both about the hand-written DTO conversions. This commit closes
+both. No production encoding behaviour changes: the whole diff is one comment
+rewrite, one comment sentence, and one new test file.
+
+Advisory A1 was that the S1016 suppression's stated reason is factually wrong.
+It claimed a struct conversion would reintroduce the coupling being removed —
+that the durable spelling would follow the exported struct's tags. It would not:
+**Go ignores struct tags in conversions**, and the gate proved it by building the
+conversion variant and finding it compiles, passes, emits byte-identical bytes,
+and still survives the probe that renames all 15 exported JSON tags at once. What
+a conversion couples is Go field names, order and types. The comment above
+`dispositionInboxToWire` now says that, and states the justification that is
+actually valid and was already the writer's second one: a conversion is a single
+statement, so the drop-a-field mutation probes that prove these conversions
+exhaustive become inexpressible and their totality would rest on the compiler
+alone. The `//lint:ignore` reason on the forward direction now reads "written out
+so each member drop stays a killable mutation". The suppression itself is
+unchanged and still load-bearing: deleting both directives on a `cp -R` copy
+leaves `staticcheck v0.8.1` reporting S1016 at `disposition_inbox.go:333` and
+`:345` and exiting 1.
+
+Advisory A2 was the real cost of that choice, and it is now closed rather than
+merely documented. RED first: on a `cp -R` copy under `/private/tmp/ss-red`, a
+new member added to BOTH `DispositionCommandDescriptor` and
+`dispositionDescriptorWire` and mapped in NEITHER conversion built clean and left
+`GOWORK=off go test -count=1 ./...` green on all four packages, exit 0, with the
+member silently dropped on encode and decode. The hazard is real.
+
+`wire_dto_test.go` adds two guards. `TestWireDTOsMirrorExportedRecords` compares
+member names between each exported record and its private DTO, and
+`TestWireConversionsCarryEveryMember` fills every member of a record, including
+every member of every nested record, with a distinguishable non-zero value and
+requires the conversion pair to return it unchanged. Both fail as vacuous rather
+than passing on nothing: zero pairs, a memberless struct, or a member the filler
+left zero is a `t.Fatal`, and a member of a kind the filler does not handle is a
+failure asking for it to be extended, never a silent skip. Against the same
+`/private/tmp/ss-red` probe the guard FAILS, naming the dropped member.
+
+The guard covers all six hand-converted pairs, not only the two the inbox
+commit added: `DispositionInboxRecord`/`dispositionInboxRecordWire`,
+`DispositionCommandDescriptor`/`dispositionDescriptorWire`,
+`PublicCreateReservation`/`publicCreateReservationWire`,
+`PublicCreateIdentity`/`publicCreateIdentityWire`,
+`HostTargetKey`/`publicCreateTargetWire` and
+`DesiredWorkload`/`desiredWorkloadWire`. The `289819c4` pairs have the identical
+hazard and the same shape of conversion, so excluding them would have left the
+gap open where more of it lives; `desiredWorkloadWire` is included because
+`publicCreateToWire` maps it by hand too. The four nested pairs are reached
+through the two top-level round trips, so both directions of all six conversions
+are exercised. Four further probes on `cp -R` copies, each killed by the full
+suite: a member added to `PublicCreateIdentity` alone (KILLED by both guards),
+dropping `PayloadSize` from `publicCreateToWire`, dropping `Placement` from the
+`publicCreateTargetWire` mapping, and dropping `PayloadVersion` from the
+`DesiredWorkload` decode (KILLED by the round-trip guard and the public-create
+golden). `public_create.go`'s DTO comment gained one sentence pointing a future
+author at the two guards.
+
+Verification, all `GOWORK=off` in `/Users/ipotter/code/looprig/sessionstore`:
+`go build ./... && go vet ./...` clean, exit 0 (9s). `go test -race -count=1
+./...` passed all four packages, exit 0 (30s wall). `go test -count=1 -run
+'^TestPublicCreate|^TestDisposition' .` exit 0 (2s). `make staticcheck` clean,
+exit 0, with no unused-directive complaint. `gofmt -l .` empty; `go mod verify`
+all modules verified; `go mod tidy` produced no `go.mod` or `go.sum` diff; `git
+diff --check` clean. Pins remain `core v0.7.0` and `storage v0.6.0`, no
+`replace`, no vendor. `GOWORK=off GOMAXPROCS=8 make check` ran to completion, exit 0, in 754s (12:34) —
+vet, staticcheck v0.8.1, gosec v2.28.0, `go mod verify`, govulncheck v1.6.0 (no
+vulnerabilities), the `-race` suite, 20 default 30-second fuzz targets with no
+crashers, and build.
+
+Byte identity re-proved rather than assumed: a throwaway probe encoding the three
+golden inbox shapes through `encodeDispositionInboxRecord` was run in a detached
+worktree at `7aeec70e` and against these sources, and the bytes are
+BYTE-IDENTICAL. `go doc -all .` against `7aeec70e` is identical — zero removed
+and zero added lines — so the public Go API is untouched and remains purely
+additive against published v0.4.0. `testdata` is unchanged: one tracked fuzz
+corpus seed, no untracked files.
+
+This is one further repository-local commit on local `main`. Nothing is pushed,
+tagged, released or accepted; the release decision, version bump and tag remain
+root's.
