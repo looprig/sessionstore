@@ -189,3 +189,78 @@ These changes are now one separate repository-local commit on local `main`.
 Still owed before any release: independent spec and code-quality rechecks of
 the committed revision. Do not push, tag, update dependencies/root docs,
 release, accept Factory A3.1, or lift the Host hold.
+
+## Disposition inbox wire pinning (2026-09-05, over `289819c4`)
+
+The independent quality recheck of `289819c4` passed with advisory A1: the third
+record `AdmitPublicCreate` writes — the disposition inbox row — was still
+marshalled straight off the exported `DispositionInboxRecord` and
+`DispositionCommandDescriptor`, with no private DTO and no golden byte literal.
+Its probe renaming `json:"public_create"` to `json:"pc"` survived the whole
+suite. Reproduced first as RED here: on a `cp -R` copy under
+`/private/tmp/mut-red`, that rename left `GOWORK=off go test -count=1 ./...`
+green on all four packages.
+
+`disposition_inbox.go` now carries `dispositionInboxRecordWire` and
+`dispositionDescriptorWire`, with `dispositionInboxToWire` and
+`(dispositionInboxRecordWire).record()` written out member by member in both
+directions: 4 of 4 record members and 11 of 11 descriptor members each way, no
+unmapped member on either side. `dispositionInboxWire` embeds the private record
+DTO instead of the exported one; encode and decode route through the
+conversions. Stored bytes are unchanged — the golden literals were written
+against the pre-DTO encoder and still pass byte-for-byte after it. staticcheck
+S1016 wants both literals replaced by a struct conversion; that is refused with a
+`//lint:ignore` and a stated reason, because a conversion only compiles while the
+DTO's field names match the exported struct's, which reintroduces the coupling
+being removed. This is the repository's first lint suppression.
+
+`TestDispositionInboxWireGolden` pins full encoded bytes for three cases:
+marker present with an inline payload, marker absent with the same payload
+(`public_create` is `omitempty`, so both spellings are pinned), and marker
+present with a `payload_object` instead. Opaque IDs carry case, a slash and a
+colon (`Tenant/A:B`, `Session/A:B`, `Create/A:B`, `Kind/A:B`). Each case also
+decodes back to the canonical record and rejects noncanonical spellings: the
+`pc` rename, `descriptor` renamed to `command`, an omitted `payload_size` and an
+explicit `"public_create":false`. Dropping the marker outright is deliberately
+NOT a codec error — those bytes are the valid unmarked record — so the test says
+so and leaves that to the winner comparison in `admitDispositionCommand`.
+`desiredWorkloadWire`'s doc comment (advisory A2) now describes both spellings:
+absent through the catalog's pointer, explicitly present as
+`{"payload_version":"","payload":null}` in the by-value reservation embedding.
+`DispositionCommandDescriptor`'s Godoc gained one sentence stating its tags are
+not the durable spelling.
+
+Verification, all `GOWORK=off` in `/Users/ipotter/code/looprig/sessionstore`:
+`go build ./... && go vet ./...` clean (9.2s). `go test -race -count=1 ./...`
+passed all four packages (12.7s package, 30.2s wall). `go test -count=1 -run
+'^TestPublicCreate|^TestDisposition' .` passed with 34 top-level tests matched
+(0.554s). `GOWORK=off GOMAXPROCS=8 make check` ran to completion, exit 0, in
+12:27.5 — vet, staticcheck v0.8.1, gosec v2.28.0, `go mod verify` (all modules
+verified), govulncheck v1.6.0 (no vulnerabilities), the `-race` suite, 20 default
+30-second fuzz targets with no crashers, and build. `go mod tidy` produced no
+`go.mod` or `go.sum` diff; `git diff --check` clean; pins remain `core v0.7.0`
+and `storage v0.6.0` with no `replace` and no vendor directory.
+
+Mutation probes, each on a `cp -R` copy under `/private/tmp`, shared sources and
+the module cache untouched. The formerly surviving marker rename is now KILLED by
+`TestDispositionInboxWireGolden` (`marked_inline`, `marked_object`). Dropping
+`Payload` from the encode conversion is KILLED by the disposition suite
+(`TestDispositionUnreadablePageContinues` and others); dropping it from the
+decode conversion is KILLED likewise. Renaming the DTO's `descriptor` to
+`command` is KILLED by the golden and `TestPublicCreateCodecsFailClosed`;
+renaming the DTO's `payload_object` to `object` is KILLED by the golden's
+`marked_object` case. Renaming the tag on the EXPORTED descriptor alone survives,
+which is the intended result and the decoupling proof: stored bytes no longer
+follow the exported struct's tags.
+
+Released formats re-verified, not assumed: a throwaway probe encoding a
+representative catalog v1 record and a v2 bound record through
+`encodeCatalogRecord` was run in a detached worktree at published v0.4.0
+`5170b531` and against these sources; the emitted bytes are BYTE-IDENTICAL. `go
+doc -all .` shows zero removed lines against `5170b531` (225 added) and, against
+`289819c4`, only the one added `DispositionCommandDescriptor` doc sentence. No
+settlement, no new mode claim, nothing that would lift the Host hold.
+
+This is one further repository-local commit on local `main`. Nothing is pushed,
+tagged, released or accepted; the release decision, version bump and tag remain
+root's.

@@ -96,10 +96,14 @@ func (w DesiredWorkload) isZero() bool {
 	return w.PayloadVersion == "" && len(w.Payload) == 0
 }
 
-// desiredWorkloadWire is the stored shape. It is reached through a pointer in
-// the catalog record's wire form, so an absent workload contributes no member
-// at all rather than an empty object — the same reason the checkpoint summary
-// and the Host route are pointers.
+// desiredWorkloadWire is the stored shape. How absence is spelled depends on the
+// record that holds it, and both spellings are deliberate. The catalog record's
+// wire form reaches it through a pointer, so an absent workload contributes no
+// member at all rather than an empty object — the same reason the checkpoint
+// summary and the Host route are pointers. The public-create reservation embeds
+// it by value instead, so an absent workload is explicitly present there as
+// {"payload_version":"","payload":null}; that record has exactly one canonical
+// spelling and no omitted-member alternate.
 type desiredWorkloadWire struct {
 	PayloadVersion string `json:"payload_version"`
 	Payload        []byte `json:"payload"`

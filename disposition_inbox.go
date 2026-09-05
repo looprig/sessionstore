@@ -30,6 +30,9 @@ const dispositionInboxNamespace = "sessionstore/disposition-inbox"
 // PayloadObject, when present, contains the exact winning canonical metadata.
 // Payload bytes are private and bounded by MaxInboxPayloadBytes; nil means empty
 // inline content when PayloadObject is nil. Binding is the actual catalog pin.
+// These struct tags are NOT the durable spelling: stored member names are pinned
+// separately by this package's private wire DTO and by golden byte literals, so
+// renaming a field here cannot move a stored record.
 type DispositionCommandDescriptor struct {
 	// PublicCreate is emitted only by AdmitPublicCreate. Its explicit presence
 	// fails older strict canonical v2 decoders; Kind itself remains opaque.
@@ -280,7 +283,67 @@ func dispositionInboxEntryFor(stored storage.OrderedRecord, scope sessionScope, 
 
 type dispositionInboxWire struct {
 	RecordVersion uint8 `json:"record_version"`
-	DispositionInboxRecord
+	dispositionInboxRecordWire
+}
+
+// The private DTOs below fix this record's durable member names independently of
+// the exported record and descriptor's Go field names, so renaming an exported
+// field cannot silently rewrite stored bytes. public_create is emitted only when
+// true; that presence, its absence, and each of the two mutually exclusive
+// payload representations are pinned by golden literals in
+// TestDispositionInboxWireGolden.
+// Canonical re-encoding rejects every other spelling, including an explicit
+// "public_create":false. Conversions are exhaustive in both directions.
+type dispositionInboxRecordWire struct {
+	Descriptor    dispositionDescriptorWire `json:"descriptor"`
+	AcceptedAt    time.Time                 `json:"accepted_at"`
+	ApplyDeadline time.Time                 `json:"apply_deadline"`
+	State         InboxState                `json:"state"`
+}
+
+type dispositionDescriptorWire struct {
+	PublicCreate     bool                        `json:"public_create,omitempty"`
+	TenantID         sessionwire.TenantID        `json:"tenant_id"`
+	SessionID        sessionwire.SessionID       `json:"session_id"`
+	CommandID        sessionwire.CommandID       `json:"command_id"`
+	Binding          SessionBinding              `json:"binding"`
+	RuntimeCommandID RuntimeCommandID            `json:"runtime_command_id"`
+	Kind             CommandKind                 `json:"kind"`
+	PayloadDigest    string                      `json:"payload_digest"`
+	PayloadSize      uint64                      `json:"payload_size"`
+	Payload          []byte                      `json:"payload,omitempty"`
+	PayloadObject    *sessionwire.ObjectMetadata `json:"payload_object,omitempty"`
+}
+
+// Taking staticcheck's S1016 advice here would defeat the point. A conversion
+// only compiles while the DTO's field NAMES still match the exported struct's,
+// so the two would be renamed together — reintroducing exactly the coupling
+// these member names are being bought independence from. Written out, each
+// member is assigned once and the golden literals pin the result.
+func dispositionInboxToWire(r DispositionInboxRecord) dispositionInboxRecordWire {
+	d := r.Descriptor
+	return dispositionInboxRecordWire{
+		//lint:ignore S1016 durable member names must stay independent of the exported struct
+		Descriptor: dispositionDescriptorWire{
+			PublicCreate: d.PublicCreate, TenantID: d.TenantID, SessionID: d.SessionID, CommandID: d.CommandID,
+			Binding: d.Binding, RuntimeCommandID: d.RuntimeCommandID, Kind: d.Kind,
+			PayloadDigest: d.PayloadDigest, PayloadSize: d.PayloadSize, Payload: d.Payload, PayloadObject: d.PayloadObject,
+		},
+		AcceptedAt: r.AcceptedAt, ApplyDeadline: r.ApplyDeadline, State: r.State,
+	}
+}
+
+func (w dispositionInboxRecordWire) record() DispositionInboxRecord {
+	d := w.Descriptor
+	return DispositionInboxRecord{
+		//lint:ignore S1016 the reverse direction is written out for the same reason
+		Descriptor: DispositionCommandDescriptor{
+			PublicCreate: d.PublicCreate, TenantID: d.TenantID, SessionID: d.SessionID, CommandID: d.CommandID,
+			Binding: d.Binding, RuntimeCommandID: d.RuntimeCommandID, Kind: d.Kind,
+			PayloadDigest: d.PayloadDigest, PayloadSize: d.PayloadSize, Payload: d.Payload, PayloadObject: d.PayloadObject,
+		},
+		AcceptedAt: w.AcceptedAt, ApplyDeadline: w.ApplyDeadline, State: w.State,
+	}
 }
 
 func encodeDispositionInboxRecord(r DispositionInboxRecord) ([]byte, DispositionInboxRecord, error) {
@@ -288,7 +351,7 @@ func encodeDispositionInboxRecord(r DispositionInboxRecord) ([]byte, Disposition
 	if err != nil {
 		return nil, DispositionInboxRecord{}, err
 	}
-	value, err := json.Marshal(dispositionInboxWire{RecordVersion: DispositionInboxRecordVersion, DispositionInboxRecord: r})
+	value, err := json.Marshal(dispositionInboxWire{RecordVersion: DispositionInboxRecordVersion, dispositionInboxRecordWire: dispositionInboxToWire(r)})
 	if err != nil {
 		return nil, DispositionInboxRecord{}, inboxInvalid("record", err)
 	}
@@ -303,7 +366,7 @@ func decodeDispositionInboxRecord(value []byte) (DispositionInboxRecord, error) 
 	if err != nil {
 		return DispositionInboxRecord{}, err
 	}
-	canonical, record, err := encodeDispositionInboxRecord(wire.DispositionInboxRecord)
+	canonical, record, err := encodeDispositionInboxRecord(wire.record())
 	if err != nil {
 		return DispositionInboxRecord{}, err
 	}

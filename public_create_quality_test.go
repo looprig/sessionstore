@@ -3,8 +3,11 @@ package sessionstore
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/looprig/storage"
@@ -174,6 +177,76 @@ func TestPublicCreateReservationFilingValidation(t *testing.T) {
 			entry, created, err := s.AdmitPublicCreate(t.Context(), AdmitPublicCreateRequest{Identity: req.Identity, Payload: inboxPayload})
 			if !errors.As(err, &inboxErr) || inboxErr.Code != tc.kind || created || !reflect.DeepEqual(entry, DispositionInboxEntry{}) {
 				t.Fatalf("misfiled reservation acknowledged: %+v %v %v", entry, created, err)
+			}
+		})
+	}
+}
+
+// The disposition inbox row is the third record AdmitPublicCreate writes. These
+// literals pin its stored member names independently of the exported descriptor,
+// including the public_create marker present and absent — it is omitempty, so
+// both spellings need pinning — and the mutually exclusive inline payload and
+// payload_object members.
+func TestDispositionInboxWireGolden(t *testing.T) {
+	const head = `{"record_version":2,"descriptor":{`
+	const identity = `"tenant_id":"Tenant/A:B","session_id":"Session/A:B","command_id":"Create/A:B","binding":{"storage_binding_id":"agent-pool/east","binding_version":"config-2026-09","runtime_session_id":"runtime/session-a","protocol_mode":"disposition"},"runtime_command_id":"2f1c7d1e-0f3a-4c5b-9f21-000000000001","kind":"Kind/A:B","payload_digest":"`
+	const tail = `},"accepted_at":"2026-08-30T11:30:00Z","apply_deadline":"2026-08-30T12:30:00Z","state":"pending"}`
+	const inlineDigest = "47ffa3ea45a70b8a41c2c0825df323c00a8b7a01c1ea06083cc41dddcc001123"
+	object := objectMetadataFor(ObjectKindCommandPayload, [16]byte{1}, 3, sha256.Sum256([]byte{0, 255, 1}), "text/plain")
+	objectWire, err := json.Marshal(object)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		d    DispositionCommandDescriptor
+		want string
+	}{
+		{
+			"marked inline",
+			DispositionCommandDescriptor{PublicCreate: true, Payload: []byte{0, 255, 1}, PayloadDigest: inlineDigest, PayloadSize: 3},
+			head + `"public_create":true,` + identity + inlineDigest + `","payload_size":3,"payload":"AP8B"` + tail,
+		},
+		{
+			"unmarked inline",
+			DispositionCommandDescriptor{Payload: []byte{0, 255, 1}, PayloadDigest: inlineDigest, PayloadSize: 3},
+			head + identity + inlineDigest + `","payload_size":3,"payload":"AP8B"` + tail,
+		},
+		{
+			"marked object",
+			DispositionCommandDescriptor{PublicCreate: true, PayloadObject: &object, PayloadDigest: inlineDigest, PayloadSize: 3},
+			head + `"public_create":true,` + identity + inlineDigest + `","payload_size":3,"payload_object":` + string(objectWire) + tail,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := tc.d
+			d.TenantID, d.SessionID, d.CommandID = "Tenant/A:B", "Session/A:B", "Create/A:B"
+			d.Binding, d.RuntimeCommandID, d.Kind = testSessionBinding(), inboxRuntime, "Kind/A:B"
+			r := DispositionInboxRecord{Descriptor: d, AcceptedAt: inboxAcceptedAt, ApplyDeadline: inboxDeadline, State: InboxStatePending}
+			got, canonical, err := encodeDispositionInboxRecord(r)
+			if err != nil || string(got) != tc.want {
+				t.Fatalf("inbox golden: %s, %v; want %s", got, err, tc.want)
+			}
+			decoded, err := decodeDispositionInboxRecord([]byte(tc.want))
+			if err != nil || !reflect.DeepEqual(decoded, canonical) {
+				t.Fatalf("inbox decode: %+v %v", decoded, err)
+			}
+			// Every alternate spelling of a durable member must be refused,
+			// including an explicit rendering of the omitted marker. Simply
+			// dropping the marker is NOT a spelling error — it is the valid
+			// unmarked record above — so the winner comparison in
+			// admitDispositionCommand, not the codec, is what refuses it.
+			for _, bad := range [][]byte{
+				bytes.Replace([]byte(tc.want), []byte(`"public_create"`), []byte(`"pc"`), 1),
+				bytes.Replace([]byte(tc.want), []byte(`"descriptor":`), []byte(`"command":`), 1),
+				bytes.Replace([]byte(tc.want), []byte(`,"payload_size":3`), nil, 1),
+				[]byte(strings.Replace(tc.want, `"descriptor":{`, `"descriptor":{"public_create":false,`, 1)),
+			} {
+				if !bytes.Equal(bad, []byte(tc.want)) {
+					if _, err := decodeDispositionInboxRecord(bad); err == nil {
+						t.Fatalf("noncanonical member spelling accepted: %s", bad)
+					}
+				}
 			}
 		})
 	}
