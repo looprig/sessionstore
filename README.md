@@ -86,6 +86,34 @@ a direct provider read or a bounded provider query, and a cache in front of it
 would serve a revision a compare-and-swap has already invalidated, which is the
 one thing the fences exist to prevent.
 
+## Immutable session bindings
+
+`CreateCatalogEntryRequest.Binding` optionally pins `StorageBindingID`,
+`BindingVersion`, `RuntimeSessionID`, and `ProtocolMode`. These are bounded opaque
+IDs; the configuration version is immutable and contains no credentials. A
+complete binding is written inside the catalog's single atomic ordered create.
+Matching retries return the winning record; a different binding or AgentID fails
+with `CatalogErrorConflict`. Desired-state updates preserve the binding. There is
+no online binding or protocol conversion API.
+
+Zero binding retains the literal version-1 legacy catalog format and its legacy
+retry behavior. Bound records use version 2, require every binding field, and
+reject unknown fields or modes. `ProtocolModeLegacy` selects the released
+single-store protocol. `ProtocolModeDisposition` reserves the independent
+ownership and settlement protocol; its execution APIs are not implemented yet.
+Existing Host/gate, journal, inbox, registration, and pointer writers cannot
+execute that protocol. This prerequisite does not activate Host adoption.
+
+A separate create-only KV witness reserves **only the protocol**, before any
+session data is written. It never selects storage configuration or the winning
+catalog binding. If creation fails after that witness, a same-mode retry can
+still create the catalog with its proposed binding. Keep the witness for the
+session's lifetime; deleting it independently is unsupported. Sessions with old
+collision witnesses but no protocol witness are conservatively legacy, including
+previously unused scopes. The legacy single-tenant layout refuses disposition
+sessions. Old binaries must be excluded from stores serving disposition sessions:
+they do not know this witness and cannot be fenced by it.
+
 ## Provider compatibility
 
 `Open` requires the backend's `Blobs` primitive to implement Storage's optional

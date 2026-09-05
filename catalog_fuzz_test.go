@@ -42,6 +42,11 @@ func FuzzCatalogRecordCodec(f *testing.F) {
 	}
 	full := testCatalogRecord()
 	f.Add(seed(full))
+	bound := full
+	bound.Binding = testSessionBinding()
+	f.Add(seed(bound))
+	bound.Binding.ProtocolMode = ProtocolModeLegacy
+	f.Add(seed(bound))
 
 	minimal := full
 	minimal.OpenGates = nil

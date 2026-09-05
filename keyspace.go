@@ -318,6 +318,15 @@ func (s *Store) verifySessionScope(ctx context.Context, scope sessionScope) erro
 // bindSessionScope create-only binds collision witnesses before a caller may
 // create any canonical session data. Legacy scopes require no witnesses.
 func (s *Store) bindSessionScope(ctx context.Context, scope sessionScope) error {
+	return s.bindSessionScopeMode(ctx, scope, ProtocolModeLegacy)
+}
+
+// bindSessionScopeMode reserves the protocol before creating collision
+// witnesses. The latter attest only identity, never storage routing authority.
+func (s *Store) bindSessionScopeMode(ctx context.Context, scope sessionScope, mode ProtocolMode) error {
+	if err := s.bindProtocolMode(ctx, scope, mode); err != nil {
+		return err
+	}
 	if err := s.validateSessionScope(scope); err != nil {
 		return err
 	}

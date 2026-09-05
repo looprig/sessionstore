@@ -883,6 +883,9 @@ func (s *Store) writeSessionPointer(
 	value []byte,
 	expectedRevision uint64,
 ) (SessionPointerEntry, error) {
+	if err := s.bindProtocolMode(ctx, scope, ProtocolModeLegacy); err != nil {
+		return SessionPointerEntry{}, err
+	}
 	stored, err := s.backend.OrderedIndex.Update(
 		ctx, sessionPointerID(scope, pointer.Kind), expectedRevision,
 		value, storage.Rank{}, sessionPointerDue(pointer))

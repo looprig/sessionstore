@@ -785,6 +785,9 @@ func (s *Store) currentInboxEntry(
 	if err != nil {
 		return InboxEntry{}, err
 	}
+	if err := s.bindProtocolMode(ctx, scope, ProtocolModeLegacy); err != nil {
+		return InboxEntry{}, err
+	}
 	if current.Revision != expectedRevision {
 		return InboxEntry{}, &InboxError{Code: InboxErrorConflict, Field: "expected_revision", Revision: current.Revision}
 	}

@@ -29,9 +29,8 @@ const catalogNamespace = "sessionstore/catalog"
 const maxCatalogCursorBytes = 4 << 10
 
 const (
-	// CatalogRecordVersion is the independent version of the stored catalog
-	// record. A reader fails closed on any other version rather than guessing
-	// which members a future encoder meant.
+	// CatalogRecordVersion is the stored legacy catalog version. Bound records
+	// use CatalogBindingRecordVersion; readers refuse all other versions.
 	CatalogRecordVersion uint8 = 1
 
 	// MaxCatalogOpenGates bounds the open-gate projections one catalog record
@@ -92,6 +91,8 @@ func (c CheckpointSummary) isZero() bool {
 // state, guarded by revision compare-and-swap and an idempotency key; Factory
 // never names a lease epoch, so it cannot claim ownership it does not have.
 type CatalogRecord struct {
+	// Binding is immutable after creation. Zero preserves the legacy v1 record.
+	Binding                SessionBinding
 	TenantID               sessionwire.TenantID
 	SessionID              sessionwire.SessionID
 	AgentID                sessionwire.AgentID
@@ -172,9 +173,12 @@ func (r CatalogRecord) Status() (sessionwire.SessionStatus, error) {
 }
 
 // CreateCatalogEntryRequest creates the authoritative record for one session.
-// It is idempotent by (TenantID, SessionID): a repeat returns the stored record
-// unchanged with created false.
+// Legacy creation is idempotent by (TenantID, SessionID). A bound retry must
+// also match the immutable Binding and AgentID; a mismatch is CatalogErrorConflict.
+// A legacy request cannot adopt a bound row. Matching retries return the stored
+// record unchanged with created false, even when mutable desired fields differ.
 type CreateCatalogEntryRequest struct {
+	Binding                SessionBinding
 	TenantID               sessionwire.TenantID
 	SessionID              sessionwire.SessionID
 	AgentID                sessionwire.AgentID
@@ -273,6 +277,7 @@ func (s *Store) CreateCatalogEntry(ctx context.Context, req CreateCatalogEntryRe
 		return CatalogEntry{}, false, err
 	}
 	record := CatalogRecord{
+		Binding:                req.Binding,
 		TenantID:               req.TenantID,
 		SessionID:              req.SessionID,
 		AgentID:                req.AgentID,
@@ -298,7 +303,11 @@ func (s *Store) CreateCatalogEntry(ctx context.Context, req CreateCatalogEntryRe
 		return CatalogEntry{}, false, err
 	}
 	defer release()
-	if err := s.bindSessionScope(opCtx, scope); err != nil {
+	mode := req.Binding.ProtocolMode
+	if req.Binding == (SessionBinding{}) {
+		mode = ProtocolModeLegacy
+	}
+	if err := s.bindSessionScopeMode(opCtx, scope, mode); err != nil {
 		return CatalogEntry{}, false, err
 	}
 	stored, created, err := s.backend.OrderedIndex.Create(
@@ -307,6 +316,10 @@ func (s *Store) CreateCatalogEntry(ctx context.Context, req CreateCatalogEntryRe
 		return CatalogEntry{}, false, classifyCatalogOrderedError(err, "create")
 	}
 	entry, err := catalogEntry(stored, req.TenantID, req.SessionID)
+	if err == nil && (req.Binding != (SessionBinding{}) || entry.Record.Binding != (SessionBinding{})) &&
+		(req.Binding != entry.Record.Binding || req.AgentID != entry.Record.AgentID) {
+		return CatalogEntry{}, false, &CatalogError{Code: CatalogErrorConflict, Field: "binding", Revision: entry.Revision}
+	}
 	return entry, created, err
 }
 
@@ -596,6 +609,9 @@ func (s *Store) readCatalogEntry(
 // It is epochFence in the catalog's vocabulary; the rule, and why an equal
 // epoch is admitted, are stated there.
 func hostEpochFence(current CatalogRecord, epoch uint64) error {
+	if current.Binding.ProtocolMode == ProtocolModeDisposition {
+		return catalogInvalid("binding.protocol_mode", nil)
+	}
 	return epochFence(current.LeaseEpoch, epoch, func(committed uint64) error {
 		return &CatalogError{Code: CatalogErrorEpoch, Field: "lease_epoch", Epoch: committed}
 	})
@@ -809,7 +825,12 @@ func encodeCatalogRecord(record CatalogRecord) ([]byte, error) {
 			CapturedAt: record.Checkpoint.CapturedAt,
 		}
 	}
-	encoded, err := json.Marshal(wire)
+	var payload any = wire
+	if record.Binding != (SessionBinding{}) {
+		wire.RecordVersion = CatalogBindingRecordVersion
+		payload = catalogBindingWire{catalogWire: wire, Binding: record.Binding}
+	}
+	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, catalogErr(CatalogErrorInvalid, "record", err)
 	}
@@ -832,13 +853,33 @@ func encodeCatalogRecord(record CatalogRecord) ([]byte, error) {
 // exceptions are core's own declared redaction boundaries, such as
 // ObjectReference, which drop an undeclared member rather than proxy it.
 func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
-	wire, err := decodeVersionedRecord[catalogWire](
-		value, MaxCatalogRecordBytes, CatalogRecordVersion,
-		versionedRecordFields{Record: "record", Version: "record_version"}, catalogRecordFailure)
+	var wire catalogWire
+	var binding SessionBinding
+	var err error
+	// Bound the probe too; malformed and unsupported input is classified by
+	// the shared strict decoder, including its version-before-members rule.
+	var probe struct {
+		RecordVersion uint8 `json:"record_version"`
+	}
+	if len(value) <= MaxCatalogRecordBytes {
+		_ = json.Unmarshal(value, &probe)
+	}
+	fields := versionedRecordFields{Record: "record", Version: "record_version"}
+	if probe.RecordVersion == CatalogBindingRecordVersion {
+		var bound catalogBindingWire
+		bound, err = decodeVersionedRecord[catalogBindingWire](value, MaxCatalogRecordBytes, CatalogBindingRecordVersion, fields, catalogRecordFailure)
+		wire, binding = bound.catalogWire, bound.Binding
+		if err == nil {
+			err = binding.validate()
+		}
+	} else {
+		wire, err = decodeVersionedRecord[catalogWire](value, MaxCatalogRecordBytes, CatalogRecordVersion, fields, catalogRecordFailure)
+	}
 	if err != nil {
 		return CatalogRecord{}, err
 	}
 	record := CatalogRecord{
+		Binding:                binding,
 		TenantID:               wire.TenantID,
 		SessionID:              wire.SessionID,
 		AgentID:                wire.AgentID,
@@ -966,6 +1007,11 @@ const (
 // gate slice. Encoding and decoding both end here, so a record read back is
 // byte-identical to the record written and two encoders cannot disagree.
 func canonicalCatalogRecord(record CatalogRecord) (CatalogRecord, error) {
+	if record.Binding != (SessionBinding{}) {
+		if err := record.Binding.validate(); err != nil {
+			return CatalogRecord{}, err
+		}
+	}
 	if err := record.TenantID.Validate(); err != nil {
 		return CatalogRecord{}, catalogErr(CatalogErrorInvalid, "tenant_id", err)
 	}

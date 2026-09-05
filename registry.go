@@ -788,6 +788,9 @@ func (s *Store) updateHostRegistration(
 	value []byte,
 	expectedRevision uint64,
 ) (HostRegistrationEntry, error) {
+	if err := s.bindProtocolMode(ctx, scope, ProtocolModeLegacy); err != nil {
+		return HostRegistrationEntry{}, err
+	}
 	stored, err := s.backend.OrderedIndex.Update(
 		ctx, hostRegistrationID(scope, record.SessionID), expectedRevision,
 		value, storage.Rank{}, hostRegistrationDue(record))

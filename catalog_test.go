@@ -308,7 +308,7 @@ func TestCatalogRecordDecodeFailsClosed(t *testing.T) {
 		{name: "not json", value: []byte("{"), code: CatalogErrorMalformed},
 		{name: "trailing content", value: append(append([]byte(nil), valid...), '{'), code: CatalogErrorMalformed},
 		{name: "unknown version", value: rewrite(func(m map[string]json.RawMessage) {
-			m["record_version"] = json.RawMessage("2")
+			m["record_version"] = json.RawMessage("3")
 		}), code: CatalogErrorVersion},
 		{name: "unknown member", value: rewrite(func(m map[string]json.RawMessage) {
 			m["surprise"] = json.RawMessage(`"x"`)
@@ -1397,6 +1397,7 @@ func enumerateTextSites(value reflect.Value, path string, out *[]textSite) {
 func TestCatalogTextValidationCoversEveryStringField(t *testing.T) {
 	count := func() int {
 		record := richCatalogRecord()
+		record.Binding = testSessionBinding()
 		var sites []textSite
 		enumerateTextSites(reflect.ValueOf(&record).Elem(), "record", &sites)
 		return len(sites)
@@ -1406,12 +1407,13 @@ func TestCatalogTextValidationCoversEveryStringField(t *testing.T) {
 	// the enumerator walks into — narrow this test's coverage without failing
 	// it. Bump this number when the record legitimately gains or loses a text
 	// member, and check that the member is validated when you do.
-	const wantTextSites = 27
+	const wantTextSites = 31
 	if count != wantTextSites {
 		t.Fatalf("the enumerator found %d text sites, want exactly %d; bump me when the record gains or loses a text member", count, wantTextSites)
 	}
 	for i := range count {
 		record := richCatalogRecord()
+		record.Binding = testSessionBinding()
 		var sites []textSite
 		enumerateTextSites(reflect.ValueOf(&record).Elem(), "record", &sites)
 		site := sites[i]
