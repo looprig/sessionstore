@@ -308,7 +308,7 @@ func TestCatalogRecordDecodeFailsClosed(t *testing.T) {
 		{name: "not json", value: []byte("{"), code: CatalogErrorMalformed},
 		{name: "trailing content", value: append(append([]byte(nil), valid...), '{'), code: CatalogErrorMalformed},
 		{name: "unknown version", value: rewrite(func(m map[string]json.RawMessage) {
-			m["record_version"] = json.RawMessage("3")
+			m["record_version"] = json.RawMessage("255")
 		}), code: CatalogErrorVersion},
 		{name: "unknown member", value: rewrite(func(m map[string]json.RawMessage) {
 			m["surprise"] = json.RawMessage(`"x"`)

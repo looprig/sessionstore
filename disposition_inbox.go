@@ -31,6 +31,9 @@ const dispositionInboxNamespace = "sessionstore/disposition-inbox"
 // Payload bytes are private and bounded by MaxInboxPayloadBytes; nil means empty
 // inline content when PayloadObject is nil. Binding is the actual catalog pin.
 type DispositionCommandDescriptor struct {
+	// PublicCreate is emitted only by AdmitPublicCreate. Its explicit presence
+	// fails older strict canonical v2 decoders; Kind itself remains opaque.
+	PublicCreate     bool                        `json:"public_create,omitempty"`
 	TenantID         sessionwire.TenantID        `json:"tenant_id"`
 	SessionID        sessionwire.SessionID       `json:"session_id"`
 	CommandID        sessionwire.CommandID       `json:"command_id"`
@@ -118,10 +121,10 @@ func (s *Store) dispositionCatalog(ctx context.Context, scope sessionScope, tena
 // reading its body. That index does not prove current existence after external
 // deletion; GetObject must still verify the full stream when consuming it.
 func (s *Store) AdmitDispositionCommand(ctx context.Context, req AdmitDispositionCommandRequest) (DispositionInboxEntry, bool, error) {
-	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
-	if err != nil {
-		return DispositionInboxEntry{}, false, err
-	}
+	return s.admitDispositionCommand(ctx, req, nil)
+}
+
+func dispositionDescriptor(req AdmitDispositionCommandRequest) (DispositionCommandDescriptor, error) {
 	d := DispositionCommandDescriptor{TenantID: req.TenantID, SessionID: req.SessionID, CommandID: req.CommandID, Binding: req.Binding, RuntimeCommandID: req.ProposedRuntimeCommandID, Kind: req.Kind, Payload: req.Payload, PayloadObject: req.PayloadObject}
 	if d.PayloadObject == nil {
 		digest := sha256.Sum256(d.Payload)
@@ -129,10 +132,26 @@ func (s *Store) AdmitDispositionCommand(ctx context.Context, req AdmitDispositio
 	} else {
 		parsed, err := parseObjectMetadata(*d.PayloadObject)
 		if err != nil {
-			return DispositionInboxEntry{}, false, err
+			return DispositionCommandDescriptor{}, err
+		}
+		if parsed.kind != ObjectKindCommandPayload || !d.PayloadObject.CreatedAt.IsZero() {
+			return DispositionCommandDescriptor{}, inboxInvalid("payload_object", nil)
 		}
 		d.PayloadDigest, d.PayloadSize = hex.EncodeToString(parsed.digest[:]), d.PayloadObject.SizeBytes
 	}
+	return d, nil
+}
+
+func (s *Store) admitDispositionCommand(ctx context.Context, req AdmitDispositionCommandRequest, public *PublicCreateReservation) (DispositionInboxEntry, bool, error) {
+	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
+	if err != nil {
+		return DispositionInboxEntry{}, false, err
+	}
+	d, err := dispositionDescriptor(req)
+	if err != nil {
+		return DispositionInboxEntry{}, false, err
+	}
+	d.PublicCreate = public != nil
 	value, record, err := encodeDispositionInboxRecord(DispositionInboxRecord{Descriptor: d, AcceptedAt: req.AcceptedAt, ApplyDeadline: req.ApplyDeadline, State: InboxStatePending})
 	if err != nil {
 		return DispositionInboxEntry{}, false, err
@@ -142,9 +161,20 @@ func (s *Store) AdmitDispositionCommand(ctx context.Context, req AdmitDispositio
 		return DispositionInboxEntry{}, false, err
 	}
 	defer release()
-	binding, err := s.dispositionCatalog(opCtx, scope, req.TenantID, req.SessionID)
+	catalog, err := s.readCatalogEntry(opCtx, scope, req.TenantID, req.SessionID)
 	if err != nil {
 		return DispositionInboxEntry{}, false, err
+	}
+	binding := catalog.Record.Binding
+	if binding.ProtocolMode != ProtocolModeDisposition {
+		return DispositionInboxEntry{}, false, catalogInvalid("binding.protocol_mode", nil)
+	}
+	if public != nil {
+		if !samePublicCreate(public, catalog.Record.PublicCreate) {
+			return DispositionInboxEntry{}, false, inboxErr(InboxErrorCommandMismatch, "public_create", nil)
+		}
+	} else if catalog.Record.PublicCreate != nil && catalog.Record.PublicCreate.Identity.CommandID == req.CommandID {
+		return DispositionInboxEntry{}, false, inboxErr(InboxErrorCommandMismatch, "public_create", nil)
 	}
 	if binding != d.Binding {
 		return DispositionInboxEntry{}, false, inboxErr(InboxErrorCommandMismatch, "binding", nil)
@@ -173,8 +203,11 @@ func (s *Store) AdmitDispositionCommand(ctx context.Context, req AdmitDispositio
 		return DispositionInboxEntry{}, false, inboxErr(InboxErrorIdentity, "value", nil)
 	}
 	winner := entry.Record.Descriptor
-	if winner.Kind != d.Kind || winner.PayloadDigest != d.PayloadDigest || winner.PayloadSize != d.PayloadSize {
+	if winner.PublicCreate != d.PublicCreate || winner.Kind != d.Kind || winner.PayloadDigest != d.PayloadDigest || winner.PayloadSize != d.PayloadSize {
 		return DispositionInboxEntry{}, false, inboxErr(InboxErrorCommandMismatch, "command", nil)
+	}
+	if public != nil && (winner.RuntimeCommandID != public.RuntimeCommandID || !entry.Record.AcceptedAt.Equal(public.AcceptedAt) || !entry.Record.ApplyDeadline.Equal(public.ApplyDeadline)) {
+		return DispositionInboxEntry{}, false, inboxErr(InboxErrorCommandMismatch, "public_create", nil)
 	}
 	return entry, created, nil
 }

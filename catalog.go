@@ -91,6 +91,9 @@ func (c CheckpointSummary) isZero() bool {
 // state, guarded by revision compare-and-swap and an idempotency key; Factory
 // never names a lease epoch, so it cannot claim ownership it does not have.
 type CatalogRecord struct {
+	// PublicCreate is immutable provenance, present only in version 3 catalogs.
+	// Desired placement and idempotency changes never rewrite this identity.
+	PublicCreate *PublicCreateReservation
 	// Binding is immutable after creation. Zero preserves the legacy v1 record.
 	Binding                SessionBinding
 	TenantID               sessionwire.TenantID
@@ -272,28 +275,29 @@ type UpdateCatalogDesiredStateRequest struct {
 // authoritative ordered record. A duplicate identity returns the canonical
 // stored record with created false and never overwrites it.
 func (s *Store) CreateCatalogEntry(ctx context.Context, req CreateCatalogEntryRequest) (CatalogEntry, bool, error) {
+	return s.createCatalogEntry(ctx, req, nil)
+}
+
+func catalogRecordForCreate(req CreateCatalogEntryRequest) CatalogRecord {
+	return CatalogRecord{
+		Binding: req.Binding, TenantID: req.TenantID, SessionID: req.SessionID,
+		AgentID: req.AgentID, RuntimeCompatibilityID: req.RuntimeCompatibilityID,
+		CreatedAt: req.CreatedAt, LastActiveAt: req.LastActiveAt,
+		State: req.State, Residency: req.Residency,
+		DesiredPlacement: req.DesiredPlacement, DesiredWorkload: req.DesiredWorkload,
+		DesiredIdempotencyKey: req.IdempotencyKey,
+		// Creation is the first desired-state write for either catalog mode.
+		DesiredGeneration: initialDesiredGeneration,
+	}
+}
+
+func (s *Store) createCatalogEntry(ctx context.Context, req CreateCatalogEntryRequest, public *PublicCreateReservation) (CatalogEntry, bool, error) {
 	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
 	if err != nil {
 		return CatalogEntry{}, false, err
 	}
-	record := CatalogRecord{
-		Binding:                req.Binding,
-		TenantID:               req.TenantID,
-		SessionID:              req.SessionID,
-		AgentID:                req.AgentID,
-		RuntimeCompatibilityID: req.RuntimeCompatibilityID,
-		CreatedAt:              req.CreatedAt,
-		LastActiveAt:           req.LastActiveAt,
-		State:                  req.State,
-		Residency:              req.Residency,
-		DesiredPlacement:       req.DesiredPlacement,
-		DesiredWorkload:        req.DesiredWorkload,
-		DesiredIdempotencyKey:  req.IdempotencyKey,
-		// Creating a session names its desired placement, so the create IS the
-		// session's first desired-state write and the counter starts at one.
-		// See nextDesiredGeneration for what a controller reads it for.
-		DesiredGeneration: initialDesiredGeneration,
-	}
+	record := catalogRecordForCreate(req)
+	record.PublicCreate = public
 	value, err := encodeCatalogRecord(record)
 	if err != nil {
 		return CatalogEntry{}, false, err
@@ -316,6 +320,9 @@ func (s *Store) CreateCatalogEntry(ctx context.Context, req CreateCatalogEntryRe
 		return CatalogEntry{}, false, classifyCatalogOrderedError(err, "create")
 	}
 	entry, err := catalogEntry(stored, req.TenantID, req.SessionID)
+	if err == nil && !samePublicCreate(public, entry.Record.PublicCreate) {
+		return CatalogEntry{}, false, &CatalogError{Code: CatalogErrorConflict, Field: "public_create", Revision: entry.Revision}
+	}
 	if err == nil && (req.Binding != (SessionBinding{}) || entry.Record.Binding != (SessionBinding{})) &&
 		(req.Binding != entry.Record.Binding || req.AgentID != entry.Record.AgentID) {
 		return CatalogEntry{}, false, &CatalogError{Code: CatalogErrorConflict, Field: "binding", Revision: entry.Revision}
@@ -830,6 +837,10 @@ func encodeCatalogRecord(record CatalogRecord) ([]byte, error) {
 		wire.RecordVersion = CatalogBindingRecordVersion
 		payload = catalogBindingWire{catalogWire: wire, Binding: record.Binding}
 	}
+	if record.PublicCreate != nil {
+		wire.RecordVersion = CatalogPublicCreateRecordVersion
+		payload = catalogPublicCreateWire{catalogBindingWire: catalogBindingWire{catalogWire: wire, Binding: record.Binding}, PublicCreate: *record.PublicCreate}
+	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, catalogErr(CatalogErrorInvalid, "record", err)
@@ -855,6 +866,7 @@ func encodeCatalogRecord(record CatalogRecord) ([]byte, error) {
 func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 	var wire catalogWire
 	var binding SessionBinding
+	var public *PublicCreateReservation
 	var err error
 	// Bound the probe too; malformed and unsupported input is classified by
 	// the shared strict decoder, including its version-before-members rule.
@@ -865,7 +877,12 @@ func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 		_ = json.Unmarshal(value, &probe)
 	}
 	fields := versionedRecordFields{Record: "record", Version: "record_version"}
-	if probe.RecordVersion == CatalogBindingRecordVersion {
+	if probe.RecordVersion == CatalogPublicCreateRecordVersion {
+		var bound catalogPublicCreateWire
+		bound, err = decodeVersionedRecord[catalogPublicCreateWire](value, MaxCatalogRecordBytes, CatalogPublicCreateRecordVersion, fields, catalogRecordFailure)
+		wire, binding = bound.catalogWire, bound.Binding
+		public = &bound.PublicCreate
+	} else if probe.RecordVersion == CatalogBindingRecordVersion {
 		var bound catalogBindingWire
 		bound, err = decodeVersionedRecord[catalogBindingWire](value, MaxCatalogRecordBytes, CatalogBindingRecordVersion, fields, catalogRecordFailure)
 		wire, binding = bound.catalogWire, bound.Binding
@@ -879,6 +896,7 @@ func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 		return CatalogRecord{}, err
 	}
 	record := CatalogRecord{
+		PublicCreate:           public,
 		Binding:                binding,
 		TenantID:               wire.TenantID,
 		SessionID:              wire.SessionID,
@@ -909,7 +927,20 @@ func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 			CapturedAt: wire.Checkpoint.CapturedAt,
 		}
 	}
-	return canonicalCatalogRecord(record)
+	canonical, err := canonicalCatalogRecord(record)
+	if err != nil {
+		return CatalogRecord{}, err
+	}
+	if public != nil {
+		encoded, err := encodeCatalogRecord(canonical)
+		if err != nil {
+			return CatalogRecord{}, err
+		}
+		if !bytes.Equal(encoded, value) {
+			return CatalogRecord{}, catalogErr(CatalogErrorMalformed, "record", nil)
+		}
+	}
+	return canonical, nil
 }
 
 // decodeVersionedRecord is the one strict decode this package's stored records
@@ -1007,6 +1038,16 @@ const (
 // gate slice. Encoding and decoding both end here, so a record read back is
 // byte-identical to the record written and two encoders cannot disagree.
 func canonicalCatalogRecord(record CatalogRecord) (CatalogRecord, error) {
+	if record.PublicCreate != nil {
+		r, err := canonicalPublicCreate(*record.PublicCreate)
+		if err != nil {
+			return CatalogRecord{}, catalogInvalid("public_create", err)
+		}
+		if r.Identity.TenantID != record.TenantID || r.Identity.SessionID != record.SessionID || r.Identity.Target.AgentID != record.AgentID || r.Identity.Binding != record.Binding || !r.AcceptedAt.Equal(record.CreatedAt) {
+			return CatalogRecord{}, catalogErr(CatalogErrorIdentity, "public_create", nil)
+		}
+		record.PublicCreate = &r
+	}
 	if record.Binding != (SessionBinding{}) {
 		if err := record.Binding.validate(); err != nil {
 			return CatalogRecord{}, err

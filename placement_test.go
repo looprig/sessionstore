@@ -612,10 +612,10 @@ func TestOnlyTheDesiredStatePathsWriteTheGeneration(t *testing.T) {
 
 	// Where the generation may be written, and why each is legitimate.
 	expected := map[string]string{
-		"placement.go/applyDesiredState": "the one path that ADVANCES it, after the key and the revision have settled",
-		"catalog.go/CreateCatalogEntry":  "the one path that mints it, because creating a session names its desired placement",
-		"catalog.go/encodeCatalogRecord": "codec carry-through: copies the record's value into the wire shape unchanged",
-		"catalog.go/decodeCatalogRecord": "codec carry-through: copies the wire value back into the record unchanged",
+		"placement.go/applyDesiredState":    "the one path that ADVANCES it, after the key and the revision have settled",
+		"catalog.go/catalogRecordForCreate": "the shared generic/public create constructor that mints it, because creating a session names its desired placement",
+		"catalog.go/encodeCatalogRecord":    "codec carry-through: copies the record's value into the wire shape unchanged",
+		"catalog.go/decodeCatalogRecord":    "codec carry-through: copies the wire value back into the record unchanged",
 	}
 
 	found := map[string]bool{}
