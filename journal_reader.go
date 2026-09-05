@@ -9,6 +9,7 @@ import (
 	"io"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/storage"
 )
 
 // ReadPublicJournalRequest positions one bounded public journal page. FromSeq
@@ -25,6 +26,16 @@ type ReadPublicJournalRequest struct {
 	// fewer events than Limit. The byte budget can shorten the page further;
 	// its continuation cursor remains pinned to the same captured tip.
 	Tail bool
+
+	// ScanLimit bounds examined journal records, including withheld private
+	// records. Zero preserves the unbounded-by-records legacy scan; a positive
+	// value must not exceed storage.MaxOrderedPageLimit. Exhaustion may return
+	// an empty event page with advanced coverage and a continuation cursor.
+	// Supply this budget again on each continuation; it is not part of the
+	// cursor. Event and byte limits may stop earlier, deferring the next event
+	// without counting it as covered. This bounds record work, not total bytes
+	// fetched to resolve the public bodies of the examined records.
+	ScanLimit int
 
 	// Cursor is a token a previous page of THIS session issued. It is opaque:
 	// retain it and hand it back, but do not parse it or derive position,
@@ -80,7 +91,7 @@ type RuntimePage struct {
 // it. A public body held in an object is resolved through the same verified
 // object path a caller would use; a private runtime object is never fetched.
 func (s *Store) ReadPublicJournal(ctx context.Context, req ReadPublicJournalRequest) (sessionwire.JournalPage, error) {
-	scan, release, err := s.planJournalRead(ctx, journalCursorPublic, req.TenantID, req.SessionID, req.FromSeq, req.Cursor, req.Limit, req.Tail)
+	scan, release, err := s.planJournalRead(ctx, journalCursorPublic, req.TenantID, req.SessionID, req.FromSeq, req.Cursor, req.Limit, req.Tail, req.ScanLimit)
 	if err != nil {
 		return sessionwire.JournalPage{}, err
 	}
@@ -114,7 +125,7 @@ func (s *Store) ReadPublicJournal(ctx context.Context, req ReadPublicJournalRequ
 // journal, public and private alike, exactly as stored. It is the privileged
 // replay path; product-facing readers use ReadPublicJournal.
 func (s *Store) ReadRuntimeJournal(ctx context.Context, req ReadRuntimeJournalRequest) (RuntimePage, error) {
-	scan, release, err := s.planJournalRead(ctx, journalCursorRuntime, req.TenantID, req.SessionID, req.FromSeq, req.Cursor, req.Limit, false)
+	scan, release, err := s.planJournalRead(ctx, journalCursorRuntime, req.TenantID, req.SessionID, req.FromSeq, req.Cursor, req.Limit, false, 0)
 	if err != nil {
 		return RuntimePage{}, err
 	}
@@ -199,6 +210,7 @@ type journalScan struct {
 	capturedTip uint64
 	limit       int
 	maxBytes    int
+	scanLimit   int
 
 	covered   uint64
 	truncated bool
@@ -216,7 +228,11 @@ func (s *Store) planJournalRead(
 	cursor sessionwire.Cursor,
 	limit int,
 	tail bool,
+	scanLimit int,
 ) (*journalScan, func(), error) {
+	if scanLimit < 0 || scanLimit > storage.MaxOrderedPageLimit {
+		return nil, nil, journalErr(JournalErrorInvalid, "scan_limit", nil)
+	}
 	limit, ok := s.pageLimit(limit)
 	if !ok {
 		return nil, nil, journalErr(JournalErrorInvalid, "limit", nil)
@@ -281,6 +297,7 @@ func (s *Store) planJournalRead(
 		capturedTip: capturedTip,
 		limit:       limit,
 		maxBytes:    maxBytes,
+		scanLimit:   scanLimit,
 		covered:     covered,
 	}, release, nil
 }
@@ -291,10 +308,11 @@ func (s *Store) planJournalRead(
 // the page item and reports its resolved byte cost. A record selects returns
 // false for is WITHHELD: it contributes nothing to the page but still advances
 // CoveredThrough, which is what lets the watermark cross private records
-// without revealing their kind or bytes — including past the record limit, so a
-// page is never cut short by private traffic it is not returning.
+// without revealing their kind or bytes, including past the event limit:
+// private traffic does not consume public event slots. A positive scan limit
+// separately bounds all examined records, including private traffic.
 //
-// The walk stops at the record limit, at the byte budget, or at the captured
+// The walk stops at the event limit, byte budget, scan limit, or captured
 // tip — and at nothing else: a walk that ends anywhere else has not observed
 // every sequence through the tip it captured, and is refused rather than
 // returned. The first selected record of a page is always admitted, so a page
@@ -317,7 +335,12 @@ func walkJournal[T any](
 
 	var page []T
 	used := 0
+	examined := 0
 	for {
+		if scan.scanLimit > 0 && examined >= scan.scanLimit {
+			scan.truncate(scan.covered + 1)
+			break
+		}
 		record, err := cursor.Next(scan.ctx)
 		if errors.Is(err, io.EOF) {
 			break
@@ -328,6 +351,7 @@ func walkJournal[T any](
 		if record.Seq > scan.capturedTip {
 			break
 		}
+		examined++
 		env, err := DecodeEnvelope(record.Payload)
 		if err != nil {
 			return nil, journalErr(JournalErrorIntegrity, "record", err)
@@ -354,7 +378,7 @@ func walkJournal[T any](
 		}
 	}
 	// The walk must have REACHED its bound, unless it stopped SHORT of it on
-	// purpose. A page that ends at the record limit or the byte budget is
+	// purpose. A page that ends at the event, byte or scan limit is
 	// truncated and says so, and its cursor resumes where it stopped; a page
 	// that ends anywhere else claims to have covered everything through the tip
 	// it captured, and here that claim would be false.
