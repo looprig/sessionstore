@@ -115,6 +115,10 @@ func randomObjectGeneration() ([16]byte, error) {
 // listObjectReferences, is intentionally not exported, so no caller-facing GC
 // exists yet.
 func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwire.ObjectMetadata, error) {
+	return s.putObject(ctx, req, ProtocolModeLegacy)
+}
+
+func (s *Store) putObject(ctx context.Context, req PutObjectRequest, mode ProtocolMode) (sessionwire.ObjectMetadata, error) {
 	if !req.Kind.valid() {
 		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorInvalid, "kind", nil)
 	}
@@ -136,6 +140,14 @@ func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwir
 		return sessionwire.ObjectMetadata{}, err
 	}
 	defer release()
+	if mode == ProtocolModeDisposition {
+		if req.Kind != ObjectKindCommandPayload {
+			return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorInvalid, "kind", nil)
+		}
+		if _, err := s.dispositionCatalog(opCtx, scope, req.TenantID, req.SessionID); err != nil {
+			return sessionwire.ObjectMetadata{}, err
+		}
+	}
 	generation, err := s.objectGeneration()
 	if err != nil {
 		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorSource, "generation", err)
@@ -145,7 +157,7 @@ func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwir
 	if err != nil {
 		return sessionwire.ObjectMetadata{}, err
 	}
-	if err := s.bindSessionScope(opCtx, scope); err != nil {
+	if err := s.bindSessionScopeMode(opCtx, scope, mode); err != nil {
 		return sessionwire.ObjectMetadata{}, err
 	}
 	key := objectKey(scope, parsed)
