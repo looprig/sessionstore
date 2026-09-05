@@ -12,12 +12,19 @@ import (
 )
 
 // ReadPublicJournalRequest positions one bounded public journal page. FromSeq
-// and Cursor are mutually exclusive: a caller starts with FromSeq (inclusive,
-// zero meaning the first record) and then follows the returned cursor.
+// (inclusive, zero meaning the first record), Cursor and Tail are mutually
+// exclusive. Continue a page with its returned Cursor and Tail false.
 type ReadPublicJournalRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
 	FromSeq   uint64
+
+	// Tail starts within the last Limit sequence positions at the tip captured
+	// by this read. Limit zero uses the store's configured page size. Private
+	// records occupy positions without returning events, so a tail may contain
+	// fewer events than Limit. The byte budget can shorten the page further;
+	// its continuation cursor remains pinned to the same captured tip.
+	Tail bool
 
 	// Cursor is a token a previous page of THIS session issued. It is opaque:
 	// retain it and hand it back, but do not parse it or derive position,
@@ -32,7 +39,8 @@ type ReadPublicJournalRequest struct {
 }
 
 // ReadRuntimeJournalRequest positions one bounded privileged replay page. Its
-// positioning rules match ReadPublicJournalRequest.
+// FromSeq and Cursor positioning rules match ReadPublicJournalRequest; runtime
+// replay does not offer tail positioning.
 type ReadRuntimeJournalRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
@@ -72,7 +80,7 @@ type RuntimePage struct {
 // it. A public body held in an object is resolved through the same verified
 // object path a caller would use; a private runtime object is never fetched.
 func (s *Store) ReadPublicJournal(ctx context.Context, req ReadPublicJournalRequest) (sessionwire.JournalPage, error) {
-	scan, release, err := s.planJournalRead(ctx, journalCursorPublic, req.TenantID, req.SessionID, req.FromSeq, req.Cursor, req.Limit)
+	scan, release, err := s.planJournalRead(ctx, journalCursorPublic, req.TenantID, req.SessionID, req.FromSeq, req.Cursor, req.Limit, req.Tail)
 	if err != nil {
 		return sessionwire.JournalPage{}, err
 	}
@@ -106,7 +114,7 @@ func (s *Store) ReadPublicJournal(ctx context.Context, req ReadPublicJournalRequ
 // journal, public and private alike, exactly as stored. It is the privileged
 // replay path; product-facing readers use ReadPublicJournal.
 func (s *Store) ReadRuntimeJournal(ctx context.Context, req ReadRuntimeJournalRequest) (RuntimePage, error) {
-	scan, release, err := s.planJournalRead(ctx, journalCursorRuntime, req.TenantID, req.SessionID, req.FromSeq, req.Cursor, req.Limit)
+	scan, release, err := s.planJournalRead(ctx, journalCursorRuntime, req.TenantID, req.SessionID, req.FromSeq, req.Cursor, req.Limit, false)
 	if err != nil {
 		return RuntimePage{}, err
 	}
@@ -207,10 +215,14 @@ func (s *Store) planJournalRead(
 	fromSeq uint64,
 	cursor sessionwire.Cursor,
 	limit int,
+	tail bool,
 ) (*journalScan, func(), error) {
 	limit, ok := s.pageLimit(limit)
 	if !ok {
 		return nil, nil, journalErr(JournalErrorInvalid, "limit", nil)
+	}
+	if tail && (cursor != "" || fromSeq != 0) {
+		return nil, nil, journalErr(JournalErrorInvalid, "tail", nil)
 	}
 	if cursor != "" && fromSeq != 0 {
 		return nil, nil, journalErr(JournalErrorInvalid, "cursor", nil)
@@ -235,6 +247,10 @@ func (s *Store) planJournalRead(
 
 	from := fromSeq
 	capturedTip := tip
+	span := uint64(limit) // #nosec G115 -- pageLimit validated a positive bounded page size above
+	if tail && tip >= span {
+		from = tip - span + 1
+	}
 	if cursor != "" {
 		position, err := s.decodeJournalCursor(kind, tenant, session, cursor, tip)
 		if err != nil {
