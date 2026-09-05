@@ -76,12 +76,68 @@ type AdmitPublicCreateRequest struct {
 
 type publicCreateWire struct {
 	RecordVersion uint8 `json:"record_version"`
-	PublicCreateReservation
+	publicCreateReservationWire
 }
 
 type catalogPublicCreateWire struct {
 	catalogBindingWire
-	PublicCreate PublicCreateReservation `json:"public_create"`
+	PublicCreate publicCreateReservationWire `json:"public_create"`
+}
+
+// Private DTOs fix durable member names independently of domain field names.
+// InitialWorkload is always present, including {"payload_version":"","payload":null}
+// for absence; payload_size is present even at zero. Canonical re-encoding rejects
+// omitted members and alternate empty spellings. Only these unpublished codecs
+// use this shape; released catalog v1/v2 representations are unchanged.
+type publicCreateReservationWire struct {
+	Identity         publicCreateIdentityWire `json:"identity"`
+	RuntimeCommandID RuntimeCommandID         `json:"runtime_command_id"`
+	AcceptedAt       time.Time                `json:"accepted_at"`
+	ApplyDeadline    time.Time                `json:"apply_deadline"`
+	InitialWorkload  desiredWorkloadWire      `json:"initial_workload"`
+}
+
+type publicCreateIdentityWire struct {
+	TenantID      sessionwire.TenantID   `json:"tenant_id"`
+	SessionID     sessionwire.SessionID  `json:"session_id"`
+	CommandID     sessionwire.CommandID  `json:"command_id"`
+	Target        publicCreateTargetWire `json:"target"`
+	Binding       SessionBinding         `json:"binding"`
+	Kind          CommandKind            `json:"kind"`
+	PayloadDigest string                 `json:"payload_digest"`
+	PayloadSize   uint64                 `json:"payload_size"`
+}
+
+type publicCreateTargetWire struct {
+	AgentID                sessionwire.AgentID       `json:"agent_id"`
+	RuntimeCompatibilityID string                    `json:"runtime_compatibility_id"`
+	Placement              sessionwire.HostPlacement `json:"placement"`
+}
+
+func publicCreateToWire(r PublicCreateReservation) publicCreateReservationWire {
+	i := r.Identity
+	return publicCreateReservationWire{
+		Identity: publicCreateIdentityWire{
+			TenantID: i.TenantID, SessionID: i.SessionID, CommandID: i.CommandID,
+			Target:  publicCreateTargetWire{AgentID: i.Target.AgentID, RuntimeCompatibilityID: i.Target.RuntimeCompatibilityID, Placement: i.Target.Placement},
+			Binding: i.Binding, Kind: i.Kind, PayloadDigest: i.PayloadDigest, PayloadSize: i.PayloadSize,
+		},
+		RuntimeCommandID: r.RuntimeCommandID, AcceptedAt: r.AcceptedAt, ApplyDeadline: r.ApplyDeadline,
+		InitialWorkload: desiredWorkloadWire{PayloadVersion: r.InitialWorkload.PayloadVersion, Payload: r.InitialWorkload.Payload},
+	}
+}
+
+func (w publicCreateReservationWire) reservation() PublicCreateReservation {
+	i := w.Identity
+	return PublicCreateReservation{
+		Identity: PublicCreateIdentity{
+			TenantID: i.TenantID, SessionID: i.SessionID, CommandID: i.CommandID,
+			Target:  HostTargetKey{AgentID: i.Target.AgentID, RuntimeCompatibilityID: i.Target.RuntimeCompatibilityID, Placement: i.Target.Placement},
+			Binding: i.Binding, Kind: i.Kind, PayloadDigest: i.PayloadDigest, PayloadSize: i.PayloadSize,
+		},
+		RuntimeCommandID: w.RuntimeCommandID, AcceptedAt: w.AcceptedAt, ApplyDeadline: w.ApplyDeadline,
+		InitialWorkload: DesiredWorkload{PayloadVersion: w.InitialWorkload.PayloadVersion, Payload: w.InitialWorkload.Payload},
+	}
 }
 
 func validatePublicCreateIdentity(i PublicCreateIdentity) error {
@@ -146,7 +202,7 @@ func encodePublicCreate(r PublicCreateReservation) ([]byte, PublicCreateReservat
 	if err != nil {
 		return nil, PublicCreateReservation{}, err
 	}
-	v, err := json.Marshal(publicCreateWire{PublicCreateReservationVersion, r})
+	v, err := json.Marshal(publicCreateWire{PublicCreateReservationVersion, publicCreateToWire(r)})
 	if err != nil {
 		return nil, PublicCreateReservation{}, inboxInvalid("reservation", err)
 	}
@@ -161,7 +217,7 @@ func decodePublicCreate(v []byte) (PublicCreateReservation, error) {
 	if err != nil {
 		return PublicCreateReservation{}, err
 	}
-	canonical, r, err := encodePublicCreate(w.PublicCreateReservation)
+	canonical, r, err := encodePublicCreate(w.reservation())
 	if err != nil {
 		return PublicCreateReservation{}, err
 	}

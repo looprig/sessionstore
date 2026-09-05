@@ -839,7 +839,7 @@ func encodeCatalogRecord(record CatalogRecord) ([]byte, error) {
 	}
 	if record.PublicCreate != nil {
 		wire.RecordVersion = CatalogPublicCreateRecordVersion
-		payload = catalogPublicCreateWire{catalogBindingWire: catalogBindingWire{catalogWire: wire, Binding: record.Binding}, PublicCreate: *record.PublicCreate}
+		payload = catalogPublicCreateWire{catalogBindingWire: catalogBindingWire{catalogWire: wire, Binding: record.Binding}, PublicCreate: publicCreateToWire(*record.PublicCreate)}
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -881,7 +881,8 @@ func decodeCatalogRecord(value []byte) (CatalogRecord, error) {
 		var bound catalogPublicCreateWire
 		bound, err = decodeVersionedRecord[catalogPublicCreateWire](value, MaxCatalogRecordBytes, CatalogPublicCreateRecordVersion, fields, catalogRecordFailure)
 		wire, binding = bound.catalogWire, bound.Binding
-		public = &bound.PublicCreate
+		reservation := bound.PublicCreate.reservation()
+		public = &reservation
 	} else if probe.RecordVersion == CatalogBindingRecordVersion {
 		var bound catalogBindingWire
 		bound, err = decodeVersionedRecord[catalogBindingWire](value, MaxCatalogRecordBytes, CatalogBindingRecordVersion, fields, catalogRecordFailure)

@@ -118,3 +118,74 @@ marked v2 record; old catalog versions reject public-create v3.
 This evidence is for the Store prerequisite only. Independent root acceptance,
 release, Factory adoption and the broader ownership/settlement integration gate
 remain separate.
+
+## Quality-review correction checkpoint (2026-09-05, unpublished)
+
+The next agent inherits uncommitted edits on local main above
+`9d07c0cd0710cd0fb8169a77f93ad1b54763298a`. Published v0.4.0 remains
+`5170b531`; admission/public-create formats are still unpublished. Root approved
+correcting these formats before their first release; no migration or change to
+released catalog v1/v2 is intended.
+
+Private tagged DTOs now separate public-create reservation identity, target and
+proposal bytes from the public Go domain fields. Reservation v1 and catalog v3
+provenance share those conversions. Target members are `agent_id`,
+`runtime_compatibility_id`, and `placement`. Existing `desiredWorkloadWire` is
+reused unchanged: `initial_workload` is always present, with
+`{"payload_version":"","payload":null}` for empty workload. `payload_size`
+remains present at zero. Full literal golden bytes pin reservation and catalog
+v3 for empty and nonempty workload (binary bytes `00 ff 01`, base64 `AP8B`) and
+opaque IDs with case, slash and colon. Both codecs reject omitted workload,
+empty-object workload and omitted zero payload-size alternatives. Public Go
+domain fields/tags remain unchanged.
+
+`public_create_quality_test.go` also surgically changes only top-level catalog
+tenant/session/agent/binding/created-at while preserving embedded provenance
+and canonical JSON order. Codec and actual `GetCatalogEntry` checks require
+the provenance identity error. A reservation filing matrix checks namespace,
+stable key, ordering/ranking scopes, nonzero Due, zero order, zero/rewritten
+revision, and deletion through the winner helper and `AdmitPublicCreate`,
+requiring typed errors and no ACK. Revision is documented as defense in depth,
+not an independently necessary admission invariant. Exported marker and generic
+getter Godoc now state that catalog-binding reads do not verify reservation
+proof or authorize future create dispatch; only dedicated admission checks all
+three records. No generic cancellation or dispatch behavior changed.
+
+Verification so far: golden tests failed on the original uppercase domain JSON
+member names before production edits. After DTO conversion and correcting the
+golden's existing catalog idempotency member, `GOWORK=off GOMAXPROCS=8 go test
+-run '^TestPublicCreate' .` passed (0.410s). `git diff --check` passed.
+
+Isolated copies for the two formerly surviving mutations are under
+`/private/tmp/sessionstore-quality.3Rk1e2/catalog-mutant/` (catalog/provenance
+comparison removed) and `filing-mutant/` (reservation `checkFiledScope` call
+removed). Shared main and module-cache sources were never mutated. Initial
+attempts failed at setup on sandbox cache permissions and are not mutation
+evidence. Retries with `GOCACHE=/private/tmp/sessionstore-quality.3Rk1e2/go-cache`
+compiled and were both killed by assertions: catalog mutant (0.284s) accepted
+all five codec mismatches and agent/binding/created-at mismatches through the
+real getter; tenant/session still hit the separate filed-record identity guard.
+Filing mutant (0.342s) accepted ranking-scope and Due mismatches through both
+the helper and actual `AdmitPublicCreate`, returning a created marked inbox ACK.
+Command for each was `GOWORK=off GOMAXPROCS=8 GOCACHE=... go test -count=1
+-run '^TestPublicCreate(CatalogProvenanceIdentity|ReservationFilingValidation)$' .`.
+Both processes have exited; no verification process remains running.
+
+Work paused for the user's requested agent handoff, then resumed by root.
+Root inspected the full diff and froze these sources unchanged.
+
+Root verification (2026-09-05, sources frozen at the diff above over
+`9d07c0cd`): `GOWORK=off GOMAXPROCS=8 make check` PASSED, exit 0 — vet,
+staticcheck v0.8.1, gosec v2.28.0, `go mod verify` (all modules verified),
+govulncheck v1.6.0 (no vulnerabilities), the `-race` suite, **20** default
+30-second fuzz targets with no crashers and no new interesting inputs, and
+build. Standalone `GOWORK=off go test ./...` passed (3.540s). `GOWORK=off
+go mod tidy` produced no `go.mod` or `go.sum` diff. `git diff --check` clean.
+No `replace` directives and no vendor directory. The two mutant copies stayed
+under `/private/tmp/sessionstore-quality.3Rk1e2/`; shared sources and the
+module cache were never mutated.
+
+These changes are now one separate repository-local commit on local `main`.
+Still owed before any release: independent spec and code-quality rechecks of
+the committed revision. Do not push, tag, update dependencies/root docs,
+release, accept Factory A3.1, or lift the Host hold.

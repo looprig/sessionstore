@@ -33,6 +33,9 @@ const dispositionInboxNamespace = "sessionstore/disposition-inbox"
 type DispositionCommandDescriptor struct {
 	// PublicCreate is emitted only by AdmitPublicCreate. Its explicit presence
 	// fails older strict canonical v2 decoders; Kind itself remains opaque.
+	// Generic reads check catalog binding, not reservation proof. The marker
+	// alone cannot authorize future public-create dispatch; only successful
+	// AdmitPublicCreate verifies reservation, catalog and inbox for an ACK.
 	PublicCreate     bool                        `json:"public_create,omitempty"`
 	TenantID         sessionwire.TenantID        `json:"tenant_id"`
 	SessionID        sessionwire.SessionID       `json:"session_id"`
@@ -221,6 +224,10 @@ type GetDispositionCommandRequest struct {
 
 // GetDispositionCommand checks actual catalog authority and reads one exact
 // inbox row. A protocol witness alone never authorizes a result.
+// It verifies the catalog binding, not the public-create reservation. A returned
+// PublicCreate marker alone cannot authorize future public-create dispatch;
+// only successful AdmitPublicCreate verifies reservation, catalog and inbox
+// together to acknowledge that create.
 func (s *Store) GetDispositionCommand(ctx context.Context, req GetDispositionCommandRequest) (DispositionInboxEntry, error) {
 	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
 	if err != nil {
