@@ -95,16 +95,18 @@ func randomObjectGeneration() ([16]byte, error) {
 
 // PutObject streams, verifies, persists, and re-verifies an immutable object
 // before returning its metadata. The stages are: static validation, admission,
-// minting an identity, writing the blob, and re-reading it back.
+// minting an identity, writing the blob, re-reading it back, and create-only
+// persistence of its scoped metadata index for GetObjectMetadata.
 //
 // The declared SizeBytes and SHA256 are exact: the body is accepted only if it
 // ends at that length with that digest, and neither the caller's metadata nor
 // any reference is produced otherwise.
 //
 // Orphan policy. The identity is minted before the write, and PutObject returns
-// a reference only after the persisted bytes have been read back and verified.
-// A provider failure after the blob commits therefore leaves a persisted,
-// verified blob that no caller was ever told about — an orphan. That is
+// a reference only after the persisted bytes have been read back and verified
+// and the immutable metadata index has committed. A failure after the blob
+// commits can therefore leave a blob that no caller was ever told about — an
+// orphan, whose verification may also have failed. That is
 // deliberate: the alternative, deleting on a post-commit error, would issue a
 // delete against a provider that has just proved unreliable, and the blob is
 // content- and generation-addressed so it can never be mistaken for another
@@ -165,6 +167,9 @@ func (s *Store) PutObject(ctx context.Context, req PutObjectRequest) (sessionwir
 		return sessionwire.ObjectMetadata{}, objectErr(ObjectErrorIntegrity, "put_eof", nil)
 	}
 	if err := s.verifyPersisted(opCtx, key, req.SizeBytes, req.SHA256); err != nil {
+		return sessionwire.ObjectMetadata{}, err
+	}
+	if err := s.persistObjectMetadata(opCtx, scope, req, metadata, parsed); err != nil {
 		return sessionwire.ObjectMetadata{}, err
 	}
 	return metadata, nil

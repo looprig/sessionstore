@@ -320,9 +320,10 @@ Skipping silently inside the reader is what would have been unsafe.
 Every path in this package that stores bytes larger than a record persists and
 VERIFIES the object before writing anything that names it, and never the other
 way round. `PutObject` mints the identity, writes the blob, re-reads the
-persisted bytes and checks them against the declared length and digest, and only
-then returns a reference. A journal append whose body is over threshold uploads
-and verifies the object first and appends the reference second. `OpenGate`
+persisted bytes and checks them against the declared length and digest, commits
+its immutable metadata index, and only then returns a reference. A journal append
+whose body is over threshold uploads and verifies the object first and appends
+the reference second. `OpenGate`
 writes the deadline intent before it commits the open-gate projection, which is
 the same rule one level up.
 
@@ -345,10 +346,10 @@ reclaiming them is the operator's job. See the next section.
 ## Object orphans
 
 `PutObject` mints an object's identity before writing it and returns a reference
-only after re-reading the persisted bytes and verifying them against the declared
-length and digest. A provider failure after the blob has committed therefore
-returns an error and no reference while leaving a verified blob behind — an
-orphan.
+only after re-reading the persisted bytes, verifying their declared length and
+digest, and committing the immutable metadata index. An unresolved provider
+failure after the blob commits returns an error and no reference while leaving
+an orphan. The blob's readback verification may itself have failed.
 
 That is deliberate. Deleting on a post-commit failure would issue a delete
 against a provider that has just proved unreliable, and every object key is
@@ -357,6 +358,39 @@ served as, another object. Reclaiming orphans is the store operator's
 responsibility, over the tenant- and session-scoped blob prefix; SessionStore's
 only enumeration path is internal and unexported, so no caller-facing garbage
 collector exists yet.
+
+## Resolving object metadata
+
+`GetObjectMetadata` accepts authenticated tenant/session scope, a logical
+`Reference`, and an explicit `ExpectedKind`. It returns the exact metadata from
+`PutObject`, including the immutable generation, digest, exact size and media
+type. It performs at most two collision-witness reads and one exact KV read,
+with no journal scan, key enumeration or blob read. Factory must authorize the
+request; Harness must authorize retained-result access against its committed
+capture records. The index itself grants neither authority.
+
+Each successful `PutObject` creates a versioned immutable record under the
+session's `object-metadata/v1/<kind>/<digest>/<generation>` KV namespace after
+blob readback verification. LROM v1 stores the tenant, session, reference,
+digest, media type and exact uint64 size in a canonical binary record bounded
+to 1,303 bytes; `CreatedAt` remains the zero value returned by `PutObject`.
+Decoding rejects malformed, oversized, noncanonical and mismatched records.
+KV returns a complete byte slice, so this limit bounds accepted records and
+decoder work, not a faulty provider's allocation before returning the slice.
+An ambiguous create resolves through one exact read and requires the exact
+canonical winner. Failure never triggers deletion or overwrite of the winner.
+
+`ObjectErrorMetadataUnavailable` with `Field: "metadata"` means no index row
+exists. It does **not** prove that bytes are absent: objects written by older
+binaries, and writes interrupted before indexing, may have no row. There is no
+automatic migration or backfill. Existing `GetObject` calls with explicit full
+metadata remain compatible and do not consult the index.
+
+Conversely, an index row does not prove that bytes still exist or are intact.
+Administrative or external deletion can leave the immutable metadata behind.
+`GetObject` preserves `storage.BlobNotFoundError` in its typed backend error
+when the body is missing; full integrity is established only by consuming its
+verified stream through terminal EOF. Premature close remains an error.
 
 ## Journal ownership: no rebasing after a fence conflict
 

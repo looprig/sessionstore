@@ -110,6 +110,9 @@ const (
 	ObjectErrorConflict  ObjectErrorCode = "conflict"
 	ObjectErrorIntegrity ObjectErrorCode = "integrity"
 	ObjectErrorCanceled  ObjectErrorCode = "canceled"
+	// MetadataUnavailable means the scoped immutable index has no record. The
+	// bytes may still exist (for example, objects written before the index).
+	ObjectErrorMetadataUnavailable ObjectErrorCode = "metadata_unavailable"
 )
 
 // ObjectError is a typed, redacted object operation failure. Field names the
