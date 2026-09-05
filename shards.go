@@ -690,6 +690,12 @@ func (s *Store) RetireGateDeadlineIntent(ctx context.Context, req RetireGateDead
 	if err := s.refuseIfGateIsStillOpen(opCtx, scope, req); err != nil {
 		return err
 	}
+	// Retirement mutates legacy gate state even when the catalog is absent.
+	// Reserve/check the legacy protocol without requiring collision witnesses
+	// or a catalog, preserving retirement of orphaned crash remnants.
+	if err := s.bindProtocolMode(opCtx, scope, ProtocolModeLegacy); err != nil {
+		return err
+	}
 	if _, err := s.backend.OrderedIndex.Delete(opCtx, gateIntentID(scope, req.GateID), req.Revision); err != nil {
 		return classifyCatalogOrderedError(err, "gate_intent")
 	}

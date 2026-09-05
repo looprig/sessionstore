@@ -551,6 +551,11 @@ func (s *Store) ReleaseReconciliationClaim(
 	if !claimHeldAt(current.Claim, now) {
 		return current, nil
 	}
+	// Releasing a legacy claim is still a protocol-specific mutation. A claim
+	// injected under a disposition session cannot authorize that write.
+	if err := s.bindProtocolMode(opCtx, scope, ProtocolModeLegacy); err != nil {
+		return ReconciliationClaimEntry{}, err
+	}
 	return s.writeReconciliationClaim(opCtx, scope, released, value, current.Revision)
 }
 
