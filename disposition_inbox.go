@@ -13,10 +13,14 @@ import (
 	"github.com/looprig/storage"
 )
 
-// DispositionInboxRecordVersion identifies the pending-only disposition inbox
-// codec. Legacy v1 records retain their original codec and PayloadRef equality.
-// Future attempts or terminal states require an explicit codec/API extension;
-// this version refuses them and supplies no dispatch or settlement authority.
+// DispositionInboxRecordVersion identifies the disposition inbox codec. Legacy
+// v1 records retain their original codec and PayloadRef equality. This version
+// carries the claim, attempt and outcome of the settlement protocol as members
+// absent until the state that requires them, so a pending record's bytes are
+// exactly what they were before those states existed. It is a record format and
+// not an authority: it supplies no claim, dispatch or settlement permission,
+// and a further durable member still requires a version bump because decoding
+// demands exact canonical re-encoding.
 const DispositionInboxRecordVersion uint8 = 2
 
 // A separate sharded namespace keeps legacy due sweepers away from disposition
@@ -61,7 +65,10 @@ type DispositionCommandDescriptor struct {
 // carry is validateDispositionState, because that is a property of the record
 // rather than of whichever transition wrote it. Once written, the attempt and
 // both of its grant identities are immutable — no transition may rewrite one to
-// make a successor's epochs look current.
+// make a successor's epochs look current. A terminal REJECTION is the one state
+// that may carry none of the three: the protocol allows a command to be rejected
+// before any dispatch was authorized, and such a record has no attempt for an
+// outcome to be keyed by.
 //
 // These struct tags are NOT the durable spelling; see the private wire DTOs.
 type DispositionInboxRecord struct {
@@ -544,8 +551,12 @@ func canonicalDispositionInboxRecord(r DispositionInboxRecord) (DispositionInbox
 // is held to the same thing, and a member that contradicts the state cannot be
 // stored at all.
 //
-// It also copies the three members, so a caller that keeps a pointer it passed
-// in cannot mutate a record the store has already validated.
+// It also copies the three members before validating them. That is internal
+// hygiene and not a guarantee to a caller: no exported API accepts a
+// DispositionInboxRecord, so there is no outside caller holding a pointer it
+// passed in. What the copy actually buys is that a validated record never
+// aliases the value some in-package transition assembled it from, which is what
+// makes "validate then encode" safe to read as one step.
 func validateDispositionState(r *DispositionInboxRecord) error {
 	if r.Claim != nil {
 		claim := *r.Claim
@@ -582,10 +593,35 @@ func validateDispositionState(r *DispositionInboxRecord) error {
 			return inboxInvalid("state", nil)
 		}
 	case InboxStateApplied, InboxStateRejected:
-		// A terminal record keeps the claim and the attempt that produced it:
-		// they are the durable record of which grants applied the command, and
-		// a settlement that cleared them would leave its own outcome unkeyed.
-		if r.Claim == nil || r.Attempt == nil || r.Outcome == nil {
+		// A terminal record that WAS dispatched keeps the claim and the attempt
+		// that produced it: they are the durable record of which grants applied
+		// the command, and a settlement that cleared them would leave its own
+		// outcome unkeyed.
+		//
+		// A rejection may also PRECEDE any dispatch. The protocol permits a
+		// pending or claimed command to be rejected only while no attempt has
+		// been durably authorized, so such a record has no attempt by
+		// definition, has no claim at all when it was still pending, and can
+		// carry no outcome — every outcome here is keyed by the attempt it
+		// settles. This case exists so that shape is STORABLE. The transition
+		// that writes one is NOT implemented and admission still starts every
+		// record pending; a validator that accepts more never invalidates a
+		// stored record, which is why widening it is free before the shape has
+		// a producer and noisy afterwards.
+		//
+		// Only a rejection may take that shape. Applied always means a runtime
+		// accepted the command under a grant, so it always carries the attempt
+		// that named the grant. The cost of the wider rule is stated plainly:
+		// bytes whose state member alone reads "rejected" are now a valid
+		// tombstone rather than a decode failure, which is one fewer accidental
+		// corruption tripwire on a state no producer writes yet.
+		if r.Attempt == nil {
+			if r.State != InboxStateRejected || r.Outcome != nil {
+				return inboxInvalid("state", nil)
+			}
+			return nil
+		}
+		if r.Claim == nil || r.Outcome == nil {
 			return inboxInvalid("state", nil)
 		}
 		return nil

@@ -206,6 +206,106 @@ func TestBeginDispositionAttemptRefusals(t *testing.T) {
 	}
 }
 
+// The refusal ORDER is the contract, not just the set of refusals: a caller
+// meeting two conditions at once must be told the one that stays true, because
+// the codes mean different things to a Host. Each case below deliberately
+// satisfies a later refusal as well as the one it asserts, so the assertion
+// fails if the two are ever reordered.
+func TestBeginDispositionAttemptRefusalOrder(t *testing.T) {
+	// A settled command is terminal AND is not claimed. Terminal means stop,
+	// someone else settled this; state means reread and reconsider. Deleting
+	// the terminal refusal lets this record fall through to the not-claimed
+	// check and answer the weaker of the two.
+	t.Run("terminal before not claimed", func(t *testing.T) {
+		reader := &fakeEvidence{evidence: appliedEvidence()}
+		s, _, claimed := settlementFixture(t, reader)
+		applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		settled, ok, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, settlementResidenc))
+		if err != nil || !ok || !settled.Record.State.terminal() {
+			t.Fatalf("settle: %+v %v %v", settled, ok, err)
+		}
+		if settled.Record.State == InboxStateClaimed {
+			t.Fatal("vacuous: a settled record is claimed, so it meets only one refusal")
+		}
+		req := beginRequest(settled)
+		req.AttemptID = "attempt/after-settlement"
+		_, err = s.BeginDispositionAttempt(context.Background(), req)
+		assertInboxCode(t, err, InboxErrorTerminal)
+		got, err := s.GetDispositionCommand(context.Background(), GetDispositionCommandRequest{TenantID: req.TenantID, SessionID: req.SessionID, CommandID: req.CommandID})
+		if err != nil || got.Revision != settled.Revision || *got.Record.Outcome != *settled.Record.Outcome {
+			t.Fatalf("refused attempt disturbed a settled record: %+v %v", got, err)
+		}
+	})
+
+	// An applying record carries a claim, so the residency fence would have
+	// something to run against and would answer InboxErrorEpoch for a
+	// superseded residency. It must not: the record has already authorized a
+	// dispatch, and that is the fact that stays true.
+	t.Run("not claimed before the residency fence", func(t *testing.T) {
+		s, _, claimed := settlementFixture(t, nil)
+		applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if applying.Record.Claim == nil {
+			t.Fatal("vacuous: an applying record has no claim for the fence to consult")
+		}
+		req := beginRequest(applying)
+		req.AttemptID = "attempt/second"
+		req.ResidencyEpoch = settlementResidenc - 1
+		_, err = s.BeginDispositionAttempt(context.Background(), req)
+		assertInboxCode(t, err, InboxErrorState)
+	})
+
+	// A pending command is the other not-claimed record, and it reaches that
+	// refusal with no claim at all.
+	t.Run("pending is not claimed", func(t *testing.T) {
+		s := openStore(t, memstore.New(), WithClock(newMovableClock(settlementNow)))
+		createDispositionCatalog(t, s)
+		admitted, _, err := s.AdmitDispositionCommand(context.Background(), dispositionRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if admitted.Record.State != InboxStatePending || admitted.Record.Claim != nil {
+			t.Fatalf("vacuous fixture: %+v", admitted.Record)
+		}
+		_, err = s.BeginDispositionAttempt(context.Background(), beginRequest(admitted))
+		assertInboxCode(t, err, InboxErrorState)
+	})
+
+	// A superseded residency meeting a claim that has ALSO lapsed must be told
+	// it was superseded: that is permanent, while a lapsed claim is a fact
+	// about a claim this caller no longer has any standing to hold anyway.
+	t.Run("superseded residency before a lapsed claim", func(t *testing.T) {
+		s, clock, claimed := settlementFixture(t, nil)
+		clock.set(settlementExpiry)
+		req := beginRequest(claimed)
+		req.ResidencyEpoch = settlementResidenc - 1
+		_, err := s.BeginDispositionAttempt(context.Background(), req)
+		epoch := assertInboxCode(t, err, InboxErrorEpoch)
+		if epoch.Epoch != uint64(settlementResidenc) {
+			t.Fatalf("epoch = %d, want the committed claim's %d", epoch.Epoch, settlementResidenc)
+		}
+	})
+
+	// A residency that never claimed this command, meeting the same lapsed
+	// claim, is told the same thing it is told on a live claim.
+	t.Run("claim ownership before a lapsed claim", func(t *testing.T) {
+		s, clock, claimed := settlementFixture(t, nil)
+		clock.set(settlementExpiry)
+		req := beginRequest(claimed)
+		req.ResidencyEpoch = settlementResidenc + 1
+		_, err := s.BeginDispositionAttempt(context.Background(), req)
+		claimLost := assertInboxCode(t, err, InboxErrorClaimLost)
+		if claimLost.Field != "residency_epoch" {
+			t.Fatalf("field = %q, want residency_epoch: a lapsed claim answered for the fence", claimLost.Field)
+		}
+	})
+}
+
 // An expired claim is no longer a claim: the dispatch it would authorize may no
 // longer be the only one, so the transition refuses on the store's clock.
 func TestBeginDispositionAttemptRefusesLapsedClaim(t *testing.T) {
@@ -437,6 +537,42 @@ func TestSettleDispositionRequiresAConfiguredReader(t *testing.T) {
 	}
 }
 
+// A settlement request is validated before any provider I/O, and each refusal
+// names the request member that was wrong. The zero settling residency is
+// asserted by FIELD as well as by code, because a zero one is also caught a
+// layer down by the stored outcome's own rules — a test that looked only at the
+// code could not tell which of the two answered.
+func TestSettleDispositionValidatesItsRequestBeforeAnyRead(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*SettleDispositionCommandRequest)
+		field  string
+	}{
+		{"zero revision", func(r *SettleDispositionCommandRequest) { r.ExpectedRevision = 0 }, "expected_revision"},
+		{"zero residency", func(r *SettleDispositionCommandRequest) { r.ResidencyEpoch = 0 }, "residency_epoch"},
+		{"empty command", func(r *SettleDispositionCommandRequest) { r.CommandID = "" }, "command_id"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := &fakeEvidence{evidence: appliedEvidence()}
+			s, _, claimed := settlementFixture(t, reader)
+			applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := settleRequest(applying, settlementResidenc)
+			tc.mutate(&req)
+			_, ok, err := s.SettleDispositionCommand(context.Background(), req)
+			invalid := assertInboxCode(t, err, InboxErrorInvalid)
+			if ok || invalid.Field != tc.field {
+				t.Fatalf("field = %q, want %q (ok=%v)", invalid.Field, tc.field, ok)
+			}
+			if len(reader.seen) != 0 {
+				t.Fatalf("an invalid request reached the evidence reader: %d", len(reader.seen))
+			}
+		})
+	}
+}
+
 // A record with no durably authorized attempt has nothing to settle: the
 // terminal outcome is keyed by an attempt, and a pending or claimed record has
 // none. Reading evidence for one would be evidence about nothing.
@@ -505,6 +641,156 @@ func TestSettleDispositionChecksCatalogAuthorityAndClearsTheDueView(t *testing.T
 	if err != nil || len(page.Commands) != 0 || page.Examined != 0 {
 		t.Fatalf("settled command still due: %+v %v", page, err)
 	}
+}
+
+// dispositionWitnessRace removes both session witnesses at the instant the
+// protocol fence reads for them, which is the only window in which that fence's
+// create-only PUT is reachable from a disposition transition: the catalog read
+// that runs first already requires the collision witness, so an external
+// deletion has to land between the two reads.
+type dispositionWitnessRace struct {
+	storage.KV
+	arm  bool
+	keys []string
+}
+
+func (r *dispositionWitnessRace) Get(ctx context.Context, key string) ([]byte, uint64, error) {
+	if r.arm && key == r.keys[0] {
+		r.arm = false
+		for _, k := range r.keys {
+			if err := r.KV.Delete(ctx, k); err != nil {
+				return nil, 0, err
+			}
+		}
+	}
+	return r.KV.Get(ctx, key)
+}
+
+// Neither transition is "one read and one compare-and-swap", and the difference
+// matters to anyone reasoning about failure modes. Each reads the catalog, then
+// re-fences the session's protocol mode through bindProtocolMode — which is a
+// potential WRITE — and only then reads and compare-and-swaps the inbox record.
+// All three branches of that fence are asserted, because the catalog's own
+// binding check answers the mode question in the ordinary case and would carry
+// a test that looked only at the transition's outcome.
+func TestDispositionTransitionsFenceTheProtocolMode(t *testing.T) {
+	setup := func(t *testing.T, race *dispositionWitnessRace) (*storage.Composite, *Store, DispositionInboxEntry, sessionScope, string, []byte) {
+		t.Helper()
+		backend := memstore.New()
+		if race != nil {
+			race.KV = backend.KV
+			backend.KV = race
+		}
+		s := openStore(t, backend, WithClock(newMovableClock(settlementNow)), WithDispositionEvidence(&fakeEvidence{evidence: appliedEvidence()}))
+		createDispositionCatalog(t, s)
+		admitted, _, err := s.AdmitDispositionCommand(context.Background(), dispositionRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed := fileDispositionClaim(t, s, admitted, DispositionClaim{ResidencyEpoch: settlementResidenc, ExpiresAt: settlementExpiry})
+		d := claimed.Record.Descriptor
+		scope, err := s.deriveSessionScope(d.TenantID, d.SessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		key := scope.SessionNamespace + "/protocol"
+		want := encodeWitness(1, scope.sessionWitness, []byte(ProtocolModeDisposition))
+		got, _, err := backend.KV.Get(context.Background(), key)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("vacuous fixture: the create did not install the witness this test manipulates: %v", err)
+		}
+		if race != nil {
+			race.keys = []string{key, scope.sessionWitnessKey}
+		}
+		return backend, s, claimed, scope, key, want
+	}
+
+	// A mode witness pinned to the other protocol refuses both transitions even
+	// though the catalog binding still says disposition. This is the fence
+	// itself answering, not the catalog: they are two independent records, and
+	// this is the case in which they disagree.
+	t.Run("a legacy witness refuses both transitions", func(t *testing.T) {
+		for _, entry := range []string{"attempt", "settlement"} {
+			t.Run(entry, func(t *testing.T) {
+				backend, s, claimed, scope, key, _ := setup(t, nil)
+				_, rev, err := backend.KV.Get(context.Background(), key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := backend.KV.Put(context.Background(), key, rev, encodeWitness(1, scope.sessionWitness, []byte(ProtocolModeLegacy))); err != nil {
+					t.Fatal(err)
+				}
+				if entry == "attempt" {
+					_, err = s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+				} else {
+					_, _, err = s.SettleDispositionCommand(context.Background(), settleRequest(claimed, settlementResidenc))
+				}
+				assertCatalogCode(t, err, CatalogErrorConflict)
+				stored, err := backend.OrderedIndex.Get(context.Background(), dispositionInboxID(scope, claimed.Record.Descriptor.CommandID))
+				if err != nil || stored.Revision != claimed.Revision {
+					t.Fatalf("a refused transition wrote: %+v %v", stored, err)
+				}
+			})
+		}
+	})
+
+	// A mode witness missing BESIDE a live collision witness is the
+	// conservatively-legacy case: a bound scope with no mode pin is read as
+	// legacy and the transition is refused, never silently repinned.
+	t.Run("a missing witness beside a bound scope is a conflict", func(t *testing.T) {
+		backend, s, claimed, _, key, _ := setup(t, nil)
+		if err := backend.KV.Delete(context.Background(), key); err != nil {
+			t.Fatal(err)
+		}
+		_, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+		assertCatalogCode(t, err, CatalogErrorConflict)
+		if _, _, err := backend.KV.Get(context.Background(), key); err == nil {
+			t.Fatal("a refused transition repinned the mode")
+		}
+	})
+
+	// With NO witness at all the fence installs one, and that PUT is the write
+	// the documentation has to account for. It is reachable from here only in
+	// the window this fixture opens, because the catalog read that runs first
+	// needs the collision witness — which is exactly why the transition is
+	// documented as a potential write rather than a read.
+	t.Run("the fence installs a witness when the session has none", func(t *testing.T) {
+		for _, entry := range []string{"attempt", "settlement"} {
+			t.Run(entry, func(t *testing.T) {
+				race := &dispositionWitnessRace{}
+				backend, s, claimed, _, key, want := setup(t, race)
+				current := claimed
+				if entry == "settlement" {
+					applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+					if err != nil {
+						t.Fatal(err)
+					}
+					current = applying
+				}
+				race.arm = true
+				var err error
+				if entry == "attempt" {
+					_, err = s.BeginDispositionAttempt(context.Background(), beginRequest(current))
+				} else {
+					var ok bool
+					_, ok, err = s.SettleDispositionCommand(context.Background(), settleRequest(current, settlementResidenc))
+					if err == nil && !ok {
+						t.Fatal("settlement did not settle")
+					}
+				}
+				if err != nil {
+					t.Fatalf("%s over an unwitnessed session: %v", entry, err)
+				}
+				if race.arm {
+					t.Fatal("vacuous: the fence never read the mode witness")
+				}
+				got, _, getErr := backend.KV.Get(context.Background(), key)
+				if getErr != nil || !bytes.Equal(got, want) {
+					t.Fatalf("the %s did not install the protocol witness: %x %v", entry, got, getErr)
+				}
+			})
+		}
+	})
 }
 
 // Legacy commands are a different protocol with different epoch assumptions.
@@ -663,6 +949,27 @@ func TestDispositionRecordStatesRequireTheirMembers(t *testing.T) {
 		{"rejected carrying an applied outcome", func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateRejected, claim, attempt, outcome
 		}, false},
+		// Reject-before-dispatch: the design's negative outcome for a command
+		// no dispatch was ever authorized for. It has no attempt by definition,
+		// and therefore no evidence-keyed outcome, and it may or may not have
+		// reached a claim first. Both shapes must be storable.
+		{"rejected before any claim", func(r *DispositionInboxRecord) { r.State = InboxStateRejected }, true},
+		{"rejected after a claim before dispatch", func(r *DispositionInboxRecord) {
+			r.State, r.Claim = InboxStateRejected, claim
+		}, true},
+		// The relaxation is exactly that wide and no wider: only a rejection
+		// may lack an attempt, it may not then carry an outcome keyed by one,
+		// and nothing may reach applied without the attempt that applied it.
+		{"rejected before dispatch carrying an outcome", func(r *DispositionInboxRecord) {
+			r.State, r.Outcome = InboxStateRejected, outcome
+		}, false},
+		{"rejected before dispatch with a claim and an outcome", func(r *DispositionInboxRecord) {
+			r.State, r.Claim, r.Outcome = InboxStateRejected, claim, outcome
+		}, false},
+		{"applied before any claim", func(r *DispositionInboxRecord) { r.State = InboxStateApplied }, false},
+		{"applied with a claim but no attempt", func(r *DispositionInboxRecord) {
+			r.State, r.Claim = InboxStateApplied, claim
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			record := base()
@@ -730,6 +1037,18 @@ func TestDispositionSettlementWireGolden(t *testing.T) {
 			func(r *DispositionInboxRecord) { r.Claim, r.Attempt, r.Outcome = claim, attempt, closure },
 			identity + `rejected",` + claimWire + `,` + attemptWire + `,"outcome":{"kind":"not_applied","attempt_id":"attempt/A:B","attempt_journal_epoch":9,"author_journal_epoch":10,"disposition_seq":31,"author_fence_seq":30,"event_id":"","event_seq":0,"settling_residency_epoch":7,"settled_at":"2026-08-30T11:40:00Z"}}`,
 			[]string{`"event_id"`, `"event_seq"`, `"author_fence_seq"`},
+		},
+		{
+			"rejected before any claim", InboxStateRejected,
+			func(*DispositionInboxRecord) {},
+			identity + `rejected"}`,
+			[]string{`"state"`},
+		},
+		{
+			"rejected after a claim before dispatch", InboxStateRejected,
+			func(r *DispositionInboxRecord) { r.Claim = claim },
+			identity + `rejected",` + claimWire + `}`,
+			[]string{`"claim"`, `"expires_at"`},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

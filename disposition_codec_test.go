@@ -84,6 +84,36 @@ func FuzzDispositionInboxCodec(f *testing.F) {
 		f.Fatal(err)
 	}
 	f.Add(v)
+	// The three post-admission members are durable too. Seeding only pending
+	// records left claim, attempt and outcome bytes entirely unfuzzed, because
+	// random mutation of a pending record will not synthesise a canonical one.
+	// Every state the codec decodes gets a seed, including the rejection that
+	// precedes any dispatch and therefore carries none of the three.
+	r.Descriptor.PayloadObject = nil
+	r.Descriptor.Payload = req.Payload
+	r.Descriptor.PayloadDigest = digest
+	claim := &DispositionClaim{ResidencyEpoch: 4, ExpiresAt: settlementExpiry}
+	attempt := &DispositionAttempt{AttemptID: "attempt/A:B", JournalEpoch: 9, ResidencyEpoch: 4, StartedAt: settlementNow}
+	applied := &DispositionOutcome{Kind: DispositionApplied, AttemptID: attempt.AttemptID, AttemptJournalEpoch: 9, AuthorJournalEpoch: 9, DispositionSeq: 12, EventID: "01J0000000000000000000EVNT", EventSeq: 12, SettlingResidencyEpoch: 4, SettledAt: settlementNow}
+	closure := &DispositionOutcome{Kind: DispositionNotApplied, AttemptID: attempt.AttemptID, AttemptJournalEpoch: 9, AuthorJournalEpoch: 10, DispositionSeq: 31, AuthorFenceSeq: 30, SettlingResidencyEpoch: 7, SettledAt: settlementNow}
+	noOp := &DispositionOutcome{Kind: DispositionNoOp, AttemptID: attempt.AttemptID, AttemptJournalEpoch: 9, AuthorJournalEpoch: 9, DispositionSeq: 12, SettlingResidencyEpoch: 4, SettledAt: settlementNow}
+	for _, seed := range []DispositionInboxRecord{
+		{State: InboxStateClaimed, Claim: claim},
+		{State: InboxStateApplying, Claim: claim, Attempt: attempt},
+		{State: InboxStateApplied, Claim: claim, Attempt: attempt, Outcome: applied},
+		{State: InboxStateApplied, Claim: claim, Attempt: attempt, Outcome: noOp},
+		{State: InboxStateRejected, Claim: claim, Attempt: attempt, Outcome: closure},
+		{State: InboxStateRejected},
+		{State: InboxStateRejected, Claim: claim},
+	} {
+		staged := r
+		staged.State, staged.Claim, staged.Attempt, staged.Outcome = seed.State, seed.Claim, seed.Attempt, seed.Outcome
+		v, _, err := encodeDispositionInboxRecord(staged)
+		if err != nil {
+			f.Fatalf("seed %q: %v", seed.State, err)
+		}
+		f.Add(v)
+	}
 	f.Fuzz(func(t *testing.T, value []byte) {
 		r, err := decodeDispositionInboxRecord(value)
 		if err != nil {
@@ -102,7 +132,17 @@ func FuzzDispositionInboxCodec(f *testing.F) {
 		if !bytes.Equal(a, b) {
 			t.Fatal("codec not fixed point")
 		}
-		if r.State != InboxStatePending {
+		// "The codec grants progress" was originally spelled as "the decoded
+		// state is pending", which was the same assertion while pending was the
+		// only decodable state. It is generalised, not weakened: the decoded
+		// state must be one the INPUT BYTES spell, so a decoder that invented
+		// any state — including pending — still fails. JSON escapes an embedded
+		// quote, so this substring cannot be forged inside an opaque identity
+		// or a base64 payload.
+		if !bytes.Contains(value, []byte(`"state":"`+string(r.State)+`"`)) {
+			t.Fatal("codec grants progress")
+		}
+		if r.State == InboxStatePending && (r.Claim != nil || r.Attempt != nil || r.Outcome != nil) {
 			t.Fatal("codec grants progress")
 		}
 	})

@@ -16,8 +16,34 @@ import (
 //
 //	claimed -> applying (an attempt)   applying -> applied | rejected (settlement)
 //
-// — each one read plus one revision compare-and-swap of that same record,
-// through the same ordered-index operations every other transition uses.
+// — each one revision compare-and-swap of that same record, through the same
+// ordered-index operations every other transition uses.
+//
+// It is worth being exact about what surrounds that compare-and-swap, because
+// "one read and one write" is what a reader would otherwise assume and it is
+// not true. Each transition first reads the immutable catalog binding, then
+// re-fences the session's protocol mode through bindProtocolMode, and only then
+// reads the inbox record and compare-and-swaps it.
+//
+// That fence is not a read. It reads the create-only mode witness and PUTS one
+// when it finds NO witness at all, so either transition can create a durable
+// record in a second store namespace. The three branches, stated exactly
+// because two of them are easy to conflate:
+//
+//   - the witness pins this mode: the transition proceeds;
+//   - the witness pins the other mode, OR it is missing beside a live collision
+//     witness: refused with a CatalogError, because a bound scope with no mode
+//     pin is conservatively legacy and is never silently repinned;
+//   - no witness at all: one is installed, and the transition proceeds.
+//
+// The last branch is the write, and reaching it from HERE additionally needs
+// the collision witness to disappear between the catalog read and the fence,
+// since the catalog read requires it. So the write is not merely unlikely in
+// production, it is confined to that window — but a caller reasoning about
+// failure modes still must know it exists, and must know that a fence failure
+// is a CatalogError about the witness rather than an InboxError about the
+// command. GetDispositionCommand, the pre-existing read path, does NOT make
+// this call and remains a pure read.
 //
 // # The two ownership domains never meet
 //
@@ -221,6 +247,18 @@ func WithDispositionEvidence(reader DispositionEvidenceReader) Option {
 // beside the attempt rather than over it, so the record keeps naming the grants
 // the dispatch was actually authorized under.
 //
+// SettledAt is a DELIBERATE DEVIATION from this package's convention that a
+// stored instant is the caller's own clock reading, and the deviation is the
+// point rather than an oversight. Every other member of this struct is derived
+// from verified evidence or from the store's own immutable record, and the
+// whole of SettleDispositionCommandRequest is that a caller supplies nothing an
+// outcome is built from; accepting a caller's timestamp would have been the one
+// caller-authored value in a record whose entire purpose is that it has none.
+// It is the store's clock at the moment the outcome was constructed, taken
+// before the terminal compare-and-swap, so it is when the store DECIDED and not
+// when the runtime acted — the journal sequences are what order the runtime's
+// side. It is not comparable with a caller's clock and must not be used as one.
+//
 // These struct tags are NOT the durable spelling; see dispositionOutcomeWire.
 type DispositionOutcome struct {
 	Kind                   DispositionOutcomeKind `json:"kind"`
@@ -245,7 +283,10 @@ type DispositionOutcome struct {
 // superseded permanently, and a higher one has not claimed this command.
 //
 // StartedAt is the caller's own clock reading of when the attempt began, as
-// every stored instant in this package is. It is recorded, not used as a guard.
+// every CALLER-SUPPLIED stored instant in this package is. It is recorded, not
+// used as a guard. It is not the only convention in this file: a settlement
+// caller supplies no instant at all, and DispositionOutcome.SettledAt is the
+// store's own reading for the reason stated there.
 type BeginDispositionAttemptRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
@@ -342,8 +383,10 @@ func (s *Store) BeginDispositionAttempt(ctx context.Context, req BeginDispositio
 //
 // The sequence is fixed and each step exists for a stated reason:
 //
-//  1. Read the store's OWN authority — the immutable catalog binding — and the
-//     current inbox record, and hold the caller to the revision it decided on.
+//  1. Read the store's OWN authority — the immutable catalog binding and the
+//     session's protocol-mode fence, which installs its create-only witness
+//     when the session has none at all — and the current inbox record, and hold
+//     the caller to the revision it decided on.
 //     Losing that comparison returns the current revision, because the answer
 //     to a lost compare-and-swap is to reread the inbox and never to repeat
 //     execution.
@@ -525,6 +568,19 @@ func dispositionResidencyFence(claim DispositionClaim, residency ResidencyEpoch)
 // store's own catalog authority, and holds the caller to the revision it
 // decided on. The provider's comparison still runs at the write; this one
 // exists so the guards above run against the record the caller actually read.
+//
+// Two authorities are consulted, not one, and the second of them can WRITE.
+// The catalog gives the immutable binding and refuses a legacy row; the
+// protocol-mode fence is a separate create-only witness record, and
+// bindProtocolMode installs one when the session has no witness at all rather
+// than reading that absence as an absent mode. A mode witness missing beside a
+// live collision witness is instead read conservatively as legacy and refused,
+// which is the older-binary case that rule exists for. The two authorities are
+// checked together because they can disagree — a witness pinned to legacy
+// refuses a transition the catalog would have allowed — and that disagreement
+// is a CatalogError, never an inbox one. The fence is deliberately redundant
+// with the catalog check in every ordinary case; it is not redundant when the
+// two records disagree, which is the only case it exists for.
 func (s *Store) dispositionEntryAtRevision(
 	ctx context.Context,
 	scope sessionScope,
