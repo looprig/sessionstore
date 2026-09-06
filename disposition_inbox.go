@@ -52,13 +52,26 @@ type DispositionCommandDescriptor struct {
 	PayloadObject    *sessionwire.ObjectMetadata `json:"payload_object,omitempty"`
 }
 
-// DispositionInboxRecord only admits pending commands. Timestamps, like the
-// descriptor, remain exactly those chosen by the winning create.
+// DispositionInboxRecord is one disposition command's authoritative record.
+// Timestamps, like the descriptor, remain exactly those chosen by the winning
+// create; admission produces InboxStatePending and never anything else.
+//
+// Claim, Attempt and Outcome are the states beyond admission, and each is
+// absent until the state that requires it: what each state must and must not
+// carry is validateDispositionState, because that is a property of the record
+// rather than of whichever transition wrote it. Once written, the attempt and
+// both of its grant identities are immutable — no transition may rewrite one to
+// make a successor's epochs look current.
+//
+// These struct tags are NOT the durable spelling; see the private wire DTOs.
 type DispositionInboxRecord struct {
 	Descriptor    DispositionCommandDescriptor `json:"descriptor"`
 	AcceptedAt    time.Time                    `json:"accepted_at"`
 	ApplyDeadline time.Time                    `json:"apply_deadline"`
 	State         InboxState                   `json:"state"`
+	Claim         *DispositionClaim            `json:"claim,omitempty"`
+	Attempt       *DispositionAttempt          `json:"attempt,omitempty"`
+	Outcome       *DispositionOutcome          `json:"outcome,omitempty"`
 }
 
 // DispositionInboxEntry carries provider revision and opaque per-session order.
@@ -259,7 +272,15 @@ func dispositionInboxID(scope sessionScope, command sessionwire.CommandID) stora
 	return storage.OrderedID{Namespace: shardNamespace(dispositionInboxNamespace, scope.ControlShard), OrderingScope: scope.SessionNamespace, StableKey: storage.StableKey(command)}
 }
 
+// dispositionInboxDue files a command at its apply deadline until it is
+// settled, and files a settled one nowhere. The deadline is the whole horizon:
+// this protocol has no reclaim horizon to fold in, because an applying command
+// is closed by evidence rather than by a claim lapsing, and a claim edge that
+// would need one does not exist yet.
 func dispositionInboxDue(r DispositionInboxRecord) storage.Due {
+	if r.State.terminal() {
+		return storage.Due{}
+	}
 	return storage.Due{State: storage.DueAt, UnixMillis: r.ApplyDeadline.UnixMilli()}
 }
 
@@ -299,6 +320,39 @@ type dispositionInboxRecordWire struct {
 	AcceptedAt    time.Time                 `json:"accepted_at"`
 	ApplyDeadline time.Time                 `json:"apply_deadline"`
 	State         InboxState                `json:"state"`
+	Claim         *dispositionClaimWire     `json:"claim,omitempty"`
+	Attempt       *dispositionAttemptWire   `json:"attempt,omitempty"`
+	Outcome       *dispositionOutcomeWire   `json:"outcome,omitempty"`
+}
+
+// The three post-admission members are pointers and omitempty, so a pending
+// record's bytes are exactly what they were before they existed and the golden
+// literals that pinned them still hold byte for byte. Inside each one every
+// member is unconditionally present: canonical re-encoding compares whole
+// bytes, so an omitempty member would pin two spellings per member for no gain.
+type dispositionClaimWire struct {
+	ResidencyEpoch ResidencyEpoch `json:"residency_epoch"`
+	ExpiresAt      time.Time      `json:"expires_at"`
+}
+
+type dispositionAttemptWire struct {
+	AttemptID      DispositionAttemptID `json:"attempt_id"`
+	JournalEpoch   JournalEpoch         `json:"journal_epoch"`
+	ResidencyEpoch ResidencyEpoch       `json:"residency_epoch"`
+	StartedAt      time.Time            `json:"started_at"`
+}
+
+type dispositionOutcomeWire struct {
+	Kind                   DispositionOutcomeKind `json:"kind"`
+	AttemptID              DispositionAttemptID   `json:"attempt_id"`
+	AttemptJournalEpoch    JournalEpoch           `json:"attempt_journal_epoch"`
+	AuthorJournalEpoch     JournalEpoch           `json:"author_journal_epoch"`
+	DispositionSeq         uint64                 `json:"disposition_seq"`
+	AuthorFenceSeq         uint64                 `json:"author_fence_seq"`
+	EventID                sessionwire.EventID    `json:"event_id"`
+	EventSeq               uint64                 `json:"event_seq"`
+	SettlingResidencyEpoch ResidencyEpoch         `json:"settling_residency_epoch"`
+	SettledAt              time.Time              `json:"settled_at"`
 }
 
 type dispositionDescriptorWire struct {
@@ -337,6 +391,57 @@ func dispositionInboxToWire(r DispositionInboxRecord) dispositionInboxRecordWire
 			PayloadDigest: d.PayloadDigest, PayloadSize: d.PayloadSize, Payload: d.Payload, PayloadObject: d.PayloadObject,
 		},
 		AcceptedAt: r.AcceptedAt, ApplyDeadline: r.ApplyDeadline, State: r.State,
+		Claim: claimToWire(r.Claim), Attempt: attemptToWire(r.Attempt), Outcome: outcomeToWire(r.Outcome),
+	}
+}
+
+func claimToWire(c *DispositionClaim) *dispositionClaimWire {
+	if c == nil {
+		return nil
+	}
+	return &dispositionClaimWire{ResidencyEpoch: c.ResidencyEpoch, ExpiresAt: c.ExpiresAt}
+}
+
+func (w *dispositionClaimWire) claim() *DispositionClaim {
+	if w == nil {
+		return nil
+	}
+	return &DispositionClaim{ResidencyEpoch: w.ResidencyEpoch, ExpiresAt: w.ExpiresAt}
+}
+
+func attemptToWire(a *DispositionAttempt) *dispositionAttemptWire {
+	if a == nil {
+		return nil
+	}
+	return &dispositionAttemptWire{AttemptID: a.AttemptID, JournalEpoch: a.JournalEpoch, ResidencyEpoch: a.ResidencyEpoch, StartedAt: a.StartedAt}
+}
+
+func (w *dispositionAttemptWire) attempt() *DispositionAttempt {
+	if w == nil {
+		return nil
+	}
+	return &DispositionAttempt{AttemptID: w.AttemptID, JournalEpoch: w.JournalEpoch, ResidencyEpoch: w.ResidencyEpoch, StartedAt: w.StartedAt}
+}
+
+func outcomeToWire(o *DispositionOutcome) *dispositionOutcomeWire {
+	if o == nil {
+		return nil
+	}
+	return &dispositionOutcomeWire{
+		Kind: o.Kind, AttemptID: o.AttemptID, AttemptJournalEpoch: o.AttemptJournalEpoch,
+		AuthorJournalEpoch: o.AuthorJournalEpoch, DispositionSeq: o.DispositionSeq, AuthorFenceSeq: o.AuthorFenceSeq,
+		EventID: o.EventID, EventSeq: o.EventSeq, SettlingResidencyEpoch: o.SettlingResidencyEpoch, SettledAt: o.SettledAt,
+	}
+}
+
+func (w *dispositionOutcomeWire) outcome() *DispositionOutcome {
+	if w == nil {
+		return nil
+	}
+	return &DispositionOutcome{
+		Kind: w.Kind, AttemptID: w.AttemptID, AttemptJournalEpoch: w.AttemptJournalEpoch,
+		AuthorJournalEpoch: w.AuthorJournalEpoch, DispositionSeq: w.DispositionSeq, AuthorFenceSeq: w.AuthorFenceSeq,
+		EventID: w.EventID, EventSeq: w.EventSeq, SettlingResidencyEpoch: w.SettlingResidencyEpoch, SettledAt: w.SettledAt,
 	}
 }
 
@@ -350,6 +455,7 @@ func (w dispositionInboxRecordWire) record() DispositionInboxRecord {
 			PayloadDigest: d.PayloadDigest, PayloadSize: d.PayloadSize, Payload: d.Payload, PayloadObject: d.PayloadObject,
 		},
 		AcceptedAt: w.AcceptedAt, ApplyDeadline: w.ApplyDeadline, State: w.State,
+		Claim: w.Claim.claim(), Attempt: w.Attempt.attempt(), Outcome: w.Outcome.outcome(),
 	}
 }
 
@@ -398,8 +504,11 @@ func canonicalDispositionInboxRecord(r DispositionInboxRecord) (DispositionInbox
 	if err := d.Binding.validate(); err != nil {
 		return DispositionInboxRecord{}, err
 	}
-	if d.Binding.ProtocolMode != ProtocolModeDisposition || r.State != InboxStatePending {
+	if d.Binding.ProtocolMode != ProtocolModeDisposition {
 		return DispositionInboxRecord{}, inboxInvalid("protocol_state", nil)
+	}
+	if err := validateDispositionState(&r); err != nil {
+		return DispositionInboxRecord{}, err
 	}
 	if len(d.Payload) > MaxInboxPayloadBytes {
 		return DispositionInboxRecord{}, inboxInvalid("payload", nil)
@@ -426,4 +535,125 @@ func canonicalDispositionInboxRecord(r DispositionInboxRecord) (DispositionInbox
 	}
 	r.AcceptedAt, r.ApplyDeadline = base.AcceptedAt, base.ApplyDeadline
 	return r, nil
+}
+
+// validateDispositionState enumerates the states this record has and states,
+// for each one, exactly which of the three post-admission members it must and
+// must not carry. It is the record's own rule rather than a transition's, so a
+// record assembled by any route — a transition, a decode, a future claim edge —
+// is held to the same thing, and a member that contradicts the state cannot be
+// stored at all.
+//
+// It also copies the three members, so a caller that keeps a pointer it passed
+// in cannot mutate a record the store has already validated.
+func validateDispositionState(r *DispositionInboxRecord) error {
+	if r.Claim != nil {
+		claim := *r.Claim
+		if claim.ResidencyEpoch == 0 || !rankableTime(claim.ExpiresAt) {
+			return inboxInvalid("claim", nil)
+		}
+		r.Claim = &claim
+	}
+	if r.Attempt != nil {
+		attempt := *r.Attempt
+		if err := validateDispositionAttempt(&attempt); err != nil {
+			return err
+		}
+		r.Attempt = &attempt
+	}
+	if r.Outcome != nil {
+		outcome := *r.Outcome
+		if err := validateDispositionOutcome(outcome, r.Attempt, r.State); err != nil {
+			return err
+		}
+		r.Outcome = &outcome
+	}
+	switch r.State {
+	case InboxStatePending:
+		if r.Claim != nil || r.Attempt != nil {
+			return inboxInvalid("state", nil)
+		}
+	case InboxStateClaimed:
+		if r.Claim == nil || r.Attempt != nil {
+			return inboxInvalid("state", nil)
+		}
+	case InboxStateApplying:
+		if r.Claim == nil || r.Attempt == nil {
+			return inboxInvalid("state", nil)
+		}
+	case InboxStateApplied, InboxStateRejected:
+		// A terminal record keeps the claim and the attempt that produced it:
+		// they are the durable record of which grants applied the command, and
+		// a settlement that cleared them would leave its own outcome unkeyed.
+		if r.Claim == nil || r.Attempt == nil || r.Outcome == nil {
+			return inboxInvalid("state", nil)
+		}
+		return nil
+	default:
+		return inboxInvalid("state", nil)
+	}
+	if r.Outcome != nil {
+		return inboxInvalid("outcome", nil)
+	}
+	return nil
+}
+
+// validateDispositionAttempt holds an attempt to its own well-formedness. Both
+// grants are required and neither may be zero: an attempt that recorded one
+// authority could not tell a successor which had been held, and a zero epoch is
+// not a grant any provider issues.
+func validateDispositionAttempt(a *DispositionAttempt) error {
+	if err := validateOpaque(string(a.AttemptID), "attempt_id", inboxInvalid); err != nil {
+		return err
+	}
+	if a.JournalEpoch == 0 {
+		return inboxInvalid("journal_epoch", nil)
+	}
+	if a.ResidencyEpoch == 0 {
+		return inboxInvalid("residency_epoch", nil)
+	}
+	if !rankableTime(a.StartedAt) {
+		return inboxInvalid("started_at", nil)
+	}
+	return nil
+}
+
+// validateDispositionOutcome holds a terminal outcome to the attempt it claims
+// to settle and to the state it settles into. The evidence rules themselves
+// live with the settlement that verifies them; what is restated here is only
+// what a STORED record must satisfy on its own, so a decoded outcome cannot
+// name another attempt, another grant, or a state its kind does not produce.
+func validateDispositionOutcome(o DispositionOutcome, attempt *DispositionAttempt, state InboxState) error {
+	if !o.Kind.valid() || o.Kind.terminalState() != state {
+		return inboxInvalid("outcome.kind", nil)
+	}
+	if attempt == nil || o.AttemptID != attempt.AttemptID || o.AttemptJournalEpoch != attempt.JournalEpoch {
+		return inboxInvalid("outcome.attempt_id", nil)
+	}
+	if o.AuthorJournalEpoch == 0 || o.DispositionSeq == 0 || o.SettlingResidencyEpoch == 0 {
+		return inboxInvalid("outcome", nil)
+	}
+	if !rankableTime(o.SettledAt) {
+		return inboxInvalid("outcome.settled_at", nil)
+	}
+	if o.Kind == DispositionNotApplied {
+		if o.AuthorJournalEpoch <= o.AttemptJournalEpoch || o.AuthorFenceSeq == 0 || o.AuthorFenceSeq >= o.DispositionSeq {
+			return inboxInvalid("outcome.author_journal_epoch", nil)
+		}
+	} else if o.AuthorJournalEpoch != o.AttemptJournalEpoch || o.AuthorFenceSeq != 0 {
+		return inboxInvalid("outcome.author_journal_epoch", nil)
+	}
+	if o.Kind == DispositionApplied {
+		if err := o.EventID.Validate(); err != nil {
+			return inboxInvalid("outcome.event_id", err)
+		}
+		if o.EventSeq != o.DispositionSeq {
+			return inboxInvalid("outcome.event_seq", nil)
+		}
+		return nil
+	}
+	if o.EventID != "" || o.EventSeq != 0 {
+		return inboxInvalid("outcome.event", nil)
+	}
+	return nil
 }

@@ -52,6 +52,7 @@ type config struct {
 	layout          keyspaceLayout
 	legacyTenant    sessionwire.TenantID
 	shards          uint32
+	evidence        DispositionEvidenceReader
 }
 
 func defaultConfig() config {

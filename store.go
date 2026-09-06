@@ -25,6 +25,11 @@ type Store struct {
 	closing         bool
 	active          sync.WaitGroup
 
+	// evidence is the settlement evidence boundary, nil unless configured. It
+	// is a read-only collaborator: nothing in this package calls it except
+	// SettleDispositionCommand, which verifies everything it returns.
+	evidence DispositionEvidenceReader
+
 	providerClose    func(context.Context) error
 	ioAdapter        *ioProviderAdapter
 	keys             keyspace
@@ -97,6 +102,7 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 		shutdownTimeout:   cfg.shutdownTimeout,
 		ctx:               ownedCtx,
 		cancel:            cancel,
+		evidence:          cfg.evidence,
 		providerClose:     cfg.providerClose,
 		ioAdapter:         cfg.ioAdapter,
 		keys:              keys,

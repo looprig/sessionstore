@@ -28,6 +28,9 @@ func TestWireDTOsMirrorExportedRecords(t *testing.T) {
 		{reflect.TypeOf(PublicCreateIdentity{}), reflect.TypeOf(publicCreateIdentityWire{})},
 		{reflect.TypeOf(HostTargetKey{}), reflect.TypeOf(publicCreateTargetWire{})},
 		{reflect.TypeOf(DesiredWorkload{}), reflect.TypeOf(desiredWorkloadWire{})},
+		{reflect.TypeOf(DispositionClaim{}), reflect.TypeOf(dispositionClaimWire{})},
+		{reflect.TypeOf(DispositionAttempt{}), reflect.TypeOf(dispositionAttemptWire{})},
+		{reflect.TypeOf(DispositionOutcome{}), reflect.TypeOf(dispositionOutcomeWire{})},
 	}
 	if len(pairs) == 0 {
 		t.Fatal("vacuous: no pinned exported/DTO pairs were examined")
