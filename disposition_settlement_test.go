@@ -586,6 +586,74 @@ func TestSettleDispositionRefusesWithoutAnAttempt(t *testing.T) {
 	}
 }
 
+// The settling residency is fenced against the claim's high-water mark, and the
+// ORDER is what this pins, not merely the refusal: a superseded caller is told
+// it is superseded instead of being sent to look for evidence under a lease that
+// no longer exists.
+//
+// The "no read happened" half of that is an assertion whose passing condition is
+// that nothing occurred, so it proves nothing on its own — the equal and above
+// rows are its positive control. They run the SAME call with the same reader and
+// require the reader to have been reached, so a store that never consulted
+// evidence at all would fail them rather than pass this test three times over.
+//
+// Above the claim is a successor and must settle, which is why only the
+// superseded arm of dispositionResidencyFence applies here: the full fence would
+// refuse every residency that is not exactly the claim's.
+func TestSettleDispositionFencesASupersededResidencyBeforeReadingEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		residency ResidencyEpoch
+		reads     int
+		wantState InboxState
+	}{
+		{name: "below the claim is refused before any evidence read", residency: settlementResidenc - 1, reads: 0},
+		{name: "at the claim reaches the reader", residency: settlementResidenc, reads: 1, wantState: InboxStateApplied},
+		{name: "above the claim is a successor and reaches the reader", residency: settlementResidenc + 3, reads: 1, wantState: InboxStateApplied},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			reader := &fakeEvidence{evidence: appliedEvidence()}
+			s, _, claimed := settlementFixture(t, reader)
+			applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+			if err != nil {
+				t.Fatal(err)
+			}
+			settled, ok, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, tc.residency))
+			if len(reader.seen) != tc.reads {
+				t.Fatalf("evidence reads = %d, want %d", len(reader.seen), tc.reads)
+			}
+			if tc.reads == 0 {
+				refusal := assertInboxCode(t, err, InboxErrorEpoch)
+				if refusal.Field != "residency_epoch" {
+					t.Fatalf("field = %q, want residency_epoch", refusal.Field)
+				}
+				// The refused caller is handed the COMMITTED mark, which is the
+				// only value it can act on, and not the one it named.
+				if refusal.Epoch != uint64(settlementResidenc) {
+					t.Fatalf("epoch = %d, want the claim's %d", refusal.Epoch, settlementResidenc)
+				}
+				if ok {
+					t.Fatal("a superseded settlement reported settled")
+				}
+				// The record is untouched and still settleable by a caller at
+				// the mark, so the refusal wrote nothing.
+				current, _, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, settlementResidenc))
+				if err != nil || current.Record.State != InboxStateApplied {
+					t.Fatalf("the refusal was not inert: %+v %v", current, err)
+				}
+				return
+			}
+			if err != nil || !ok || settled.Record.State != tc.wantState {
+				t.Fatalf("settlement: %+v %v %v", settled, ok, err)
+			}
+			if settled.Record.Outcome.SettlingResidencyEpoch != tc.residency {
+				t.Fatalf("settling residency = %d, want %d", settled.Record.Outcome.SettlingResidencyEpoch, tc.residency)
+			}
+		})
+	}
+}
+
 // Losing the terminal CAS is a reread instruction carrying the current
 // revision; meeting the settled state again at that revision is idempotent, and
 // a repeat settlement neither reads evidence again nor writes.

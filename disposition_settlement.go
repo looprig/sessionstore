@@ -247,6 +247,15 @@ func WithDispositionEvidence(reader DispositionEvidenceReader) Option {
 // beside the attempt rather than over it, so the record keeps naming the grants
 // the dispatch was actually authorized under.
 //
+// Be exact about how much it is worth. It is settlement context recorded from
+// the REQUEST, fenced only against the claim's high-water mark, so the stored
+// invariant it carries is SettlingResidencyEpoch >= Claim.ResidencyEpoch and
+// nothing more. It is NOT proof of live residency at settlement: no lease is
+// read on this path, so a Host whose residency merely equals the claim's may
+// have lost that lease since, and one naming a higher epoch is taken at its
+// word. Read it as "who asked, and that they were not already superseded" —
+// never as "who validly held the session when this settled".
+//
 // SettledAt is a DELIBERATE DEVIATION from this package's convention that a
 // stored instant is the caller's own clock reading, and the deviation is the
 // point rather than an oversight. Every other member of this struct is derived
@@ -397,13 +406,25 @@ func (s *Store) BeginDispositionAttempt(ctx context.Context, req BeginDispositio
 //  3. A record with no durably authorized attempt has nothing to settle. The
 //     terminal outcome is keyed by an attempt, so evidence about a command that
 //     never had one would be evidence about nothing.
-//  4. Obtain the evidence through the configured reader, using a request the
+//  4. Refuse a settling residency STRICTLY BELOW the claim's high-water mark,
+//     with InboxErrorEpoch on residency_epoch, and do it before the evidence
+//     read for the reason the legacy CompleteCommand gives at its own fence: a
+//     superseded caller must be told it is superseded, not sent to look for
+//     evidence under a lease that no longer exists.
+//  5. Obtain the evidence through the configured reader, using a request the
 //     store derived from its own record, and VERIFY it — before the write.
-//  5. Compare-and-swap that exact revision to terminal.
+//  6. Compare-and-swap that exact revision to terminal.
 //
 // It does this for the original holder AND for a successor; the difference
-// between them is in the evidence, not in the caller's assertion. It makes no
-// claim that any external side effect happened exactly once.
+// between them is in the evidence, not in the caller's assertion. Step 4 does
+// not narrow that: a successor holds a residency ABOVE the claim's by lease
+// monotonicity, so the only caller it turns away is one that was already
+// superseded when the claim was taken and therefore never held this command.
+// The fence is a high-water check on a value the record already carries; it is
+// NOT a liveness check, and reads no lease. See DispositionOutcome's
+// SettlingResidencyEpoch for exactly what the stored epoch is then worth.
+//
+// It makes no claim that any external side effect happened exactly once.
 func (s *Store) SettleDispositionCommand(ctx context.Context, req SettleDispositionCommandRequest) (DispositionInboxEntry, bool, error) {
 	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
 	if err != nil {
@@ -432,8 +453,23 @@ func (s *Store) SettleDispositionCommand(ctx context.Context, req SettleDisposit
 	if current.Record.State.terminal() {
 		return current, false, nil
 	}
-	if current.Record.State != InboxStateApplying || current.Record.Attempt == nil {
+	if current.Record.State != InboxStateApplying || current.Record.Attempt == nil || current.Record.Claim == nil {
 		return DispositionInboxEntry{}, false, inboxErr(InboxErrorState, "state", nil)
+	}
+	// The high-water fence runs BEFORE the evidence read, for the reason the
+	// legacy CompleteCommand states at its own fence: a caller below the mark is
+	// superseded permanently and must learn that, rather than be sent to look for
+	// evidence under a lease that no longer exists. The ORDER is the contract.
+	//
+	// Only the superseded arm applies here, never dispositionResidencyFence's
+	// second arm. Settlement is deliberately open to a residency that is not the
+	// claim's, because evidence is the authority and a successor must be able to
+	// settle an attempt it did not start. By lease monotonicity a successor's
+	// residency is strictly HIGHER than the claim's, so this fence never
+	// obstructs one; the only caller it refuses is one already superseded when
+	// the claim was taken, which by construction never held this command.
+	if err := dispositionResidencyHighWater(*current.Record.Claim, req.ResidencyEpoch); err != nil {
+		return DispositionInboxEntry{}, false, err
 	}
 	if s.evidence == nil {
 		return DispositionInboxEntry{}, false, inboxErr(InboxErrorEvidence, "reader", nil)
@@ -548,14 +584,34 @@ func verifiedDispositionOutcome(attempt DispositionAttempt, e DispositionEvidenc
 	}, nil
 }
 
+// dispositionResidencyHighWater is the SUPERSEDED arm on its own: the shared
+// rule from epochFence, measured against a disposition command's high-water
+// mark, which is its CLAIM's residency. That is the mark epochFence's own doc
+// names for a command, so this is not a second notion of "superseded".
+//
+// It is a named function rather than a second inlined call because the two
+// settlement transitions need different amounts of the same rule, and only one
+// of them wants the whole of dispositionResidencyFence. Copying the
+// error-building closure to the second site is precisely the drift epochFence
+// was hoisted to prevent: a duplicate on a path that only runs once a Host has
+// already been superseded, where a weakened check looks exactly like a passing
+// one.
+func dispositionResidencyHighWater(claim DispositionClaim, residency ResidencyEpoch) error {
+	return epochFence(uint64(claim.ResidencyEpoch), uint64(residency), func(committed uint64) error {
+		return &InboxError{Code: InboxErrorEpoch, Field: "residency_epoch", Epoch: committed}
+	})
+}
+
 // dispositionResidencyFence admits a write that must come from the claim's own
 // residency, in the order commandClaimFence uses and for its reasons: a
 // residency below the claim's high-water mark is superseded permanently and
 // must be told so, while one above it merely has not claimed this command.
+//
+// Only claimed -> applying wants BOTH arms. Settlement wants the first alone,
+// because a successor that never claimed the command must still be able to
+// settle it; it calls dispositionResidencyHighWater directly.
 func dispositionResidencyFence(claim DispositionClaim, residency ResidencyEpoch) error {
-	if err := epochFence(uint64(claim.ResidencyEpoch), uint64(residency), func(committed uint64) error {
-		return &InboxError{Code: InboxErrorEpoch, Field: "residency_epoch", Epoch: committed}
-	}); err != nil {
+	if err := dispositionResidencyHighWater(claim, residency); err != nil {
 		return err
 	}
 	if residency != claim.ResidencyEpoch {
