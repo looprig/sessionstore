@@ -8,22 +8,34 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/looprig/storage/memstore"
 )
 
-// everyDispositionState is the durable state space, written down ONCE. It is the
-// only hand-maintained list in this file; the terminal subset, the settlement
-// kinds that reach it and the call sites that read it are all derived from it or
-// from an authority independent of the predicate under test.
-var everyDispositionState = []InboxState{
-	InboxStatePending,
-	InboxStateClaimed,
-	InboxStateApplying,
-	InboxStateApplied,
-	InboxStateRejected,
+// everyDispositionState is the durable state space, DERIVED from inbox.go's
+// constant declarations rather than written down here.
+//
+// It used to be a literal of five, guarded by a `!= 5` count. That guard was
+// worth less than it looked: a count cannot see the enum GROW — add a sixth
+// state and the literal keeps five, the count keeps passing, and every "for all
+// states" property in this file silently becomes "for the five it was shown".
+// declaredInboxStates already parses those constants for the legacy state
+// machine, so the derivation costs one call. Sorted for a stable subtest order.
+func everyDispositionState(t *testing.T) []InboxState {
+	t.Helper()
+	declared := declaredInboxStates(t)
+	states := make([]InboxState, 0, len(declared))
+	for name := range declared {
+		states = append(states, InboxState(name))
+	}
+	slices.Sort(states)
+	if len(states) < 2 {
+		t.Fatalf("vacuous: inbox.go declares %d states", len(states))
+	}
+	return states
 }
 
 // TestInboxStateTerminalPartitionsTheStateSpace pins the predicate itself over
@@ -33,14 +45,23 @@ var everyDispositionState = []InboxState{
 func TestInboxStateTerminalPartitionsTheStateSpace(t *testing.T) {
 	t.Parallel()
 	settled := []InboxState{InboxStateApplied, InboxStateRejected}
-	for _, state := range everyDispositionState {
+	states := everyDispositionState(t)
+	for _, state := range states {
 		want := slices.Contains(settled, state)
 		if got := state.terminal(); got != want {
 			t.Errorf("%q.terminal() = %v, want %v", state, got, want)
 		}
 	}
-	if len(everyDispositionState) != 5 || len(settled) != 2 {
-		t.Fatalf("vacuous: %d states, %d settled — the domain is no longer the one this test was derived over", len(everyDispositionState), len(settled))
+	// Not a count. Every state inbox.go declares must have been ruled on above,
+	// and every state named settled must be one it declares — so a sixth
+	// constant fails here instead of being silently excluded from the domain.
+	for _, state := range settled {
+		if !slices.Contains(states, state) {
+			t.Errorf("%q is named settled here and inbox.go does not declare it", state)
+		}
+	}
+	if len(states) <= len(settled) {
+		t.Fatalf("vacuous: %d declared states, %d of them settled — nothing in-flight is being ruled on", len(states), len(settled))
 	}
 }
 
@@ -53,6 +74,14 @@ func TestInboxStateTerminalPartitionsTheStateSpace(t *testing.T) {
 // is narrowed — which is exactly the mutation at issue — so the domain must come
 // from somewhere else. DispositionOutcomeKind.terminalState() is that somewhere:
 // it is the independent authority on which state each settlement stores.
+//
+// It IS hand-maintained, and an earlier comment above wrongly called
+// everyDispositionState "the only hand-maintained list in this file" while this
+// map sat below it with no staleness guard at all. It has one now:
+// TestDispositionSettlementKindsCoverTheDeclaredVocabulary parses the kind
+// constants out of disposition_settlement.go and requires this map's keys to
+// equal them, so a fourth outcome kind cannot be added without something
+// noticing that no site is ever driven with it.
 var dispositionSettlementKinds = map[DispositionOutcomeKind]func() DispositionEvidence{
 	DispositionApplied:    appliedEvidence,
 	DispositionNoOp:       noOpEvidence,
@@ -96,6 +125,11 @@ func settleDispositionOfKind(t *testing.T, kind DispositionOutcomeKind, opts ...
 // not a label: TestEveryDispositionTerminalCallSiteIsDriven parses the sources
 // and requires this set to equal the set of call sites that actually exist.
 type dispositionTerminalSite struct {
+	// fn is the QUALIFIED declaration: "(*Store).SettleDispositionCommand" for a
+	// method, a bare name for a plain function. The qualification is the fix for
+	// a real escape — keying on the bare declared name let a new, undriven site
+	// inside a method of the SAME name on ANOTHER type be attributed to this
+	// driver and pass. The receiver is part of the identity of a call site.
 	fn    string
 	what  string
 	drive func(t *testing.T, kind DispositionOutcomeKind)
@@ -110,7 +144,7 @@ type dispositionTerminalSite struct {
 // at the other two. Deriving the set is the fix; adding rows is not.
 var dispositionTerminalSites = []dispositionTerminalSite{
 	{
-		fn:   "currentDispositionEntry",
+		fn:   "(*Store).currentDispositionEntry",
 		what: "the attempt edge refuses a settled command as terminal, not as not-claimed",
 		drive: func(t *testing.T, kind DispositionOutcomeKind) {
 			s, _, settled := settleDispositionOfKind(t, kind)
@@ -125,7 +159,7 @@ var dispositionTerminalSites = []dispositionTerminalSite{
 		},
 	},
 	{
-		fn:   "SettleDispositionCommand",
+		fn:   "(*Store).SettleDispositionCommand",
 		what: "re-settling a settled command at its own revision is idempotent and reads no evidence",
 		drive: func(t *testing.T, kind DispositionOutcomeKind) {
 			s, _, settled := settleDispositionOfKind(t, kind)
@@ -176,7 +210,7 @@ func TestDispositionTerminalStatesAreReadAtEveryCallSite(t *testing.T) {
 	}
 	// The kinds must between them reach EVERY settled state, or the
 	// cross-product is a sample of the domain again.
-	for _, state := range everyDispositionState {
+	for _, state := range everyDispositionState(t) {
 		if state.terminal() && !reached[state] {
 			t.Fatalf("no settlement kind reaches terminal state %q; the domain is incomplete", state)
 		}
@@ -215,25 +249,65 @@ func TestDispositionDueViewPositiveControl(t *testing.T) {
 	}
 }
 
+// dispositionTerminalExclusions are the terminal() call sites this file
+// deliberately does NOT drive, each recorded with the test that does.
+//
+// They are the LEGACY command protocol. Folding them into the cross-product
+// would put one property under two owners; excluding them silently would make
+// "every call site" a sentence about a subset. So they are named here, and each
+// name is a measurement rather than a claim: mutating each site to
+// `== InboxStateApplied` was run, and each dies to exactly the test named.
+//
+// A stale exclusion is an error too — see below — so an entry cannot outlive
+// the site it excuses.
+var dispositionTerminalExclusions = map[string]string{
+	"inboxDue":                   "TestTerminalTransitionsLeaveTheCommandNotDueAndDirectlyGettable and FuzzInboxRecordCodec",
+	"(*Store).currentInboxEntry": "TestCommandStateMachineAdmitsExactlyItsTransitions",
+}
+
 // TestEveryDispositionTerminalCallSiteIsDriven is the reader that stops the
 // table from growing one row per review.
 //
-// It parses the disposition protocol's production sources, collects every
-// enclosing function that calls terminal(), and requires that set to EQUAL the
-// set dispositionTerminalSites drives. A fourth call site cannot be added
-// without this failing, and a driver cannot outlive the site it was written for.
-// Without it, "every call site" is a claim about code nobody re-reads.
+// # What it keys on, and therefore what it cannot see
 //
-// The scope is the disposition protocol, and that is a deliberate line rather
-// than the reach of the file-name prefix. terminal() is also read by the LEGACY
-// command protocol, in inbox.go and inbox_claim.go, whose own suite drives both
-// states through those sites; folding them in here would put one property under
-// two owners. What this guard must never allow is a FOURTH disposition site
-// appearing with no driver, which is exactly how the three known ones came to be
-// read for one state each.
+// The unit of analysis is the QUALIFIED DECLARATION — "(*Store).Method" or a
+// bare function name — over EVERY production .go file in the package root. Both
+// halves of that were escapes and are stated because a guard's docstring must
+// name its mechanism:
+//
+//   - Keying on the bare name let an undriven site inside a same-named method on
+//     another type be attributed to an existing driver and pass.
+//   - Scanning a FILENAME PREFIX while the comment said "the disposition
+//     protocol" meant the same site in a file named otherwise — inbox_recovery.go
+//     was the gate's example — was invisible. The mechanism is widened rather
+//     than the sentence narrowed: the scan is now package-wide and the legacy
+//     sites are named exclusions, so a new site in a new file fails by default.
+//
+// It still cannot see: a call in another package, in a sub-package directory, or
+// through a function value rather than a direct call. Those are outside a
+// syntactic scan and are stated rather than implied.
+//
+// And it is partly a SPELLING LOCK, which is a real cost and is accepted
+// knowingly. Inlining the predicate at a site — writing `== applied || ==
+// rejected` in place of `terminal()` — is behaviourally equivalent and this test
+// still fails it, as "the driver has outlived its site". That is the price of a
+// syntactic guard: it pins how the property is written, not only that it holds.
+// It is worth paying here because the failure it prevents is silent and the
+// failure it causes is loud and takes one line to resolve — but a reader hitting
+// it should know it is an equivalent mutant being refused, not a defect.
+//
+// # Which way it errs
+//
+// CLOSED, in every direction it has. The scan cannot resolve types, so it may
+// match some other type's terminal() — that demands a driver for a site that may
+// not need one. A call it cannot attribute to a declaration is recorded under a
+// sentinel that is in neither the driven nor the excluded set, so it fails
+// rather than disappearing. An undriven site fails; a driver whose site is gone
+// fails; an exclusion whose site is gone fails. There is no arm on which an
+// unrecognised call passes.
 func TestEveryDispositionTerminalCallSiteIsDriven(t *testing.T) {
 	t.Parallel()
-	found, err := terminalCallSites(".", "disposition_")
+	found, err := terminalCallSites(".")
 	if err != nil {
 		t.Fatalf("scan for terminal() call sites: %v", err)
 	}
@@ -247,33 +321,52 @@ func TestEveryDispositionTerminalCallSiteIsDriven(t *testing.T) {
 	slices.Sort(found)
 	slices.Sort(driven)
 	for _, fn := range found {
-		if !slices.Contains(driven, fn) {
-			t.Errorf("%s reads InboxState.terminal() and no case in dispositionTerminalSites drives it; derive the cross-product rather than adding one row", fn)
+		if slices.Contains(driven, fn) {
+			continue
 		}
+		if by, ok := dispositionTerminalExclusions[fn]; ok {
+			if by == "" {
+				t.Errorf("%s is excluded with no test named as covering it", fn)
+			}
+			continue
+		}
+		t.Errorf("%s reads InboxState.terminal() and nothing drives it: add it to dispositionTerminalSites, or to dispositionTerminalExclusions naming the test that covers it. Derive the cross-product rather than adding one row", fn)
 	}
 	for _, fn := range driven {
 		if !slices.Contains(found, fn) {
 			t.Errorf("dispositionTerminalSites drives %s, which no longer reads InboxState.terminal(); the driver has outlived its site", fn)
 		}
 	}
+	for fn := range dispositionTerminalExclusions {
+		if !slices.Contains(found, fn) {
+			t.Errorf("dispositionTerminalExclusions excuses %s, which no longer reads InboxState.terminal(); the exclusion has outlived its site", fn)
+		}
+	}
 }
 
-// terminalCallSites reports the names of the functions in root's production
-// files whose base name starts with prefix that call a method named "terminal".
+// terminalCallSites reports the qualified declarations, across every production
+// .go file in root, that call a method named "terminal" with no arguments.
 //
-// It is deliberately syntactic. It cannot resolve types, so it would also match
-// some other type's terminal() — which fails CLOSED, by demanding a driver for a
-// site that does not need one, and is the safe direction for a guard whose
-// purpose is to notice a site nobody thought about.
-func terminalCallSites(root, prefix string) ([]string, error) {
+// A method is reported as "(*Recv).Name" or "Recv.Name"; a plain function as
+// "Name". A matching call that is not inside a top-level function declaration —
+// a package-level var initializer, say — is reported under the sentinel
+// "<unattributed>", which no driver and no exclusion names, so it FAILS. That is
+// the direction a guard of this kind must err in: something it cannot explain
+// must not be something it ignores.
+func terminalCallSites(root string) ([]string, error) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, err
 	}
 	var sites []string
+	add := func(name string) {
+		if !slices.Contains(sites, name) {
+			sites = append(sites, name)
+		}
+	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
 			continue
 		}
 		fset := token.NewFileSet()
@@ -281,26 +374,124 @@ func terminalCallSites(root, prefix string) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Attribute by walking each declaration, then compare against a
+		// file-wide count so a call outside every FuncDecl cannot be lost.
+		attributed := 0
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok {
+			if !ok || fn.Body == nil {
 				continue
 			}
 			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				call, ok := n.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				selector, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || selector.Sel.Name != "terminal" || len(call.Args) != 0 {
-					return true
-				}
-				if !slices.Contains(sites, fn.Name.Name) {
-					sites = append(sites, fn.Name.Name)
+				if isTerminalCall(n) {
+					attributed++
+					add(qualifiedFuncName(fn))
 				}
 				return true
 			})
 		}
+		total := 0
+		ast.Inspect(file, func(n ast.Node) bool {
+			if isTerminalCall(n) {
+				total++
+			}
+			return true
+		})
+		if total > attributed {
+			add("<unattributed>")
+		}
 	}
 	return sites, nil
+}
+
+func isTerminalCall(n ast.Node) bool {
+	call, ok := n.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && selector.Sel.Name == "terminal" && len(call.Args) == 0
+}
+
+// qualifiedFuncName renders a declaration the way dispositionTerminalSites and
+// dispositionTerminalExclusions spell one. The receiver is part of the identity:
+// two methods of the same name on different types are two call sites.
+func qualifiedFuncName(fn *ast.FuncDecl) string {
+	if fn.Recv == nil || len(fn.Recv.List) == 0 {
+		return fn.Name.Name
+	}
+	switch receiver := fn.Recv.List[0].Type.(type) {
+	case *ast.StarExpr:
+		if ident, ok := receiver.X.(*ast.Ident); ok {
+			return "(*" + ident.Name + ")." + fn.Name.Name
+		}
+	case *ast.Ident:
+		return receiver.Name + "." + fn.Name.Name
+	}
+	// An unrecognised receiver spelling is reported as unattributable rather
+	// than collapsed to the bare name, which is the escape this guard just closed.
+	return "<unattributed>"
+}
+
+// TestDispositionSettlementKindsCoverTheDeclaredVocabulary is the staleness
+// guard dispositionSettlementKinds lacked. The cross-product's domain is that
+// map, so a kind the map does not name is a settlement outcome no call site is
+// ever driven with — the same "for all X defended by a sample" shape as the call
+// sites, one axis over.
+func TestDispositionSettlementKindsCoverTheDeclaredVocabulary(t *testing.T) {
+	t.Parallel()
+	declared := declaredDispositionOutcomeKinds(t)
+	for kind := range declared {
+		if _, ok := dispositionSettlementKinds[DispositionOutcomeKind(kind)]; !ok {
+			t.Errorf("disposition_settlement.go declares the outcome kind %q and no evidence in dispositionSettlementKinds produces it", kind)
+		}
+	}
+	for kind := range dispositionSettlementKinds {
+		if !declared[string(kind)] {
+			t.Errorf("dispositionSettlementKinds names %q, which disposition_settlement.go no longer declares", kind)
+		}
+	}
+}
+
+// declaredDispositionOutcomeKinds enumerates the DispositionOutcomeKind
+// constants from source, the way declaredInboxStates does for the states. The
+// type is named on the spec, so a const block that also declares something else
+// cannot smuggle a non-kind in.
+func declaredDispositionOutcomeKinds(t *testing.T) map[string]bool {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), "disposition_settlement.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse disposition_settlement.go: %v", err)
+	}
+	kinds := map[string]bool{}
+	for _, declaration := range file.Decls {
+		general, ok := declaration.(*ast.GenDecl)
+		if !ok || general.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range general.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			if name, ok := value.Type.(*ast.Ident); !ok || name.Name != "DispositionOutcomeKind" {
+				continue
+			}
+			for _, literal := range value.Values {
+				text, ok := literal.(*ast.BasicLit)
+				if !ok || text.Kind != token.STRING {
+					continue
+				}
+				unquoted, err := strconv.Unquote(text.Value)
+				if err != nil {
+					t.Fatalf("unquote %s: %v", text.Value, err)
+				}
+				kinds[unquoted] = true
+			}
+		}
+	}
+	if len(kinds) == 0 {
+		t.Fatal("no DispositionOutcomeKind constants were found; the enumerator is not reaching the declarations")
+	}
+	return kinds
 }

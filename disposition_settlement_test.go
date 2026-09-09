@@ -1107,7 +1107,8 @@ func TestDispositionRecordStatesRequireTheirMembers(t *testing.T) {
 	// the states whose own arm would refuse the record for a different reason a
 	// line later. That is precisely what makes each cell discriminating: gate the
 	// check on any state and that state's cell answers "state" instead.
-	for _, state := range everyDispositionState {
+	states := everyDispositionState(t)
+	for _, state := range states {
 		for _, delta := range []struct {
 			name      string
 			residency ResidencyEpoch
@@ -1123,8 +1124,8 @@ func TestDispositionRecordStatesRequireTheirMembers(t *testing.T) {
 			})
 		}
 	}
-	if len(everyDispositionState) < 2 {
-		t.Fatalf("vacuous: the generated residency rows cover %d states", len(everyDispositionState))
+	if len(states) < 2 {
+		t.Fatalf("vacuous: the generated residency rows cover %d states", len(states))
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
