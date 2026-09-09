@@ -212,52 +212,22 @@ func TestBeginDispositionAttemptRefusals(t *testing.T) {
 // satisfies a later refusal as well as the one it asserts, so the assertion
 // fails if the two are ever reordered.
 func TestBeginDispositionAttemptRefusalOrder(t *testing.T) {
-	// A settled command is terminal AND is not claimed. Terminal means stop,
-	// someone else settled this; state means reread and reconsider. Deleting
-	// the terminal refusal lets this record fall through to the not-claimed
-	// check and answer the weaker of the two.
+	// The terminal-before-not-claimed step is NOT driven here, deliberately.
+	// It used to be, for `applied` only, and then for `applied` and `rejected`
+	// after a gate found the first omission — which is the shape that keeps
+	// producing these findings: a table that grows one row per review is evidence
+	// the property has no reader. terminal() is read at three places in this
+	// protocol and this was one of them, so the property moved to
+	// TestDispositionTerminalStatesAreReadAtEveryCallSite, which drives every
+	// settlement kind against every call site and is itself held to the real call
+	// sites by TestEveryDispositionTerminalCallSiteIsDriven. A settled record is
+	// also a not-claimed record, so the ordering this case existed to pin is
+	// asserted there, over a larger domain than this table ever covered.
 	//
-	// BOTH terminal states are driven, and that is the point of the table rather
-	// than a completeness reflex. State.terminal() is a TWO-member predicate, so
-	// an applied-only case leaves `== InboxStateApplied` — the same defect one
-	// state to the side — passing the whole suite, and a Host meeting an
-	// already-REJECTED command has exactly as much need to be told to stop.
-	for _, tc := range []struct {
-		name      string
-		evidence  DispositionEvidence
-		residency ResidencyEpoch
-		want      InboxState
-	}{
-		{name: "terminal before not claimed, applied", evidence: appliedEvidence(), residency: settlementResidenc, want: InboxStateApplied},
-		{name: "terminal before not claimed, rejected", evidence: notAppliedEvidence(), residency: settlementResidenc + 3, want: InboxStateRejected},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			reader := &fakeEvidence{evidence: tc.evidence}
-			s, _, claimed := settlementFixture(t, reader)
-			applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
-			if err != nil {
-				t.Fatal(err)
-			}
-			settled, ok, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, tc.residency))
-			if err != nil || !ok || settled.Record.State != tc.want {
-				t.Fatalf("settle: %+v %v %v, want state %q", settled, ok, err, tc.want)
-			}
-			// Vacuity, both halves: the record must really be terminal, and it
-			// must really also satisfy the LATER refusal, or the ordering this
-			// case exists to pin is not being exercised at all.
-			if !settled.Record.State.terminal() || settled.Record.State == InboxStateClaimed {
-				t.Fatalf("vacuous: %q is not a terminal, not-claimed record", settled.Record.State)
-			}
-			req := beginRequest(settled)
-			req.AttemptID = "attempt/after-settlement"
-			_, err = s.BeginDispositionAttempt(context.Background(), req)
-			assertInboxCode(t, err, InboxErrorTerminal)
-			got, err := s.GetDispositionCommand(context.Background(), GetDispositionCommandRequest{TenantID: req.TenantID, SessionID: req.SessionID, CommandID: req.CommandID})
-			if err != nil || got.Revision != settled.Revision || *got.Record.Outcome != *settled.Record.Outcome {
-				t.Fatalf("refused attempt disturbed a settled record: %+v %v", got, err)
-			}
-		})
-	}
+	// Removing it also removes its "non-vacuity in both directions" guard, which
+	// could not fail: the line above it had already established the state was
+	// exactly applied or rejected. A guard that cannot fail is the thing this
+	// round exists to delete, not a thing to keep for reassurance.
 
 	// An applying record carries a claim, so the residency fence would have
 	// something to run against and would answer InboxErrorEpoch for a
@@ -1041,45 +1011,46 @@ func TestDispositionRecordStatesRequireTheirMembers(t *testing.T) {
 	// below are refused by validateDispositionOutcome and NOT by the state arm
 	// they were written for, and only asserting the field says which line
 	// actually answered.
-	for _, tc := range []struct {
+	type memberCase struct {
 		name  string
 		build func(*DispositionInboxRecord)
 		ok    bool
 		field string
-	}{
+	}
+	cases := []memberCase{
 		{name: "pending", build: func(*DispositionInboxRecord) {}, ok: true},
-		{name: "pending with a claim", build: func(r *DispositionInboxRecord) { r.Claim = claim }},
-		{name: "pending with an attempt", build: func(r *DispositionInboxRecord) { r.Attempt = attempt }},
+		{name: "pending with a claim", build: func(r *DispositionInboxRecord) { r.Claim = claim }, field: "state"},
+		{name: "pending with an attempt", build: func(r *DispositionInboxRecord) { r.Attempt = attempt }, field: "state"},
 		{name: "claimed", build: func(r *DispositionInboxRecord) { r.State, r.Claim = InboxStateClaimed, claim }, ok: true},
-		{name: "claimed with no claim", build: func(r *DispositionInboxRecord) { r.State = InboxStateClaimed }},
+		{name: "claimed with no claim", build: func(r *DispositionInboxRecord) { r.State = InboxStateClaimed }, field: "state"},
 		{name: "claimed with an attempt", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt = InboxStateClaimed, claim, attempt
-		}},
+		}, field: "state"},
 		{name: "applying", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt = InboxStateApplying, claim, attempt
 		}, ok: true},
-		{name: "applying with no attempt", build: func(r *DispositionInboxRecord) { r.State, r.Claim = InboxStateApplying, claim }},
+		{name: "applying with no attempt", build: func(r *DispositionInboxRecord) { r.State, r.Claim = InboxStateApplying, claim }, field: "state"},
 		{name: "applying with an outcome", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplying, claim, attempt, outcome
-		}},
+		}, field: "outcome.kind"},
 		{name: "applied", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplied, claim, attempt, outcome
 		}, ok: true},
 		{name: "applied with no outcome", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt = InboxStateApplied, claim, attempt
-		}},
+		}, field: "state"},
 		{name: "applied with no attempt", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Outcome = InboxStateApplied, claim, outcome
-		}},
+		}, field: "outcome.attempt_id"},
 		{name: "applied carrying a rejection outcome", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplied, claim, attempt, rejection()
-		}},
+		}, field: "outcome.kind"},
 		{name: "rejected", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateRejected, claim, attempt, rejection()
 		}, ok: true},
 		{name: "rejected carrying an applied outcome", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateRejected, claim, attempt, outcome
-		}},
+		}, field: "outcome.kind"},
 		// Reject-before-dispatch: the design's negative outcome for a command
 		// no dispatch was ever authorized for. It has no attempt by definition,
 		// and therefore no evidence-keyed outcome, and it may or may not have
@@ -1123,27 +1094,39 @@ func TestDispositionRecordStatesRequireTheirMembers(t *testing.T) {
 		{name: "rejected with an attempt but no claim", build: func(r *DispositionInboxRecord) {
 			r.State, r.Attempt, r.Outcome = InboxStateRejected, attempt, rejection()
 		}, field: "state"},
-		// A claim and an attempt that are both present must name the SAME
-		// residency. Every writer here produces that equality and the settlement
-		// fence leans on it, so the record must hold it too; a stored record
-		// where the two disagree makes "fence against the claim" and "fence
-		// against the attempt" mean different things.
-		{name: "applying whose attempt residency is above the claim's", build: func(r *DispositionInboxRecord) {
-			raised := *attempt
-			raised.ResidencyEpoch = settlementResidenc + 1
-			r.State, r.Claim, r.Attempt = InboxStateApplying, claim, &raised
-		}, field: "attempt.residency_epoch"},
-		{name: "applying whose attempt residency is below the claim's", build: func(r *DispositionInboxRecord) {
-			lowered := *attempt
-			lowered.ResidencyEpoch = settlementResidenc - 1
-			r.State, r.Claim, r.Attempt = InboxStateApplying, claim, &lowered
-		}, field: "attempt.residency_epoch"},
-		{name: "applied whose attempt residency disagrees with the claim's", build: func(r *DispositionInboxRecord) {
-			raised := *attempt
-			raised.ResidencyEpoch = settlementResidenc + 1
-			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplied, claim, &raised, outcome
-		}, field: "attempt.residency_epoch"},
-	} {
+		// The residency cross-check is state-INDEPENDENT by construction: it runs
+		// before the state switch so that "a record's own rule" holds for any
+		// assembly route. Three rows drawn from the states that happen to be
+		// convenient would defend that "for all" with a sample, which is how the
+		// terminal predicate came to be read for one state only. The rows are
+		// generated below from everyDispositionState instead — the whole durable
+		// domain, not a sample of it.
+	}
+	// One generated row per (state, direction) cell. The check runs BEFORE the
+	// state switch, so every cell must answer "attempt.residency_epoch" — including
+	// the states whose own arm would refuse the record for a different reason a
+	// line later. That is precisely what makes each cell discriminating: gate the
+	// check on any state and that state's cell answers "state" instead.
+	for _, state := range everyDispositionState {
+		for _, delta := range []struct {
+			name      string
+			residency ResidencyEpoch
+		}{{name: "above", residency: settlementResidenc + 1}, {name: "below", residency: settlementResidenc - 1}} {
+			cases = append(cases, memberCase{
+				name: string(state) + " whose attempt residency is " + delta.name + " the claim's",
+				build: func(r *DispositionInboxRecord) {
+					shifted := *attempt
+					shifted.ResidencyEpoch = delta.residency
+					r.State, r.Claim, r.Attempt, r.Outcome = state, claim, &shifted, nil
+				},
+				field: "attempt.residency_epoch",
+			})
+		}
+	}
+	if len(everyDispositionState) < 2 {
+		t.Fatalf("vacuous: the generated residency rows cover %d states", len(everyDispositionState))
+	}
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			record := base()
 			tc.build(&record)

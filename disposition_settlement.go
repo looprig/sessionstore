@@ -298,9 +298,13 @@ type DispositionOutcome struct {
 // superseded permanently, and a higher one has not claimed this command.
 //
 // StartedAt is the caller's own clock reading of when the attempt began. It is
-// recorded, not used as a guard. The settlement path is the exception and the
-// only one: a settlement caller supplies no instant at all, and
+// recorded, not used as a guard. Within THIS PROTOCOL the settlement path is the
+// only exception: a settlement caller supplies no instant at all, and
 // DispositionOutcome.SettledAt is the store's own reading — see there for why.
+// The scope is not decoration. Package-wide the store's clock is stored in
+// several places (gates, pointers and host targets all record one), so a
+// sentence that claimed settlement was the only such instant anywhere would be
+// false.
 type BeginDispositionAttemptRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID

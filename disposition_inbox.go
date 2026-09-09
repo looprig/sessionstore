@@ -590,7 +590,19 @@ func validateDispositionState(r *DispositionInboxRecord) error {
 		r.Outcome = &outcome
 	}
 	// The claim and the attempt name the SAME residency whenever both are
-	// present. This is a NARROWING of the codec and it is being made while it is
+	// present.
+	//
+	// Read this as a constraint on code NOT YET WRITTEN, because that is the
+	// load-bearing half. There is no in-package writer of a DispositionClaim at
+	// all — claims enter only through the wire decoder — so saying "every writer
+	// here already produces the equality" understates it. Any future claim edge
+	// that raises a claim's residency over a stored attempt now makes that record
+	// UNENCODABLE, and will have to clear the attempt or move both members
+	// together. That is the intended constraint and it fails closed, but it
+	// belongs written down here rather than discovered as an encode refusal by
+	// whoever builds that edge.
+	//
+	// This is a NARROWING of the codec and it is being made while it is
 	// still free: released v0.5.0's canonicalDispositionInboxRecord refuses any
 	// state but pending on BOTH the encode and the decode path, and a pending
 	// record carries neither member, so the rule is vacuous for every record any
