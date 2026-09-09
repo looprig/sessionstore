@@ -104,14 +104,20 @@ execution.
 - **The reject-before-dispatch entry point.** The record shape is storable as
   of this fix round; nothing writes one. A later step must add the transition
   that produces it, or explicitly decide not to and remove the shape.
-- **The open residency-fencing question (A8).** Settlement records
-  `req.ResidencyEpoch` but does not fence it against any high-water lease read,
-  so a Host whose residency has been superseded can still drive the terminal
-  compare-and-swap because the evidence — not the residency — is treated as the
-  authority. This is believed correct as designed (a successor must be able to
-  settle), but root or step 4 should confirm that reading rather than let it
-  stand as assumed; if confirmed, `Outcome.SettlingResidencyEpoch` should be
-  documented as "who asked", not "who validly settled this".
+- **The residency-fencing question (A8) — CLOSED, and the cost stated here was
+  wrong.** This item recorded settlement as unfenced and claimed that fencing it
+  "would need a lease read this path does not do". Root ruled on it and the fence
+  is implemented. No lease read was needed: "residency high-water" for a command
+  means the record's own committed mark, which is its CLAIM's residency, and that
+  value is already in hand at the compare-and-swap — one comparison, no `Leaser`.
+  `SettleDispositionCommand` now refuses a settling residency strictly BELOW the
+  claim's with `InboxErrorEpoch` on `residency_epoch`, before the evidence read,
+  matching the released legacy `CompleteCommand`. Only the superseded arm applies:
+  a successor holds a HIGHER residency by lease monotonicity and settles
+  unobstructed, which is what keeps "evidence is the authority" true.
+  `Outcome.SettlingResidencyEpoch` is documented as "who asked, and that they were
+  not already superseded" — still NOT "who validly settled this", because no lease
+  is read and a residency equal to the claim's may since have lapsed.
 - **Cross-store command settlement.** Host's independent agent-store adoption
   is sequenced behind this protocol and is not implemented by step 2, 3 or this
   checkpoint.
@@ -267,14 +273,19 @@ package, since no exported API accepts a `DispositionInboxRecord`; the comment
 claimed a guarantee to a caller who cannot exist and now says what the copy
 actually buys.
 
-**One advisory is deliberately left open for root or step 4.** Settlement does
-not fence the settling residency against any high-water: a Host whose residency
-has been superseded can still drive the terminal compare-and-swap, because the
-evidence is the authority and `req.ResidencyEpoch` is only recorded. This is
-believed correct as designed — a successor must be able to settle — but the
-practical consequence should be confirmed rather than assumed:
-`Outcome.SettlingResidencyEpoch` cannot be read as "who validly settled this",
-only as "who asked". Fencing it would need a lease read this path does not do.
+**One advisory was left open for root, and root has since closed it.** As
+written, this section said settlement does not fence the settling residency and
+that fencing it "would need a lease read this path does not do". The second
+clause was false and is corrected here rather than left for a later step to
+rediscover as a contradiction: the mark is the record's own claim residency,
+already read at the compare-and-swap, so the fence is one comparison and no
+`Leaser` is involved. A superseded settling residency is now refused with
+`InboxErrorEpoch` on `residency_epoch` before the evidence read; equal and higher
+residencies proceed exactly as before, so a successor still settles and evidence
+remains the authority. What survives unchanged from the original advisory is the
+limit: `Outcome.SettlingResidencyEpoch` is still only "who asked, and that they
+were not already superseded", never "who validly held the session when this
+settled", because the fence is a high-water check and not a liveness check.
 
 ### Verification evidence (2026-09-06)
 

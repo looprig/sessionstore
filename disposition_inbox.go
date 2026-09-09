@@ -557,6 +557,16 @@ func canonicalDispositionInboxRecord(r DispositionInboxRecord) (DispositionInbox
 // passed in. What the copy actually buys is that a validated record never
 // aliases the value some in-package transition assembled it from, which is what
 // makes "validate then encode" safe to read as one step.
+//
+// It also holds the one CROSS-member rule the record carries: a claim and an
+// attempt that are both present must name the SAME residency. That equality is
+// what every writer here already produces — BeginDispositionAttempt admits an
+// attempt only at the claim's own residency and then copies it, and no
+// transition rewrites either — and settlement's high-water fence leans on it,
+// because fencing against the claim is interchangeable with fencing against the
+// attempt only while the two agree. Until now nothing enforced it, so a record
+// whose two residencies disagreed decoded cleanly and made the two spellings of
+// that fence mean different things.
 func validateDispositionState(r *DispositionInboxRecord) error {
 	if r.Claim != nil {
 		claim := *r.Claim
@@ -578,6 +588,17 @@ func validateDispositionState(r *DispositionInboxRecord) error {
 			return err
 		}
 		r.Outcome = &outcome
+	}
+	// The claim and the attempt name the SAME residency whenever both are
+	// present. This is a NARROWING of the codec and it is being made while it is
+	// still free: released v0.5.0's canonicalDispositionInboxRecord refuses any
+	// state but pending on BOTH the encode and the decode path, and a pending
+	// record carries neither member, so the rule is vacuous for every record any
+	// released binary could have stored. It cannot invalidate one. After a tag
+	// that ships the post-admission states this argument expires, which is why
+	// the check lands here rather than later.
+	if r.Claim != nil && r.Attempt != nil && r.Attempt.ResidencyEpoch != r.Claim.ResidencyEpoch {
+		return inboxInvalid("attempt.residency_epoch", nil)
 	}
 	switch r.State {
 	case InboxStatePending:
@@ -615,6 +636,15 @@ func validateDispositionState(r *DispositionInboxRecord) error {
 		// bytes whose state member alone reads "rejected" are now a valid
 		// tombstone rather than a decode failure, which is one fewer accidental
 		// corruption tripwire on a state no producer writes yet.
+		//
+		// The `r.Outcome != nil` arm below is UNREACHABLE and is kept as a
+		// belt-and-braces restatement, not as the line that decides. An outcome
+		// beside no attempt is already refused above by validateDispositionOutcome,
+		// which returns field "outcome.attempt_id" the moment attempt == nil — so
+		// an attemptless rejection carrying an outcome never reaches this switch,
+		// and the tests for that shape assert THAT field rather than "state". If
+		// the outcome validation is ever moved after the switch, this arm becomes
+		// the one that answers, which is the only reason it is still written.
 		if r.Attempt == nil {
 			if r.State != InboxStateRejected || r.Outcome != nil {
 				return inboxInvalid("state", nil)

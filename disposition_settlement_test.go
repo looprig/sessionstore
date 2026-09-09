@@ -216,29 +216,48 @@ func TestBeginDispositionAttemptRefusalOrder(t *testing.T) {
 	// someone else settled this; state means reread and reconsider. Deleting
 	// the terminal refusal lets this record fall through to the not-claimed
 	// check and answer the weaker of the two.
-	t.Run("terminal before not claimed", func(t *testing.T) {
-		reader := &fakeEvidence{evidence: appliedEvidence()}
-		s, _, claimed := settlementFixture(t, reader)
-		applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
-		if err != nil {
-			t.Fatal(err)
-		}
-		settled, ok, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, settlementResidenc))
-		if err != nil || !ok || !settled.Record.State.terminal() {
-			t.Fatalf("settle: %+v %v %v", settled, ok, err)
-		}
-		if settled.Record.State == InboxStateClaimed {
-			t.Fatal("vacuous: a settled record is claimed, so it meets only one refusal")
-		}
-		req := beginRequest(settled)
-		req.AttemptID = "attempt/after-settlement"
-		_, err = s.BeginDispositionAttempt(context.Background(), req)
-		assertInboxCode(t, err, InboxErrorTerminal)
-		got, err := s.GetDispositionCommand(context.Background(), GetDispositionCommandRequest{TenantID: req.TenantID, SessionID: req.SessionID, CommandID: req.CommandID})
-		if err != nil || got.Revision != settled.Revision || *got.Record.Outcome != *settled.Record.Outcome {
-			t.Fatalf("refused attempt disturbed a settled record: %+v %v", got, err)
-		}
-	})
+	//
+	// BOTH terminal states are driven, and that is the point of the table rather
+	// than a completeness reflex. State.terminal() is a TWO-member predicate, so
+	// an applied-only case leaves `== InboxStateApplied` — the same defect one
+	// state to the side — passing the whole suite, and a Host meeting an
+	// already-REJECTED command has exactly as much need to be told to stop.
+	for _, tc := range []struct {
+		name      string
+		evidence  DispositionEvidence
+		residency ResidencyEpoch
+		want      InboxState
+	}{
+		{name: "terminal before not claimed, applied", evidence: appliedEvidence(), residency: settlementResidenc, want: InboxStateApplied},
+		{name: "terminal before not claimed, rejected", evidence: notAppliedEvidence(), residency: settlementResidenc + 3, want: InboxStateRejected},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reader := &fakeEvidence{evidence: tc.evidence}
+			s, _, claimed := settlementFixture(t, reader)
+			applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+			if err != nil {
+				t.Fatal(err)
+			}
+			settled, ok, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, tc.residency))
+			if err != nil || !ok || settled.Record.State != tc.want {
+				t.Fatalf("settle: %+v %v %v, want state %q", settled, ok, err, tc.want)
+			}
+			// Vacuity, both halves: the record must really be terminal, and it
+			// must really also satisfy the LATER refusal, or the ordering this
+			// case exists to pin is not being exercised at all.
+			if !settled.Record.State.terminal() || settled.Record.State == InboxStateClaimed {
+				t.Fatalf("vacuous: %q is not a terminal, not-claimed record", settled.Record.State)
+			}
+			req := beginRequest(settled)
+			req.AttemptID = "attempt/after-settlement"
+			_, err = s.BeginDispositionAttempt(context.Background(), req)
+			assertInboxCode(t, err, InboxErrorTerminal)
+			got, err := s.GetDispositionCommand(context.Background(), GetDispositionCommandRequest{TenantID: req.TenantID, SessionID: req.SessionID, CommandID: req.CommandID})
+			if err != nil || got.Revision != settled.Revision || *got.Record.Outcome != *settled.Record.Outcome {
+				t.Fatalf("refused attempt disturbed a settled record: %+v %v", got, err)
+			}
+		})
+	}
 
 	// An applying record carries a claim, so the residency fence would have
 	// something to run against and would answer InboxErrorEpoch for a
@@ -583,6 +602,40 @@ func TestSettleDispositionRefusesWithoutAnAttempt(t *testing.T) {
 	assertInboxCode(t, err, InboxErrorState)
 	if ok || len(reader.seen) != 0 {
 		t.Fatalf("evidence read for an unattempted command: %v %d", ok, len(reader.seen))
+	}
+}
+
+// SettledAt is the STORE's clock reading and not the caller's, because a
+// settlement caller supplies no instant at all. Every other settlement test
+// leaves the store clock at settlementNow, which is also the attempt's
+// caller-supplied StartedAt, so in those fixtures the two are the same value and
+// NOTHING can read the difference — `SettledAt: attempt.StartedAt` would pass
+// them all. Separating the two clocks is the whole test.
+func TestSettleDispositionStampsTheStoreClockAndNotTheAttempt(t *testing.T) {
+	reader := &fakeEvidence{evidence: appliedEvidence()}
+	s, clock, claimed := settlementFixture(t, reader)
+	applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := settlementNow.Add(37 * time.Minute)
+	if applying.Record.Attempt.StartedAt.Equal(later) {
+		t.Fatal("vacuous: the attempt already carries the instant the store will settle at")
+	}
+	clock.set(later)
+	settled, ok, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, settlementResidenc))
+	if err != nil || !ok {
+		t.Fatalf("settle: %v %v", ok, err)
+	}
+	if !settled.Record.Outcome.SettledAt.Equal(later) {
+		t.Fatalf("SettledAt = %s, want the store's own reading %s", settled.Record.Outcome.SettledAt, later)
+	}
+	// The caller-supplied instant on the attempt is untouched by the settlement,
+	// which is the other half of the convention: the attempt records the runtime's
+	// clock and the outcome records the store's, and neither is rewritten as the
+	// other.
+	if !settled.Record.Attempt.StartedAt.Equal(settlementNow) {
+		t.Fatalf("settlement rewrote the attempt's StartedAt: %s", settled.Record.Attempt.StartedAt)
 	}
 }
 
@@ -975,69 +1028,121 @@ func TestDispositionRecordStatesRequireTheirMembers(t *testing.T) {
 	claim := &DispositionClaim{ResidencyEpoch: settlementResidenc, ExpiresAt: settlementExpiry}
 	attempt := &DispositionAttempt{AttemptID: settlementAttempt, JournalEpoch: settlementJournal, ResidencyEpoch: settlementResidenc, StartedAt: settlementNow}
 	outcome := &DispositionOutcome{Kind: DispositionApplied, AttemptID: settlementAttempt, AttemptJournalEpoch: settlementJournal, AuthorJournalEpoch: settlementJournal, DispositionSeq: 12, EventID: "01J0000000000000000000EVNT", EventSeq: 12, SettlingResidencyEpoch: settlementResidenc, SettledAt: settlementNow}
+	// The same outcome shaped for a rejection. A row that pairs an APPLIED
+	// outcome with a rejected state is answered by outcome.kind before anything
+	// about the attempt is read, so probing "a rejection with no attempt may not
+	// carry an outcome" needs an outcome whose kind already agrees with the state.
+	rejection := func() *DispositionOutcome {
+		settled := *outcome
+		settled.Kind, settled.AuthorJournalEpoch, settled.AuthorFenceSeq, settled.EventID, settled.EventSeq = DispositionNotApplied, settlementJournal+1, 11, "", 0
+		return &settled
+	}
+	// field, where given, is the refusal's Field. It is not decoration: two rows
+	// below are refused by validateDispositionOutcome and NOT by the state arm
+	// they were written for, and only asserting the field says which line
+	// actually answered.
 	for _, tc := range []struct {
 		name  string
 		build func(*DispositionInboxRecord)
 		ok    bool
+		field string
 	}{
-		{"pending", func(*DispositionInboxRecord) {}, true},
-		{"pending with a claim", func(r *DispositionInboxRecord) { r.Claim = claim }, false},
-		{"pending with an attempt", func(r *DispositionInboxRecord) { r.Attempt = attempt }, false},
-		{"claimed", func(r *DispositionInboxRecord) { r.State, r.Claim = InboxStateClaimed, claim }, true},
-		{"claimed with no claim", func(r *DispositionInboxRecord) { r.State = InboxStateClaimed }, false},
-		{"claimed with an attempt", func(r *DispositionInboxRecord) {
+		{name: "pending", build: func(*DispositionInboxRecord) {}, ok: true},
+		{name: "pending with a claim", build: func(r *DispositionInboxRecord) { r.Claim = claim }},
+		{name: "pending with an attempt", build: func(r *DispositionInboxRecord) { r.Attempt = attempt }},
+		{name: "claimed", build: func(r *DispositionInboxRecord) { r.State, r.Claim = InboxStateClaimed, claim }, ok: true},
+		{name: "claimed with no claim", build: func(r *DispositionInboxRecord) { r.State = InboxStateClaimed }},
+		{name: "claimed with an attempt", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt = InboxStateClaimed, claim, attempt
-		}, false},
-		{"applying", func(r *DispositionInboxRecord) {
+		}},
+		{name: "applying", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt = InboxStateApplying, claim, attempt
-		}, true},
-		{"applying with no attempt", func(r *DispositionInboxRecord) { r.State, r.Claim = InboxStateApplying, claim }, false},
-		{"applying with an outcome", func(r *DispositionInboxRecord) {
+		}, ok: true},
+		{name: "applying with no attempt", build: func(r *DispositionInboxRecord) { r.State, r.Claim = InboxStateApplying, claim }},
+		{name: "applying with an outcome", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplying, claim, attempt, outcome
-		}, false},
-		{"applied", func(r *DispositionInboxRecord) {
+		}},
+		{name: "applied", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplied, claim, attempt, outcome
-		}, true},
-		{"applied with no outcome", func(r *DispositionInboxRecord) {
+		}, ok: true},
+		{name: "applied with no outcome", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt = InboxStateApplied, claim, attempt
-		}, false},
-		{"applied with no attempt", func(r *DispositionInboxRecord) {
+		}},
+		{name: "applied with no attempt", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Outcome = InboxStateApplied, claim, outcome
-		}, false},
-		{"applied carrying a rejection outcome", func(r *DispositionInboxRecord) {
-			settled := *outcome
-			settled.Kind, settled.AuthorJournalEpoch, settled.AuthorFenceSeq, settled.EventID, settled.EventSeq = DispositionNotApplied, settlementJournal+1, 11, "", 0
-			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplied, claim, attempt, &settled
-		}, false},
-		{"rejected", func(r *DispositionInboxRecord) {
-			settled := *outcome
-			settled.Kind, settled.AuthorJournalEpoch, settled.AuthorFenceSeq, settled.EventID, settled.EventSeq = DispositionNotApplied, settlementJournal+1, 11, "", 0
-			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateRejected, claim, attempt, &settled
-		}, true},
-		{"rejected carrying an applied outcome", func(r *DispositionInboxRecord) {
+		}},
+		{name: "applied carrying a rejection outcome", build: func(r *DispositionInboxRecord) {
+			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplied, claim, attempt, rejection()
+		}},
+		{name: "rejected", build: func(r *DispositionInboxRecord) {
+			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateRejected, claim, attempt, rejection()
+		}, ok: true},
+		{name: "rejected carrying an applied outcome", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateRejected, claim, attempt, outcome
-		}, false},
+		}},
 		// Reject-before-dispatch: the design's negative outcome for a command
 		// no dispatch was ever authorized for. It has no attempt by definition,
 		// and therefore no evidence-keyed outcome, and it may or may not have
 		// reached a claim first. Both shapes must be storable.
-		{"rejected before any claim", func(r *DispositionInboxRecord) { r.State = InboxStateRejected }, true},
-		{"rejected after a claim before dispatch", func(r *DispositionInboxRecord) {
+		{name: "rejected before any claim", build: func(r *DispositionInboxRecord) { r.State = InboxStateRejected }, ok: true},
+		{name: "rejected after a claim before dispatch", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim = InboxStateRejected, claim
-		}, true},
+		}, ok: true},
 		// The relaxation is exactly that wide and no wider: only a rejection
 		// may lack an attempt, it may not then carry an outcome keyed by one,
 		// and nothing may reach applied without the attempt that applied it.
-		{"rejected before dispatch carrying an outcome", func(r *DispositionInboxRecord) {
+		//
+		// These two are refused by validateDispositionOutcome, which runs BEFORE
+		// the state switch and answers "outcome.attempt_id" as soon as there is
+		// no attempt to key the outcome by. The state arm written for this shape
+		// never sees them, so the field is asserted to say which line answers.
+		{name: "rejected before dispatch carrying an outcome", build: func(r *DispositionInboxRecord) {
+			r.State, r.Outcome = InboxStateRejected, rejection()
+		}, field: "outcome.attempt_id"},
+		{name: "rejected before dispatch with a claim and an outcome", build: func(r *DispositionInboxRecord) {
+			r.State, r.Claim, r.Outcome = InboxStateRejected, claim, rejection()
+		}, field: "outcome.attempt_id"},
+		// The kind-mismatched spelling of the same two rows, kept because it is
+		// what they used to be and it answers one line EARLIER still. Naming both
+		// fields is the only way the table records which of the three lines that
+		// can refuse an attemptless rejection actually did.
+		{name: "rejected before dispatch carrying an applied outcome", build: func(r *DispositionInboxRecord) {
 			r.State, r.Outcome = InboxStateRejected, outcome
-		}, false},
-		{"rejected before dispatch with a claim and an outcome", func(r *DispositionInboxRecord) {
-			r.State, r.Claim, r.Outcome = InboxStateRejected, claim, outcome
-		}, false},
-		{"applied before any claim", func(r *DispositionInboxRecord) { r.State = InboxStateApplied }, false},
-		{"applied with a claim but no attempt", func(r *DispositionInboxRecord) {
+		}, field: "outcome.kind"},
+		{name: "applied before any claim", build: func(r *DispositionInboxRecord) { r.State = InboxStateApplied }, field: "state"},
+		{name: "applied with a claim but no attempt", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim = InboxStateApplied, claim
-		}, false},
+		}, field: "state"},
+		// The complement of the row above, and the one the terminal arm this
+		// range rewrote actually reads: an applied record whose claim is gone but
+		// whose attempt remains. Without it, dropping `r.Claim == nil` from that
+		// arm passes the whole suite.
+		{name: "applied with an attempt but no claim", build: func(r *DispositionInboxRecord) {
+			r.State, r.Attempt, r.Outcome = InboxStateApplied, attempt, outcome
+		}, field: "state"},
+		{name: "rejected with an attempt but no claim", build: func(r *DispositionInboxRecord) {
+			r.State, r.Attempt, r.Outcome = InboxStateRejected, attempt, rejection()
+		}, field: "state"},
+		// A claim and an attempt that are both present must name the SAME
+		// residency. Every writer here produces that equality and the settlement
+		// fence leans on it, so the record must hold it too; a stored record
+		// where the two disagree makes "fence against the claim" and "fence
+		// against the attempt" mean different things.
+		{name: "applying whose attempt residency is above the claim's", build: func(r *DispositionInboxRecord) {
+			raised := *attempt
+			raised.ResidencyEpoch = settlementResidenc + 1
+			r.State, r.Claim, r.Attempt = InboxStateApplying, claim, &raised
+		}, field: "attempt.residency_epoch"},
+		{name: "applying whose attempt residency is below the claim's", build: func(r *DispositionInboxRecord) {
+			lowered := *attempt
+			lowered.ResidencyEpoch = settlementResidenc - 1
+			r.State, r.Claim, r.Attempt = InboxStateApplying, claim, &lowered
+		}, field: "attempt.residency_epoch"},
+		{name: "applied whose attempt residency disagrees with the claim's", build: func(r *DispositionInboxRecord) {
+			raised := *attempt
+			raised.ResidencyEpoch = settlementResidenc + 1
+			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplied, claim, &raised, outcome
+		}, field: "attempt.residency_epoch"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			record := base()
@@ -1047,6 +1152,12 @@ func TestDispositionRecordStatesRequireTheirMembers(t *testing.T) {
 				t.Fatalf("encode = %v, want ok=%v", err, tc.ok)
 			}
 			if !tc.ok {
+				if tc.field != "" {
+					refusal := assertInboxCode(t, err, InboxErrorInvalid)
+					if refusal.Field != tc.field {
+						t.Fatalf("field = %q, want %q: a different line refused this shape", refusal.Field, tc.field)
+					}
+				}
 				return
 			}
 			decoded, err := decodeDispositionInboxRecord(value)

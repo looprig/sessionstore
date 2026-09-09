@@ -247,10 +247,16 @@ func WithDispositionEvidence(reader DispositionEvidenceReader) Option {
 // beside the attempt rather than over it, so the record keeps naming the grants
 // the dispatch was actually authorized under.
 //
-// Be exact about how much it is worth. It is settlement context recorded from
-// the REQUEST, fenced only against the claim's high-water mark, so the stored
-// invariant it carries is SettlingResidencyEpoch >= Claim.ResidencyEpoch and
-// nothing more. It is NOT proof of live residency at settlement: no lease is
+// Be exact about how much it is worth, and about which LAYER holds it. It is
+// settlement context recorded from the REQUEST, fenced only against the claim's
+// high-water mark, so the invariant it carries is
+// SettlingResidencyEpoch >= Claim.ResidencyEpoch and nothing more — and that is
+// a TRANSITION-time invariant, not a stored one. SettleDispositionCommand
+// enforces it; the record validators check only that the epoch is non-zero, so
+// a decoded record violating the inequality is accepted. It is true of every
+// record this package WRITES and not of every record the codec ADMITS.
+//
+// It is not proof of live residency at settlement either: no lease is
 // read on this path, so a Host whose residency merely equals the claim's may
 // have lost that lease since, and one naming a higher epoch is taken at its
 // word. Read it as "who asked, and that they were not already superseded" —
@@ -291,11 +297,10 @@ type DispositionOutcome struct {
 // grant the caller holds, and it must be the claim's own — a lower one has been
 // superseded permanently, and a higher one has not claimed this command.
 //
-// StartedAt is the caller's own clock reading of when the attempt began, as
-// every CALLER-SUPPLIED stored instant in this package is. It is recorded, not
-// used as a guard. It is not the only convention in this file: a settlement
-// caller supplies no instant at all, and DispositionOutcome.SettledAt is the
-// store's own reading for the reason stated there.
+// StartedAt is the caller's own clock reading of when the attempt began. It is
+// recorded, not used as a guard. The settlement path is the exception and the
+// only one: a settlement caller supplies no instant at all, and
+// DispositionOutcome.SettledAt is the store's own reading — see there for why.
 type BeginDispositionAttemptRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
