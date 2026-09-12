@@ -269,6 +269,14 @@ the cursor, so a walk covers exactly the snapshot that first page named; the
 ledger is append-only, so nothing inside that range can move. A cursor carrying
 an inflated captured tip cannot widen the snapshot.
 
+**The per-session acceptance stream is a third case, and it is strong.**
+`ListSessionCommands` pages one session's inbox by `ListOrdered`, which walks the
+IMMUTABLE acceptance order rather than a live ranked or due view. A row's order
+never moves, so nothing can be skipped or returned twice across a continuation,
+and the bound is a row's own order rather than an opaque token. It also fails
+closed, like the journal readers and unlike the due views: see the consumption
+section below for why a consumption stream cannot step over a row.
+
 **No single row fails a COUNTED page.** In the weak views above, and only there,
 every per-row refusal is counted and stepped over —
 `SessionPage.UnreadableSkipped`, `DueGatePage.Unreadable`,
@@ -734,6 +742,67 @@ application behind a lapsed TTL. `RejectCommand` keeps the live-claim
 requirement, because it decides something that has not happened; its lease epoch
 is optional, and a caller that names none is the deadline reconciler, which may
 settle a `pending` or lapsed-`claimed` command and nothing else.
+
+## Consuming a session's commands: an immutable stream and a durable cursor
+
+`ListSessionCommands` and `ListDueCommands` read the SAME inbox rows through two
+different provider views, and neither is derivable from the other.
+
+`ListDueCommands` answers "what in this SHARD needs attention by this instant".
+It is cross-session by its request type, ordered by a deadline, and a terminal
+command leaves it altogether because `inboxDue` files one NOT DUE. Every one of
+those is right for a reconciler and wrong for a consumer.
+
+`ListSessionCommands(tenant, session, afterOrder, limit)` answers "what has this
+SESSION accepted, in the order it accepted it, after here". The bound is the
+caller's and the ordering is the store's: a consumer that sorted a page for
+itself would be inferring an order rather than reading one. Terminal commands
+stay in the stream, which is what makes a cursor meaningful at all.
+
+**It fails closed on a row it cannot vouch for**, which is the deliberate
+divergence from the due sweep. The due view counts an unreadable row and steps
+over it, because failing would switch reconciliation off for every tenant in the
+shard. Neither half of that argument holds here: a consumer handed a page with a
+row quietly missing would act on what it received and then advance its durable
+cursor PAST the row, so the command would never be applied and nothing would
+look at it again — and the blast radius of failing is one session rather than one
+shard. The cost is real and is not hidden: one unreadable row stops that
+session's consumer at that row until the row is repaired, and there is no skip,
+no quarantine and no reporting channel.
+
+`LoadCommandCursor` and `SaveCommandCursor` are the durable consumption cursor —
+one permanent, epoch-fenced row per session, in its own unsharded namespace.
+`LoadCommandCursor` answers the ZERO ENTRY for a session that has recorded none,
+because "nothing has been consumed" is exactly the starting position of a fresh
+consumer. That answer is narrow: an undecodable stored row is NOT an absent
+cursor, it is a fence that cannot be evaluated, and it is reported as the typed
+failure it is.
+
+A save is fenced twice, epoch first and position second, for the reason
+`setPointer` gives: a superseded lease carrying a newer position must be told it
+has lost the session, and a live lease carrying an older position must be told
+its position is stale. An equal epoch and an equal position are both admitted, so
+one grant may save many times and a save retried after an ambiguous outcome
+succeeds. The write itself is a revision compare-and-swap, so concurrent savers
+under one epoch are ordered by the provider and the loser is told to retry rather
+than overwriting the winner. Every refusal is one of exactly three typed answers:
+you have lost the session, your position is stale, or you raced.
+
+**The cursor is consumption context, not authority**, in the same sense
+`SettlingResidencyEpoch` is settlement context. It does not prove any command
+was applied — a consumer that rejected three of ten writes the same row as one
+that applied all ten, and the authoritative state of a command is its own
+record's. It does not prove the saver held a LIVE lease at the swap; no path in
+this package reads a live lease on this record, so read the stored epoch as "who
+asked, at or above the mark". It authorizes nothing. It says nothing about
+commands above it. And zero does not prove nothing was consumed — it proves
+nothing was RECORDED, so a consumer that crashed before its first save leaves
+zero, and a successor re-presents work it is relying on being idempotent by
+identity.
+
+Both operations verify the session's collision witnesses, like every other named
+read here, so a session with no durable data at all is refused rather than
+answered about. A save is the operation that BINDS such a session.
 
 ## Recovering an application from the journal
 

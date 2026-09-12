@@ -402,6 +402,7 @@ const (
 	InboxErrorIdentity        InboxErrorCode = "identity"
 	InboxErrorConflict        InboxErrorCode = "conflict"
 	InboxErrorEpoch           InboxErrorCode = "epoch"
+	InboxErrorOrder           InboxErrorCode = "order"
 	InboxErrorClaimHeld       InboxErrorCode = "claim_held"
 	InboxErrorClaimLost       InboxErrorCode = "claim_lost"
 	InboxErrorDeadline        InboxErrorCode = "deadline"
@@ -419,13 +420,21 @@ const (
 // input or stage and never carries a provider name, a key, or any part of the
 // command's private payload.
 //
-// Epoch is populated only for InboxErrorEpoch and Revision only for
-// InboxErrorConflict, each carrying the value that is itself the answer, as
-// CatalogError does for the same two codes.
+// Revision is populated only for InboxErrorConflict, carrying the value that is
+// itself the answer, as CatalogError does for that code.
+//
+// Epoch and Order are the two consumption-cursor high-water marks, and BOTH are
+// populated for BOTH of the two fence codes — InboxErrorEpoch and
+// InboxErrorOrder — rather than one each. That is deliberate and is the rule
+// PointerError already follows: a caller that has to raise its epoch will have
+// to satisfy the position too, and one round trip is enough to learn both. Epoch
+// is additionally populated for InboxErrorEpoch on every other path that fences
+// an epoch. Neither member means anything for any other code.
 type InboxError struct {
 	Code     InboxErrorCode
 	Field    string
 	Epoch    uint64
+	Order    uint64
 	Revision uint64
 	Cause    error
 }
