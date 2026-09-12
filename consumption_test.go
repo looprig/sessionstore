@@ -1,6 +1,7 @@
 package sessionstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,9 +15,9 @@ import (
 )
 
 const (
-	// consumptionEpoch is the lease epoch the cursor fixture writes under. It
-	// is deliberately neither zero nor one, so a fence that compared against a
-	// constant rather than against the stored high-water is visible.
+	// consumptionEpoch is the residency epoch the cursor fixture writes under.
+	// It is deliberately neither zero nor one, so a fence that compared against
+	// a constant rather than against the stored high-water is visible.
 	consumptionEpoch = uint64(9)
 
 	// consumptionOrder is a cursor position that is not any order the provider
@@ -26,18 +27,43 @@ const (
 )
 
 // consumptionUpdatedAt is the instant the fixture's clock reads. It is the
-// inbox claim fixture's own start, because the state matrix this file ranges
-// over builds claimed and applying records through the real claim operation,
-// and a clock later than that fixture's expiry would refuse every one of them.
-var consumptionUpdatedAt = inboxClaimStart
+// disposition settlement fixture's own start, because the state matrix this
+// file ranges over builds claimed and applying records through the real
+// settlement operations, and a clock later than that fixture's expiry would
+// refuse them.
+var consumptionUpdatedAt = settlementNow
 
+// consumptionFixture opens a store on a DISPOSITION-bound session, which is the
+// only kind of session anything can consume commands for.
+//
+// The catalog is created rather than assumed, and that is the point of the
+// helper rather than a convenience: AcquireResidency refuses any session whose
+// binding is not ProtocolModeDisposition, so a fixture that consumed a legacy
+// session would be testing an operation no Host can reach.
 func consumptionFixture(t *testing.T, backend *storage.Composite) *Store {
 	t.Helper()
-	return openStore(t, backend, WithClock(newMovableClock(consumptionUpdatedAt)))
+	store := openStore(t, backend, WithClock(newMovableClock(consumptionUpdatedAt)))
+	createDispositionCatalog(t, store)
+	return store
 }
 
-func testSaveCursorRequest(epoch, order uint64) SaveCommandCursorRequest {
-	return SaveCommandCursorRequest{
+// createDispositionCatalogFor is createDispositionCatalog for a session other
+// than the fixture's own, so the cross-session tests have real neighbours
+// rather than scopes that merely fail to exist.
+func createDispositionCatalogFor(
+	t *testing.T, s *Store, tenant sessionwire.TenantID, session sessionwire.SessionID,
+) {
+	t.Helper()
+	req := testCreateRequest()
+	req.TenantID, req.SessionID = tenant, session
+	req.Binding = testSessionBinding()
+	if _, _, err := s.CreateCatalogEntry(context.Background(), req); err != nil {
+		t.Fatalf("CreateCatalogEntry(%q,%q): %v", tenant, session, err)
+	}
+}
+
+func testSaveCursorRequest(epoch, order uint64) SaveDispositionCommandCursorRequest {
+	return SaveDispositionCommandCursorRequest{
 		TenantID:      catalogTenant,
 		SessionID:     catalogSession,
 		LeaseEpoch:    epoch,
@@ -45,30 +71,30 @@ func testSaveCursorRequest(epoch, order uint64) SaveCommandCursorRequest {
 	}
 }
 
-func testLoadCursorRequest() LoadCommandCursorRequest {
-	return LoadCommandCursorRequest{TenantID: catalogTenant, SessionID: catalogSession}
+func testLoadCursorRequest() LoadDispositionCommandCursorRequest {
+	return LoadDispositionCommandCursorRequest{TenantID: catalogTenant, SessionID: catalogSession}
 }
 
-func mustSaveCursor(t *testing.T, store *Store, epoch, order uint64) CommandCursorEntry {
+func mustSaveCursor(t *testing.T, store *Store, epoch, order uint64) DispositionCommandCursorEntry {
 	t.Helper()
-	entry, err := store.SaveCommandCursor(context.Background(), testSaveCursorRequest(epoch, order))
+	entry, err := store.SaveDispositionCommandCursor(context.Background(), testSaveCursorRequest(epoch, order))
 	if err != nil {
-		t.Fatalf("SaveCommandCursor(epoch=%d order=%d): %v", epoch, order, err)
+		t.Fatalf("SaveDispositionCommandCursor(epoch=%d order=%d): %v", epoch, order, err)
 	}
 	return entry
 }
 
-func mustLoadCursor(t *testing.T, store *Store) CommandCursorEntry {
+func mustLoadCursor(t *testing.T, store *Store) DispositionCommandCursorEntry {
 	t.Helper()
-	entry, err := store.LoadCommandCursor(context.Background(), testLoadCursorRequest())
+	entry, err := store.LoadDispositionCommandCursor(context.Background(), testLoadCursorRequest())
 	if err != nil {
-		t.Fatalf("LoadCommandCursor: %v", err)
+		t.Fatalf("LoadDispositionCommandCursor: %v", err)
 	}
 	return entry
 }
 
-// admitSessionCommands admits count commands into one session, in an order the
-// caller chose, and returns the CommandIDs in ADMISSION order.
+// admitSessionCommands admits count disposition commands into one session, and
+// returns the CommandIDs in ADMISSION order.
 //
 // The identities are minted so that their lexical order is the REVERSE of the
 // admission order. That is the whole point of this helper: if the listing under
@@ -89,10 +115,14 @@ func admitSessionCommands(
 		// The identity carries its session, so two sessions in one store never
 		// collide, and its ordinal DESCENDS, so lexical order is the reverse of
 		// admission order.
-		command := sessionwire.CommandID(fmt.Sprintf("command-%s-%s-%s-%04d", tenant, session, tag, count-i))
-		req := testAdmitRequest()
+		command := sessionwire.CommandID(fmt.Sprintf("command/%s/%s/%s/%04d", tenant, session, tag, count-i))
+		req := dispositionRequest()
 		req.TenantID, req.SessionID, req.CommandID = tenant, session, command
-		mustAdmit(t, store, req)
+		if _, created, err := store.AdmitDispositionCommand(context.Background(), req); err != nil {
+			t.Fatalf("AdmitDispositionCommand(%s): %v", command, err)
+		} else if !created {
+			t.Fatalf("AdmitDispositionCommand(%s) reported an existing command for a fresh identity", command)
+		}
 		admitted = append(admitted, command)
 	}
 	return admitted
@@ -109,18 +139,19 @@ func walkSessionCommands(
 	session sessionwire.SessionID,
 	after uint64,
 	limit int,
-) []InboxEntry {
+) []DispositionInboxEntry {
 	t.Helper()
-	var seen []InboxEntry
+	var seen []DispositionInboxEntry
 	for pages := 0; ; pages++ {
 		if pages > 1000 {
 			t.Fatal("paging did not terminate")
 		}
-		page, err := store.ListSessionCommands(context.Background(), ListSessionCommandsRequest{
-			TenantID: tenant, SessionID: session, AfterOrder: after, Limit: limit,
-		})
+		page, err := store.ListSessionDispositionCommands(
+			context.Background(), ListSessionDispositionCommandsRequest{
+				TenantID: tenant, SessionID: session, AfterOrder: after, Limit: limit,
+			})
 		if err != nil {
-			t.Fatalf("ListSessionCommands(after=%d limit=%d): %v", after, limit, err)
+			t.Fatalf("ListSessionDispositionCommands(after=%d limit=%d): %v", after, limit, err)
 		}
 		if limit > 0 && len(page.Commands) > limit {
 			t.Fatalf("page returned %d rows over a limit of %d", len(page.Commands), limit)
@@ -142,6 +173,156 @@ func walkSessionCommands(
 		}
 		seen = append(seen, page.Commands...)
 		after = page.NextAfterOrder
+	}
+}
+
+// walkExactly is walkSessionCommands for a caller that is about to INDEX the
+// result. The count is stated rather than assumed, because a walk that returned
+// fewer rows than expected would otherwise fail as an index panic — and a panic
+// is not an assertion: it says a test crashed, not that a claim is false.
+func walkExactly(
+	t *testing.T,
+	store *Store,
+	tenant sessionwire.TenantID,
+	session sessionwire.SessionID,
+	after uint64,
+	limit int,
+	want int,
+) []DispositionInboxEntry {
+	t.Helper()
+	seen := walkSessionCommands(t, store, tenant, session, after, limit)
+	if len(seen) != want {
+		t.Fatalf("walk after %d returned %d commands, want %d", after, len(seen), want)
+	}
+	return seen
+}
+
+// ---------------------------------------------------------------------------
+// The release blocker this work exists to close
+// ---------------------------------------------------------------------------
+
+// TestBothOperationsReachASessionAHostCanOwn is the test the first version of
+// this file did not have, and its absence is what let a whole release be built
+// against an inbox no consumer could use.
+//
+// The chain is short and entirely outside this file. Host acquires residency
+// through Store.AcquireResidency; AcquireResidency REFUSES any session whose
+// catalog binding is not ProtocolModeDisposition; a session's protocol mode is
+// a create-only immutable pin. So every session a Host can consume commands for
+// is disposition-bound, and an operation that pins ProtocolModeLegacy on that
+// scope is refused with a catalog conflict, permanently, with no retry that can
+// help. The first version of this file did exactly that, and every one of its
+// twenty tests passed, because every one of them used a legacy session.
+//
+// This test is therefore not about the store's internals at all. It asserts
+// that the three operations are reachable on the ONE kind of session that
+// matters, and it is deliberately written against the catalog a Host's own
+// residency would require rather than against a scope this package invented.
+func TestBothOperationsReachASessionAHostCanOwn(t *testing.T) {
+	t.Parallel()
+
+	store := openStore(t, memstore.New(), WithClock(newMovableClock(consumptionUpdatedAt)))
+	createDispositionCatalog(t, store)
+
+	// The binding this session carries is the one AcquireResidency demands.
+	if got := testSessionBinding().ProtocolMode; got != ProtocolModeDisposition {
+		t.Fatalf("the fixture binding is %q, so this test would prove nothing", got)
+	}
+
+	admitted := admitSessionCommands(t, store, catalogTenant, catalogSession, "host", 2)
+	page, err := store.ListSessionDispositionCommands(
+		context.Background(), ListSessionDispositionCommandsRequest{
+			TenantID: catalogTenant, SessionID: catalogSession, Limit: 10,
+		})
+	if err != nil {
+		t.Fatalf("ListSessionDispositionCommands on a session Host can own: %v", err)
+	}
+	if len(page.Commands) != len(admitted) {
+		t.Fatalf("listing returned %d rows, want %d", len(page.Commands), len(admitted))
+	}
+
+	if _, err := store.LoadDispositionCommandCursor(context.Background(), testLoadCursorRequest()); err != nil {
+		t.Fatalf("LoadDispositionCommandCursor on a session Host can own: %v", err)
+	}
+	saved, err := store.SaveDispositionCommandCursor(
+		context.Background(), testSaveCursorRequest(consumptionEpoch, page.Commands[0].AcceptedOrder))
+	if err != nil {
+		t.Fatalf("SaveDispositionCommandCursor on a session Host can own: %v", err)
+	}
+	if saved.Cursor.ConsumedOrder != page.Commands[0].AcceptedOrder {
+		t.Fatalf("saved position = %d, want %d", saved.Cursor.ConsumedOrder, page.Commands[0].AcceptedOrder)
+	}
+
+	// The CONTROL, and it is what makes the assertions above mean "disposition
+	// works" rather than "everything works": the LEGACY command family is still
+	// refused on this session, so the exclusivity that made the first version
+	// unusable is real and is not something this change quietly removed.
+	_, _, err = store.AdmitCommand(context.Background(), testAdmitRequest())
+	var catalog *CatalogError
+	if !errors.As(err, &catalog) || catalog.Code != CatalogErrorConflict {
+		t.Fatalf("legacy AdmitCommand on a disposition session = %v, want a catalog conflict", err)
+	}
+}
+
+// TestCursorOperationsRefuseASessionWithoutADispositionCatalog states the
+// boundary of the zero-means-none answer, in the direction that is easy to
+// over-read.
+//
+// Both cursor operations and the listing are NAMED READS of the disposition
+// family and take that family's authority check: the catalog is read first,
+// which verifies the session's collision witnesses and requires
+// ProtocolModeDisposition. So "Load returns zero when none has been recorded"
+// answers about a session that EXISTS and has no cursor; it does not promise
+// that Load always succeeds. A session with no catalog at all, and a session
+// bound to another protocol, are both refused.
+//
+// This is a RESIDUE, NOT A CLOSURE. It enumerates the two cursor operations and
+// the listing, and two ways a session can fail to be a disposition session. It
+// does NOT claim to enumerate every operation in this package whose answer
+// depends on a catalog or a bound scope, nor every way a catalog read can fail,
+// and a reader must not take the absence of an operation or a failure mode from
+// this list as evidence about it.
+func TestCursorOperationsRefuseASessionWithoutADispositionCatalog(t *testing.T) {
+	t.Parallel()
+
+	const absent = sessionwire.SessionID("session-never-created")
+	const legacy = sessionwire.SessionID("session-legacy")
+
+	store := consumptionFixture(t, memstore.New())
+	// A real LEGACY session, created through the ordinary path, so the second
+	// arm is about a protocol mismatch rather than about absence again.
+	legacyReq := testCreateRequest()
+	legacyReq.SessionID = legacy
+	if _, _, err := store.CreateCatalogEntry(context.Background(), legacyReq); err != nil {
+		t.Fatalf("CreateCatalogEntry(legacy): %v", err)
+	}
+
+	for _, session := range []sessionwire.SessionID{absent, legacy} {
+		t.Run(string(session), func(t *testing.T) {
+			if _, err := store.LoadDispositionCommandCursor(context.Background(),
+				LoadDispositionCommandCursorRequest{TenantID: catalogTenant, SessionID: session}); err == nil {
+				t.Fatal("LoadDispositionCommandCursor answered about a non-disposition session")
+			}
+			if _, err := store.SaveDispositionCommandCursor(context.Background(),
+				SaveDispositionCommandCursorRequest{
+					TenantID: catalogTenant, SessionID: session,
+					LeaseEpoch: consumptionEpoch, ConsumedOrder: consumptionOrder,
+				}); err == nil {
+				t.Fatal("SaveDispositionCommandCursor wrote to a non-disposition session")
+			}
+			if _, err := store.ListSessionDispositionCommands(context.Background(),
+				ListSessionDispositionCommandsRequest{
+					TenantID: catalogTenant, SessionID: session, Limit: 10,
+				}); err == nil {
+				t.Fatal("ListSessionDispositionCommands answered about a non-disposition session")
+			}
+		})
+	}
+
+	// The CONTROL. Without it the three refusals above would also pass against
+	// a store that refused every request naming any session at all.
+	if _, err := store.LoadDispositionCommandCursor(context.Background(), testLoadCursorRequest()); err != nil {
+		t.Fatalf("the fixture's own disposition session was refused: %v", err)
 	}
 }
 
@@ -171,9 +352,9 @@ func TestListSessionCommandsIsAscendingAcceptanceOrderAtEveryLimitAndBound(t *te
 				t.Fatalf("walk returned %d commands, want %d", len(seen), len(admitted))
 			}
 			for i, entry := range seen {
-				if entry.Record.CommandID != admitted[i] {
+				if entry.Record.Descriptor.CommandID != admitted[i] {
 					t.Fatalf("position %d = %q, want %q: the walk is not in admission order",
-						i, entry.Record.CommandID, admitted[i])
+						i, entry.Record.Descriptor.CommandID, admitted[i])
 				}
 				if i > 0 && entry.AcceptedOrder <= seen[i-1].AcceptedOrder {
 					t.Fatalf("order at %d (%d) does not exceed its predecessor (%d)",
@@ -183,7 +364,7 @@ func TestListSessionCommandsIsAscendingAcceptanceOrderAtEveryLimitAndBound(t *te
 		})
 	}
 
-	full := walkSessionCommands(t, store, catalogTenant, catalogSession, 0, 100)
+	full := walkExactly(t, store, catalogTenant, catalogSession, 0, 100, len(admitted))
 	for cut := range full {
 		bound := full[cut].AcceptedOrder
 		suffix := walkSessionCommands(t, store, catalogTenant, catalogSession, bound, 5)
@@ -191,9 +372,9 @@ func TestListSessionCommandsIsAscendingAcceptanceOrderAtEveryLimitAndBound(t *te
 			t.Fatalf("after order %d the walk returned %d rows, want %d", bound, len(suffix), len(full)-cut-1)
 		}
 		for i, entry := range suffix {
-			if entry.Record.CommandID != full[cut+1+i].Record.CommandID {
-				t.Fatalf("after order %d, position %d = %q, want %q",
-					bound, i, entry.Record.CommandID, full[cut+1+i].Record.CommandID)
+			if entry.Record.Descriptor.CommandID != full[cut+1+i].Record.Descriptor.CommandID {
+				t.Fatalf("after order %d, position %d = %q, want %q", bound, i,
+					entry.Record.Descriptor.CommandID, full[cut+1+i].Record.Descriptor.CommandID)
 			}
 		}
 	}
@@ -210,6 +391,8 @@ func TestListSessionCommandsReadsOneSessionAndNotTheShardAroundIt(t *testing.T) 
 	store := consumptionFixture(t, memstore.New())
 	const otherSession = sessionwire.SessionID("session-b")
 	const otherTenant = sessionwire.TenantID("tenant-b")
+	createDispositionCatalogFor(t, store, catalogTenant, otherSession)
+	createDispositionCatalogFor(t, store, otherTenant, catalogSession)
 
 	before := admitSessionCommands(t, store, catalogTenant, otherSession, "before", 3)
 	foreign := admitSessionCommands(t, store, otherTenant, catalogSession, "foreign", 3)
@@ -225,11 +408,12 @@ func TestListSessionCommandsReadsOneSessionAndNotTheShardAroundIt(t *testing.T) 
 		foreignIDs[id] = true
 	}
 	for i, entry := range seen {
-		if entry.Record.TenantID != catalogTenant || entry.Record.SessionID != catalogSession {
-			t.Fatalf("row %d belongs to (%q,%q)", i, entry.Record.TenantID, entry.Record.SessionID)
+		d := entry.Record.Descriptor
+		if d.TenantID != catalogTenant || d.SessionID != catalogSession {
+			t.Fatalf("row %d belongs to (%q,%q)", i, d.TenantID, d.SessionID)
 		}
-		if entry.Record.CommandID != mine[i] {
-			t.Fatalf("row %d = %q, want %q", i, entry.Record.CommandID, mine[i])
+		if d.CommandID != mine[i] {
+			t.Fatalf("row %d = %q, want %q", i, d.CommandID, mine[i])
 		}
 	}
 	// The CONTROL: the neighbours exist and are readable in their own
@@ -246,56 +430,118 @@ func TestListSessionCommandsReadsOneSessionAndNotTheShardAroundIt(t *testing.T) 
 	}
 }
 
+// dispositionStates builds one admitted command into each durable state through
+// the REAL operations, so a state in this map is one the machine produces
+// rather than one a fixture asserts it accepts.
+//
+// It is keyed on the state's own name and each entry returns the entry the
+// transition left behind. `applied` runs the whole settlement protocol —
+// claim, attempt, evidence — because that is the only way a disposition command
+// reaches a terminal state.
+var dispositionStates = map[string]func(t *testing.T, s *Store, entry DispositionInboxEntry) DispositionInboxEntry{
+	"pending": func(_ *testing.T, _ *Store, entry DispositionInboxEntry) DispositionInboxEntry {
+		return entry
+	},
+	"claimed": func(t *testing.T, s *Store, entry DispositionInboxEntry) DispositionInboxEntry {
+		return fileDispositionClaim(t, s, entry,
+			DispositionClaim{ResidencyEpoch: settlementResidenc, ExpiresAt: settlementExpiry})
+	},
+	"applying": func(t *testing.T, s *Store, entry DispositionInboxEntry) DispositionInboxEntry {
+		claimed := fileDispositionClaim(t, s, entry,
+			DispositionClaim{ResidencyEpoch: settlementResidenc, ExpiresAt: settlementExpiry})
+		applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+		if err != nil {
+			t.Fatalf("BeginDispositionAttempt: %v", err)
+		}
+		return applying
+	},
+}
+
 // TestListSessionCommandsReturnsEveryDurableStateUnlikeTheDueView is where the
-// new listing and ListDueCommands are held apart.
+// new listing and ListDueDispositionCommands are held apart.
 //
 // They read the SAME rows through two different provider views, and the
-// difference is not a filter this package applies: inboxDue files a terminal
-// command NOT DUE, so it leaves the due view the instant it settles, while the
-// acceptance-order stream never loses a row. A consumer that read the due view
-// instead would silently stop seeing everything it had finished — which is
-// exactly the mistake "filter the cross-session due query per session" would
-// have been.
+// difference is not a filter this package applies: dispositionInboxDue files a
+// terminal command NOT DUE, so it leaves the due view the instant it settles,
+// while the acceptance-order stream never loses a row. A consumer that read the
+// due view instead would silently stop seeing everything it had finished —
+// which is exactly the mistake "filter the cross-session due query per session"
+// would have been.
 func TestListSessionCommandsReturnsEveryDurableStateUnlikeTheDueView(t *testing.T) {
 	t.Parallel()
 
-	for name, build := range inboxStates {
+	for name, build := range dispositionStates {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			store := consumptionFixture(t, memstore.New())
-			entry := build(t, store, mustAdmit(t, store, testAdmitRequest()))
-
-			seen := walkSessionCommands(t, store, catalogTenant, catalogSession, 0, 100)
-			if len(seen) != 1 {
-				t.Fatalf("acceptance-order listing returned %d rows in state %q, want 1", len(seen), name)
+			admitted, _, err := store.AdmitDispositionCommand(context.Background(), dispositionRequest())
+			if err != nil {
+				t.Fatalf("AdmitDispositionCommand: %v", err)
 			}
+			entry := build(t, store, admitted)
+
+			seen := walkExactly(t, store, catalogTenant, catalogSession, 0, 100, 1)
 			if seen[0].Record.State != entry.Record.State {
 				t.Fatalf("listed state = %q, want %q", seen[0].Record.State, entry.Record.State)
 			}
 			if seen[0].AcceptedOrder != entry.AcceptedOrder {
 				t.Fatalf("listed order = %d, want %d", seen[0].AcceptedOrder, entry.AcceptedOrder)
 			}
-
-			scope, err := store.deriveSessionScope(catalogTenant, catalogSession)
-			if err != nil {
-				t.Fatalf("deriveSessionScope: %v", err)
-			}
-			due, err := store.ListDueCommands(context.Background(), ListDueCommandsRequest{
-				Shard:         int(scope.ControlShard),
-				DueAtOrBefore: inboxDeadline.Add(time.Hour),
-				Limit:         100,
-			})
-			if err != nil {
-				t.Fatalf("ListDueCommands: %v", err)
-			}
-			wantDue := 0
-			if !entry.Record.State.terminal() {
-				wantDue = 1
-			}
-			if len(due.Commands) != wantDue {
-				t.Fatalf("due view returned %d rows in state %q, want %d", len(due.Commands), name, wantDue)
-			}
 		})
+	}
+}
+
+// TestASettledCommandLeavesTheDueViewAndStaysInTheStream is the other half of
+// the comparison, and it needs its own test because reaching a terminal
+// disposition state requires the whole settlement protocol and an injected
+// evidence reader.
+//
+// This is the property a cursor exists for. If the consumption stream dropped
+// settled commands the way the due view does, a cursor would be meaningless:
+// the position would name a row the stream can no longer produce.
+func TestASettledCommandLeavesTheDueViewAndStaysInTheStream(t *testing.T) {
+	t.Parallel()
+
+	s, _, claimed := settlementFixture(t, &fakeEvidence{evidence: appliedEvidence()})
+	scope, err := s.deriveSessionScope(catalogTenant, catalogSession)
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	dueAt := func() int {
+		t.Helper()
+		page, err := s.ListDueDispositionCommands(context.Background(), ListDueDispositionCommandsRequest{
+			Shard: int(scope.ControlShard), DueAtOrBefore: inboxDeadline.Add(time.Hour), Limit: 100,
+		})
+		if err != nil {
+			t.Fatalf("ListDueDispositionCommands: %v", err)
+		}
+		return len(page.Commands)
+	}
+
+	// The CONTROL, before settlement: the command is in BOTH views.
+	walkExactly(t, s, catalogTenant, catalogSession, 0, 100, 1)
+	if got := dueAt(); got != 1 {
+		t.Fatalf("due view holds %d rows before settlement, want 1", got)
+	}
+
+	applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+	if err != nil {
+		t.Fatalf("BeginDispositionAttempt: %v", err)
+	}
+	settled, _, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, settlementResidenc))
+	if err != nil {
+		t.Fatalf("SettleDispositionCommand: %v", err)
+	}
+	if !settled.Record.State.terminal() {
+		t.Fatalf("state after settlement = %q, want a terminal state", settled.Record.State)
+	}
+
+	stream := walkExactly(t, s, catalogTenant, catalogSession, 0, 100, 1)
+	if stream[0].Record.State != settled.Record.State {
+		t.Fatalf("stream state = %q, want %q", stream[0].Record.State, settled.Record.State)
+	}
+	if got := dueAt(); got != 0 {
+		t.Fatalf("due view holds %d rows after settlement, want 0", got)
 	}
 }
 
@@ -320,11 +566,9 @@ func TestASessionCommandThisReaderCannotDecodeFailsThePage(t *testing.T) {
 	}
 
 	// The CONTROL, before the corruption: both views read all five.
-	if got := walkSessionCommands(t, store, catalogTenant, catalogSession, 0, 100); len(got) != 5 {
-		t.Fatalf("control walk returned %d rows, want 5", len(got))
-	}
+	walkExactly(t, store, catalogTenant, catalogSession, 0, 100, 5)
 
-	id := inboxID(scope, admitted[2])
+	id := dispositionInboxID(scope, admitted[2])
 	stored, err := store.backend.OrderedIndex.Get(context.Background(), id)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -334,18 +578,18 @@ func TestASessionCommandThisReaderCannotDecodeFailsThePage(t *testing.T) {
 		t.Fatalf("Update: %v", err)
 	}
 
-	_, err = store.ListSessionCommands(context.Background(), ListSessionCommandsRequest{
+	_, err = store.ListSessionDispositionCommands(context.Background(), ListSessionDispositionCommandsRequest{
 		TenantID: catalogTenant, SessionID: catalogSession, Limit: 100,
 	})
 	assertInboxCode(t, err, InboxErrorMalformed)
 
-	due, err := store.ListDueCommands(context.Background(), ListDueCommandsRequest{
+	due, err := store.ListDueDispositionCommands(context.Background(), ListDueDispositionCommandsRequest{
 		Shard:         int(scope.ControlShard),
 		DueAtOrBefore: inboxDeadline.Add(time.Hour),
 		Limit:         100,
 	})
 	if err != nil {
-		t.Fatalf("ListDueCommands: %v", err)
+		t.Fatalf("ListDueDispositionCommands: %v", err)
 	}
 	if due.Unreadable != 1 || len(due.Commands) != 4 {
 		t.Fatalf("due view reported %d unreadable and %d commands, want 1 and 4",
@@ -363,7 +607,7 @@ func TestListSessionCommandsRefusesAnUnusableLimit(t *testing.T) {
 	admitSessionCommands(t, store, catalogTenant, catalogSession, "mine", 3)
 
 	for _, limit := range []int{-1, storage.MaxOrderedPageLimit + 1} {
-		_, err := store.ListSessionCommands(context.Background(), ListSessionCommandsRequest{
+		_, err := store.ListSessionDispositionCommands(context.Background(), ListSessionDispositionCommandsRequest{
 			TenantID: catalogTenant, SessionID: catalogSession, Limit: limit,
 		})
 		got := assertInboxCode(t, err, InboxErrorInvalid)
@@ -371,11 +615,11 @@ func TestListSessionCommandsRefusesAnUnusableLimit(t *testing.T) {
 			t.Fatalf("limit %d refused on field %q", limit, got.Field)
 		}
 	}
-	page, err := store.ListSessionCommands(context.Background(), ListSessionCommandsRequest{
+	page, err := store.ListSessionDispositionCommands(context.Background(), ListSessionDispositionCommandsRequest{
 		TenantID: catalogTenant, SessionID: catalogSession,
 	})
 	if err != nil {
-		t.Fatalf("ListSessionCommands(limit=0): %v", err)
+		t.Fatalf("ListSessionDispositionCommands(limit=0): %v", err)
 	}
 	if len(page.Commands) != 3 || page.Limit != storage.MaxOrderedPageLimit {
 		t.Fatalf("zero limit returned %d rows at an effective limit of %d, want 3 at %d",
@@ -394,7 +638,7 @@ func TestListSessionCommandsRefusesAnInvalidIdentity(t *testing.T) {
 		{"empty session", string(catalogTenant), ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := store.ListSessionCommands(context.Background(), ListSessionCommandsRequest{
+			_, err := store.ListSessionDispositionCommands(context.Background(), ListSessionDispositionCommandsRequest{
 				TenantID: sessionwire.TenantID(tt.tenant), SessionID: sessionwire.SessionID(tt.session), Limit: 10,
 			})
 			if err == nil {
@@ -404,17 +648,77 @@ func TestListSessionCommandsRefusesAnInvalidIdentity(t *testing.T) {
 	}
 }
 
-// bentOrderedPage is a provider that answers a ListOrdered with a continuation
-// that is not the last row's order.
+// TestListSessionCommandsCostsOnePageAndOneCatalogRead drives the cost claim
+// rather than restating it.
 //
-// It exists because memstore cannot produce this answer and a CONFORMING
-// provider never will — which is exactly why the check has to be tested against
-// a non-conforming one. A fake looser than the dependency is how a missing
-// check stays invisible; this fake is TIGHTER, and it is the only reply the
-// store takes on trust unless it holds it to the rows.
+// "ITS COST IS THE PAGE PLUS ONE CATALOG READ" is a sentence about provider
+// traffic, and provider traffic is observable: the package's own
+// instrumentComposite counts it. The invariance across limits is the part that
+// matters — a listing that read the catalog once per row, as the due sweep
+// must, would show a count that moves with the page.
+func TestListSessionCommandsCostsOnePageAndOneCatalogRead(t *testing.T) {
+	t.Parallel()
+
+	backend, calls := instrumentComposite(memstore.New())
+	store := consumptionFixture(t, backend)
+	admitSessionCommands(t, store, catalogTenant, catalogSession, "mine", 40)
+
+	var first providerCallSnapshot
+	for i, limit := range []int{1, 5, 40} {
+		before := calls.snapshot()
+		page, err := store.ListSessionDispositionCommands(context.Background(), ListSessionDispositionCommandsRequest{
+			TenantID: catalogTenant, SessionID: catalogSession, Limit: limit,
+		})
+		if err != nil {
+			t.Fatalf("ListSessionDispositionCommands(limit=%d): %v", limit, err)
+		}
+		if len(page.Commands) != limit {
+			t.Fatalf("limit %d returned %d rows", limit, len(page.Commands))
+		}
+		after := calls.snapshot()
+		cost := providerCallSnapshot{
+			Ledger:  after.Ledger - before.Ledger,
+			Leaser:  after.Leaser - before.Leaser,
+			KV:      after.KV - before.KV,
+			Blobs:   after.Blobs - before.Blobs,
+			Ordered: after.Ordered - before.Ordered,
+		}
+		if cost.Ledger != 0 || cost.Leaser != 0 || cost.Blobs != 0 {
+			t.Fatalf("limit %d touched the journal, the leaser or a blob: %+v", limit, cost)
+		}
+		// Two ordered calls: the catalog read and the page. Not one per row.
+		if cost.Ordered != 2 {
+			t.Fatalf("limit %d issued %d ordered calls, want 2 (catalog + page)", limit, cost.Ordered)
+		}
+		if i == 0 {
+			first = cost
+			continue
+		}
+		if cost != first {
+			t.Fatalf("cost moved with the limit: %+v at limit %d, %+v at limit 1", cost, limit, first)
+		}
+	}
+}
+
+// bentOrderedPage is a provider that answers a ListOrdered with a page this
+// store must not take on trust.
+//
+// It exists because memstore cannot produce these answers and a CONFORMING
+// provider never will — which is exactly why the checks have to be tested
+// against a non-conforming one. A fake looser than the dependency is how a
+// missing check stays invisible; this fake is TIGHTER, and these replies are
+// the only things the store takes on trust unless it holds them to the rows.
 type bentOrderedPage struct {
 	storage.OrderedIndex
-	bend func(storage.OrderedPage) storage.OrderedPage
+	t *testing.T
+	// needs is how many rows the bend indexes. IT IS A GUARD ON THE FIXTURE,
+	// not on the store: a bend handed a shorter page than it expects would
+	// either panic — which is a crashed test, not a failed claim — or, worse,
+	// silently return the page untouched, so the case would pass while bending
+	// nothing at all. Stating the requirement here makes a fixture that stops
+	// exercising its own case fail as an assertion naming that fact.
+	needs int
+	bend  func(storage.OrderedPage) storage.OrderedPage
 }
 
 func (o bentOrderedPage) ListOrdered(
@@ -424,10 +728,14 @@ func (o bentOrderedPage) ListOrdered(
 	if err != nil {
 		return page, err
 	}
+	if len(page.Records) < o.needs {
+		o.t.Fatalf("the honest page carried %d rows in %q and this case bends %d; the fixture is not exercising what it claims",
+			len(page.Records), namespace, o.needs)
+	}
 	return o.bend(page), nil
 }
 
-func TestListSessionCommandsHoldsTheProvidersContinuationToTheRowsItReturned(t *testing.T) {
+func TestListSessionCommandsHoldsTheProvidersPageToWhatItPromised(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -472,6 +780,26 @@ func TestListSessionCommandsHoldsTheProvidersContinuationToTheRowsItReturned(t *
 			},
 			want: InboxErrorIdentity,
 		},
+		{
+			// THE DUPLICATE, and it is the case that pins the word "strictly"
+			// in "strictly increasing AcceptedOrder".
+			//
+			// A page carrying the same acceptance order twice is the shape a
+			// consumption stream must never be handed: the command would be
+			// presented to a consumer twice inside one page, and the page would
+			// still look ascending under a NON-STRICT comparison, so only `<=`
+			// catches it. It is deliberately INSIDE the limit, because the
+			// "rows over the limit" case above also duplicates a row but with
+			// four rows against a limit of three it dies on the limit check
+			// first and says nothing about ordering at all.
+			name: "a duplicated acceptance order inside the limit",
+			bend: func(page storage.OrderedPage) storage.OrderedPage {
+				page.Records[1] = page.Records[0]
+				page.NextAfterOrder = page.Records[len(page.Records)-1].Order
+				return page
+			},
+			want: InboxErrorIdentity,
+		},
 	}
 
 	for _, tt := range tests {
@@ -481,11 +809,12 @@ func TestListSessionCommandsHoldsTheProvidersContinuationToTheRowsItReturned(t *
 			ordered := backend.OrderedIndex
 			store := consumptionFixture(t, backend)
 			admitSessionCommands(t, store, catalogTenant, catalogSession, "mine", 3)
-			store.backend.OrderedIndex = bentOrderedPage{OrderedIndex: ordered, bend: tt.bend}
+			store.backend.OrderedIndex = bentOrderedPage{OrderedIndex: ordered, t: t, needs: 2, bend: tt.bend}
 
-			page, err := store.ListSessionCommands(context.Background(), ListSessionCommandsRequest{
-				TenantID: catalogTenant, SessionID: catalogSession, Limit: 3,
-			})
+			page, err := store.ListSessionDispositionCommands(
+				context.Background(), ListSessionDispositionCommandsRequest{
+					TenantID: catalogTenant, SessionID: catalogSession, Limit: 3,
+				})
 			if tt.want == "" {
 				if err != nil {
 					t.Fatalf("a faithful reply was refused: %v", err)
@@ -500,28 +829,172 @@ func TestListSessionCommandsHoldsTheProvidersContinuationToTheRowsItReturned(t *
 	}
 }
 
+// ignoringTheBound is a provider that answers every ListOrdered from the HEAD of
+// the stream, whatever bound it was given.
+//
+// A conforming provider never does this, which is why the store's own
+// enforcement of the caller's bound cannot be tested against memstore: memstore
+// honours the bound, so a store that simply forwarded it and checked nothing
+// would look identical to one that holds the reply to it.
+type ignoringTheBound struct {
+	storage.OrderedIndex
+	// drop is how many rows to remove from the head of the honest answer, so
+	// one case can hand back a page starting strictly below the bound and
+	// another can hand back a page starting exactly AT it.
+	drop int
+}
+
+func (o ignoringTheBound) ListOrdered(
+	ctx context.Context, namespace, orderingScope string, _ uint64, limit int,
+) (storage.OrderedPage, error) {
+	page, err := o.OrderedIndex.ListOrdered(ctx, namespace, orderingScope, 0, limit+o.drop)
+	if err != nil {
+		return page, err
+	}
+	if o.drop < len(page.Records) {
+		page.Records = page.Records[o.drop:]
+	}
+	if len(page.Records) > limit {
+		page.Records = page.Records[:limit]
+	}
+	if len(page.Records) > 0 {
+		page.NextAfterOrder = page.Records[len(page.Records)-1].Order
+	}
+	return page, nil
+}
+
+// TestListSessionCommandsHoldsEveryRowToTheCallersOwnBound is "STRICTLY AFTER
+// afterOrder" — Host's declared contract, verbatim — defended as a store-side
+// guarantee rather than a forwarded argument.
+//
+// The store passes the caller's bound to the provider, and a conforming
+// provider honours it; but the sentence in this package's own documentation is
+// about what the store RETURNS, and a caller is forbidden from re-checking it
+// (that would be inferring an order). So the store seeds its ascending walk
+// with the caller's bound rather than with zero, and that single assignment is
+// what makes the first row's position checkable. Both directions are driven:
+//
+//   - a page starting strictly BELOW the bound — rows the caller has already
+//     consumed and whose commands it would apply a second time;
+//   - a page whose first row sits EXACTLY at the exclusive bound, which is the
+//     boundary the word "strictly" is about and the one an off-by-one would
+//     leak.
+func TestListSessionCommandsHoldsEveryRowToTheCallersOwnBound(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name string
+		drop int
+	}{
+		{name: "a page answered from the head despite a bound", drop: 0},
+		{name: "a page whose first row is exactly at the bound", drop: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			backend := memstore.New()
+			ordered := backend.OrderedIndex
+			store := consumptionFixture(t, backend)
+			admitSessionCommands(t, store, catalogTenant, catalogSession, "mine", 4)
+			full := walkExactly(t, store, catalogTenant, catalogSession, 0, 100, 4)
+			// The bound is the SECOND row's order, so `drop: 0` answers from
+			// row 1 (strictly below it) and `drop: 1` answers from row 2
+			// (exactly at it).
+			bound := full[1].AcceptedOrder
+
+			// The CONTROL: honestly answered, this bound returns the suffix.
+			honest, err := store.ListSessionDispositionCommands(
+				context.Background(), ListSessionDispositionCommandsRequest{
+					TenantID: catalogTenant, SessionID: catalogSession, AfterOrder: bound, Limit: 2,
+				})
+			if err != nil {
+				t.Fatalf("the honest bounded page was refused: %v", err)
+			}
+			if len(honest.Commands) != 2 || honest.Commands[0].AcceptedOrder != full[2].AcceptedOrder {
+				t.Fatalf("honest page = %d rows starting at %d, want 2 starting at %d",
+					len(honest.Commands), honest.Commands[0].AcceptedOrder, full[2].AcceptedOrder)
+			}
+
+			store.backend.OrderedIndex = ignoringTheBound{OrderedIndex: ordered, drop: tt.drop}
+			_, err = store.ListSessionDispositionCommands(
+				context.Background(), ListSessionDispositionCommandsRequest{
+					TenantID: catalogTenant, SessionID: catalogSession, AfterOrder: bound, Limit: 2,
+				})
+			got := assertInboxCode(t, err, InboxErrorIdentity)
+			if got.Field != "order" {
+				t.Fatalf("refused on field %q, want %q", got.Field, "order")
+			}
+		})
+	}
+}
+
+func mustScope(t *testing.T, store *Store) sessionScope {
+	t.Helper()
+	scope, err := store.deriveSessionScope(catalogTenant, catalogSession)
+	if err != nil {
+		t.Fatalf("deriveSessionScope: %v", err)
+	}
+	return scope
+}
+
+// TestListSessionCommandsRefusesAContinuationOnAnExhaustedPage is the empty
+// page's half of the continuation check, and it is a separate test because it
+// is a separate branch: the page with rows compares against the last row, and
+// the page WITHOUT rows has no row to compare against and must insist on zero.
+//
+// The hazard is specific. An exhausted stream's answer is "keep the bound you
+// asked with"; a provider that answered an empty page with a position would
+// hand a consumer a bound it was never given rows for, and the consumer would
+// resume from it — stepping over every command admitted between the two.
+func TestListSessionCommandsRefusesAContinuationOnAnExhaustedPage(t *testing.T) {
+	t.Parallel()
+
+	backend := memstore.New()
+	ordered := backend.OrderedIndex
+	store := consumptionFixture(t, backend)
+	admitSessionCommands(t, store, catalogTenant, catalogSession, "mine", 3)
+	full := walkExactly(t, store, catalogTenant, catalogSession, 0, 100, 3)
+	end := full[len(full)-1].AcceptedOrder
+
+	// The CONTROL: past the end, a faithful provider reports no continuation
+	// and this store passes it through.
+	page, err := store.ListSessionDispositionCommands(context.Background(), ListSessionDispositionCommandsRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, AfterOrder: end, Limit: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListSessionDispositionCommands past the end: %v", err)
+	}
+	if len(page.Commands) != 0 || page.NextAfterOrder != 0 {
+		t.Fatalf("exhausted page = %d rows continuing at %d", len(page.Commands), page.NextAfterOrder)
+	}
+
+	store.backend.OrderedIndex = bentOrderedPage{OrderedIndex: ordered, t: t, bend: func(p storage.OrderedPage) storage.OrderedPage {
+		if len(p.Records) == 0 {
+			p.NextAfterOrder = end + 1
+		}
+		return p
+	}}
+	_, err = store.ListSessionDispositionCommands(context.Background(), ListSessionDispositionCommandsRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, AfterOrder: end, Limit: 10,
+	})
+	assertInboxCode(t, err, InboxErrorIdentity)
+}
+
 // ---------------------------------------------------------------------------
 // The durable consumption cursor
 // ---------------------------------------------------------------------------
 
-// TestLoadCommandCursorReportsZeroWhenNoneHasBeenRecorded is the requirement
-// stated exactly: absence is an ANSWER, not a failure.
+// TestLoadCursorReportsZeroWhenNoneHasBeenRecorded is the requirement stated
+// exactly: absence is an ANSWER, not a failure.
 //
 // The control matters more than the claim. "Load returned zero" would also pass
 // against a Load that returned zero unconditionally, so the same store is then
 // made to record one and asked again.
-func TestLoadCommandCursorReportsZeroWhenNoneHasBeenRecorded(t *testing.T) {
+func TestLoadCursorReportsZeroWhenNoneHasBeenRecorded(t *testing.T) {
 	t.Parallel()
 
 	store := consumptionFixture(t, memstore.New())
-	// The session is made to EXIST before the cursor is asked for, which is the
-	// state the claim is about: a session that holds commands and has never had
-	// a consumer. A session with no durable data at all is a different question
-	// and is answered by TestCursorOperationsRefuseASessionWithNoDurableData.
-	admitSessionCommands(t, store, catalogTenant, catalogSession, "mine", 1)
-
 	entry := mustLoadCursor(t, store)
-	if entry != (CommandCursorEntry{}) {
+	if entry != (DispositionCommandCursorEntry{}) {
 		t.Fatalf("unrecorded cursor = %+v, want the zero entry", entry)
 	}
 
@@ -544,31 +1017,36 @@ func TestLoadCommandCursorReportsZeroWhenNoneHasBeenRecorded(t *testing.T) {
 	}
 }
 
-// TestCommandCursorSurvivesAReopen asserts the cursor is DURABLE rather than a
-// value the open Store happens to remember.
-func TestCommandCursorSurvivesAReopen(t *testing.T) {
+// TestCursorSurvivesAReopen asserts the cursor is DURABLE rather than a value
+// the open Store happens to remember.
+func TestCursorSurvivesAReopen(t *testing.T) {
 	t.Parallel()
 
 	backend := memstore.New()
 	first := consumptionFixture(t, backend)
 	mustSaveCursor(t, first, consumptionEpoch, consumptionOrder)
 
-	second := consumptionFixture(t, backend)
+	second := openStore(t, backend, WithClock(newMovableClock(consumptionUpdatedAt)))
 	reopened := mustLoadCursor(t, second)
 	if reopened.Cursor.ConsumedOrder != consumptionOrder || reopened.Cursor.LeaseEpoch != consumptionEpoch {
 		t.Fatalf("reopened cursor = %+v", reopened.Cursor)
 	}
 }
 
-// TestSaveCommandCursorFencesTheEpochBeforeTheOrder is the concurrency contract
-// in its two halves, and the ORDER of the two fences is the assertion.
+// TestSaveCursorFencesTheEpochBeforeTheOrder is the concurrency contract in its
+// two halves, and the ORDER of the two fences is the assertion.
 //
-// A superseded lease carrying a newer position must be told it has lost the
-// session rather than be admitted; a live lease carrying an older position must
-// be told its position is stale rather than that its authority is in doubt. The
-// two ask for opposite responses, so the case that names a low epoch AND a high
-// order is the one that decides which fence ran first.
-func TestSaveCommandCursorFencesTheEpochBeforeTheOrder(t *testing.T) {
+// THE DECIDING CASE IS `earlier_epoch, earlier_order`, AND ONLY THAT ONE.
+// This was stated wrongly here once and the correction is worth keeping: a
+// caller with a LOW EPOCH and a HIGH POSITION passes the order fence and is
+// then refused by the epoch fence, so it receives InboxErrorEpoch under EITHER
+// ordering — swapping the two calls does not change its answer, and it is
+// therefore no probe at all. The caller whose answer changes is the one below
+// BOTH marks: epoch-first tells it "you have lost the session", which is
+// terminal and correct, while order-first would tell it "your position is
+// stale" and invite it to fetch newer data and retry forever against a session
+// it no longer owns. Swapping the two fence calls fails exactly this row.
+func TestSaveCursorFencesTheEpochBeforeTheOrder(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -583,8 +1061,13 @@ func TestSaveCommandCursorFencesTheEpochBeforeTheOrder(t *testing.T) {
 		{name: "same epoch, equal order", epoch: consumptionEpoch, order: consumptionOrder, wantOrder: consumptionOrder},
 		{name: "same epoch, earlier order", epoch: consumptionEpoch, order: consumptionOrder - 1, want: InboxErrorOrder},
 		{name: "later epoch, earlier order", epoch: consumptionEpoch + 1, order: consumptionOrder - 1, want: InboxErrorOrder},
-		{name: "earlier epoch, later order", epoch: consumptionEpoch - 1, order: consumptionOrder + 1, want: InboxErrorEpoch},
+		// Below both marks. THIS is the row that decides the fence ordering.
 		{name: "earlier epoch, earlier order", epoch: consumptionEpoch - 1, order: consumptionOrder - 1, want: InboxErrorEpoch},
+		// Below the epoch, above the position: refused on the epoch under both
+		// orderings, so it pins the ANSWER but not the ORDER. Kept because the
+		// answer is still worth pinning, and labelled so nobody mistakes it for
+		// the ordering probe again.
+		{name: "earlier epoch, later order", epoch: consumptionEpoch - 1, order: consumptionOrder + 1, want: InboxErrorEpoch},
 	}
 
 	for _, tt := range tests {
@@ -593,10 +1076,10 @@ func TestSaveCommandCursorFencesTheEpochBeforeTheOrder(t *testing.T) {
 			store := consumptionFixture(t, memstore.New())
 			mustSaveCursor(t, store, consumptionEpoch, consumptionOrder)
 
-			entry, err := store.SaveCommandCursor(context.Background(), testSaveCursorRequest(tt.epoch, tt.order))
+			entry, err := store.SaveDispositionCommandCursor(context.Background(), testSaveCursorRequest(tt.epoch, tt.order))
 			if tt.want == "" {
 				if err != nil {
-					t.Fatalf("SaveCommandCursor: %v", err)
+					t.Fatalf("SaveDispositionCommandCursor: %v", err)
 				}
 				if entry.Cursor.ConsumedOrder != tt.wantOrder || entry.Cursor.LeaseEpoch != tt.epoch {
 					t.Fatalf("stored cursor = %+v, want order %d at epoch %d",
@@ -620,14 +1103,14 @@ func TestSaveCommandCursorFencesTheEpochBeforeTheOrder(t *testing.T) {
 	}
 }
 
-// TestSaveCommandCursorRefusesAnUnusableRequest keeps zero out of both durable
+// TestSaveCursorRefusesAnUnusableRequest keeps zero out of both durable
 // members.
 //
 // A ZERO ORDER is refused because zero is not an order any provider allocates
 // and because it is this record's spelling of "nothing recorded": admitting it
 // would make an absent cursor and a recorded one indistinguishable to Load,
 // which is the whole basis of the zero-means-none answer.
-func TestSaveCommandCursorRefusesAnUnusableRequest(t *testing.T) {
+func TestSaveCursorRefusesAnUnusableRequest(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -645,7 +1128,7 @@ func TestSaveCommandCursorRefusesAnUnusableRequest(t *testing.T) {
 			store := consumptionFixture(t, backend)
 			before := calls.snapshot()
 
-			_, err := store.SaveCommandCursor(context.Background(), testSaveCursorRequest(tt.epoch, tt.order))
+			_, err := store.SaveDispositionCommandCursor(context.Background(), testSaveCursorRequest(tt.epoch, tt.order))
 			got := assertInboxCode(t, err, InboxErrorInvalid)
 			if got.Field != tt.field {
 				t.Fatalf("refused on field %q, want %q", got.Field, tt.field)
@@ -670,11 +1153,7 @@ func TestACursorThisReaderCannotDecodeIsNotAnAbsentCursor(t *testing.T) {
 
 	store := consumptionFixture(t, memstore.New())
 	mustSaveCursor(t, store, consumptionEpoch, consumptionOrder)
-	scope, err := store.deriveSessionScope(catalogTenant, catalogSession)
-	if err != nil {
-		t.Fatalf("deriveSessionScope: %v", err)
-	}
-	id := commandCursorID(scope)
+	id := dispositionCursorID(mustScope(t, store))
 	stored, err := store.backend.OrderedIndex.Get(context.Background(), id)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -684,13 +1163,13 @@ func TestACursorThisReaderCannotDecodeIsNotAnAbsentCursor(t *testing.T) {
 		t.Fatalf("Update: %v", err)
 	}
 
-	_, err = store.LoadCommandCursor(context.Background(), testLoadCursorRequest())
+	_, err = store.LoadDispositionCommandCursor(context.Background(), testLoadCursorRequest())
 	assertInboxCode(t, err, InboxErrorMalformed)
 
 	// The save names an epoch and an order BELOW the ones the unreadable row
 	// carries, so a create-over-absence would be visible as a regression rather
 	// than only as a rewrite.
-	_, err = store.SaveCommandCursor(context.Background(), testSaveCursorRequest(1, 1))
+	_, err = store.SaveDispositionCommandCursor(context.Background(), testSaveCursorRequest(1, 1))
 	assertInboxCode(t, err, InboxErrorMalformed)
 	if got, err := store.backend.OrderedIndex.Get(context.Background(), id); err != nil {
 		t.Fatalf("Get: %v", err)
@@ -699,19 +1178,19 @@ func TestACursorThisReaderCannotDecodeIsNotAnAbsentCursor(t *testing.T) {
 	}
 }
 
-// TestCommandCursorRecordDecodeFailsClosed drives the codec's refusals
-// directly, because the operations above can only reach one of them.
-func TestCommandCursorRecordDecodeFailsClosed(t *testing.T) {
+// TestCursorRecordDecodeFailsClosed drives the codec's refusals directly,
+// because the operations above can only reach one of them.
+func TestCursorRecordDecodeFailsClosed(t *testing.T) {
 	t.Parallel()
 
-	valid, _, err := encodeCommandCursor(CommandCursor{
+	valid, _, err := encodeDispositionCursor(DispositionCommandCursor{
 		TenantID: catalogTenant, SessionID: catalogSession,
 		LeaseEpoch: consumptionEpoch, ConsumedOrder: consumptionOrder, UpdatedAt: consumptionUpdatedAt,
 	})
 	if err != nil {
-		t.Fatalf("encodeCommandCursor: %v", err)
+		t.Fatalf("encodeDispositionCursor: %v", err)
 	}
-	if _, err := decodeCommandCursor(valid); err != nil {
+	if _, err := decodeDispositionCursor(valid); err != nil {
 		t.Fatalf("the canonical record did not decode: %v", err)
 	}
 
@@ -727,41 +1206,88 @@ func TestCommandCursorRecordDecodeFailsClosed(t *testing.T) {
 		{name: "zero order", value: []byte(`{"record_version":1,"tenant_id":"tenant-a","session_id":"session-a","lease_epoch":9,"consumed_order":0,"updated_at":"2026-08-30T11:40:00Z"}`), want: InboxErrorInvalid},
 		{name: "zero epoch", value: []byte(`{"record_version":1,"tenant_id":"tenant-a","session_id":"session-a","lease_epoch":0,"consumed_order":4096,"updated_at":"2026-08-30T11:40:00Z"}`), want: InboxErrorInvalid},
 		{name: "empty tenant", value: []byte(`{"record_version":1,"tenant_id":"","session_id":"session-a","lease_epoch":9,"consumed_order":4096,"updated_at":"2026-08-30T11:40:00Z"}`), want: InboxErrorInvalid},
-		{name: "oversized", value: append([]byte(`{"record_version":1,"tenant_id":"`), make([]byte, MaxCommandCursorRecordBytes)...), want: InboxErrorTooLarge},
+		{name: "oversized", value: append([]byte(`{"record_version":1,"tenant_id":"`), make([]byte, MaxDispositionCommandCursorRecordBytes)...), want: InboxErrorTooLarge},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			_, err := decodeCommandCursor(tt.value)
+			_, err := decodeDispositionCursor(tt.value)
 			assertInboxCode(t, err, tt.want)
 		})
 	}
 }
 
-// TestCommandCursorWireGolden pins the DURABLE spelling.
+// TestCursorWireGolden pins the DURABLE spelling.
 //
-// The exported struct's JSON tags are decorative with respect to stored bytes
-// for the reason the disposition record's are: a private wire DTO fixes the
-// member names, so renaming an exported field cannot move a stored record. This
-// literal is what makes that statement checkable.
-func TestCommandCursorWireGolden(t *testing.T) {
+// The exported struct carries no JSON tags at all, so there is nothing
+// decorative for a reader to mistake for the durable names: those live only in
+// the private wire DTO, and this literal is what makes that statement
+// checkable. The chain to the stored bytes is closed by
+// verifyDispositionCursorBytes, which holds the provider's reply to exactly the
+// bytes this encoder produced.
+func TestCursorWireGolden(t *testing.T) {
 	t.Parallel()
 
-	value, _, err := encodeCommandCursor(CommandCursor{
+	value, _, err := encodeDispositionCursor(DispositionCommandCursor{
 		TenantID: catalogTenant, SessionID: catalogSession,
 		LeaseEpoch: consumptionEpoch, ConsumedOrder: consumptionOrder, UpdatedAt: consumptionUpdatedAt,
 	})
 	if err != nil {
-		t.Fatalf("encodeCommandCursor: %v", err)
+		t.Fatalf("encodeDispositionCursor: %v", err)
 	}
 	const want = `{"record_version":1,"tenant_id":"tenant-a","session_id":"session-a","lease_epoch":9,"consumed_order":4096,"updated_at":"2026-08-30T11:40:00Z"}`
 	if string(value) != want {
 		t.Fatalf("stored bytes =\n%s\nwant\n%s", value, want)
 	}
+
+	// And the bytes that reach the PROVIDER are these bytes, read back out of
+	// the backend rather than re-derived from the encoder.
+	store := consumptionFixture(t, memstore.New())
+	mustSaveCursor(t, store, consumptionEpoch, consumptionOrder)
+	stored, err := store.backend.OrderedIndex.Get(context.Background(), dispositionCursorID(mustScope(t, store)))
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !bytes.Equal(stored.Value, []byte(want)) {
+		t.Fatalf("stored row =\n%s\nwant\n%s", stored.Value, want)
+	}
 }
 
-// TestConcurrentCommandCursorSaversNeverLoseOrRegressAPosition is the
-// concurrency contract, driven rather than described.
+// TestCursorNormalizesTheInstantToUTC pins the one line in
+// canonicalDispositionCursor that nothing else can see.
+//
+// Nothing decides on UpdatedAt, so a reader could reasonably take the UTC
+// conversion for decoration. It is not: production's clock is time.Now(), so
+// without it two stores in different zones would write different durable
+// spellings of the same instant, and the record's "one canonical spelling,
+// byte-identical on read-back" property — which verifyDispositionCursorBytes
+// compares exactly — would quietly stop holding.
+func TestCursorNormalizesTheInstantToUTC(t *testing.T) {
+	t.Parallel()
+
+	zone := time.FixedZone("UTC+2", 2*60*60)
+	shifted := consumptionUpdatedAt.In(zone)
+	if shifted.Format(time.RFC3339) == consumptionUpdatedAt.UTC().Format(time.RFC3339) {
+		t.Fatal("the fixture instant spells the same in both zones; this test would prove nothing")
+	}
+	value, canonical, err := encodeDispositionCursor(DispositionCommandCursor{
+		TenantID: catalogTenant, SessionID: catalogSession,
+		LeaseEpoch: consumptionEpoch, ConsumedOrder: consumptionOrder, UpdatedAt: shifted,
+	})
+	if err != nil {
+		t.Fatalf("encodeDispositionCursor: %v", err)
+	}
+	const want = `{"record_version":1,"tenant_id":"tenant-a","session_id":"session-a","lease_epoch":9,"consumed_order":4096,"updated_at":"2026-08-30T11:40:00Z"}`
+	if string(value) != want {
+		t.Fatalf("a non-UTC instant stored as\n%s\nwant\n%s", value, want)
+	}
+	if canonical.UpdatedAt.Location() != time.UTC {
+		t.Fatalf("canonical instant is in %v, want UTC", canonical.UpdatedAt.Location())
+	}
+}
+
+// TestConcurrentCursorSaversNeverLoseOrRegressAPosition is the concurrency
+// contract, driven rather than described.
 //
 // EVERY ASSERTION HERE HOLDS UNDER EVERY INTERLEAVING, which is the whole
 // difficulty of writing this test honestly. An earlier version asserted that
@@ -779,26 +1305,21 @@ func TestCommandCursorWireGolden(t *testing.T) {
 //     whatever else is in flight. This is the order fence under contention.
 //
 //  3. A SUPERSEDED EPOCH IS ALWAYS REFUSED WITH InboxErrorEpoch, on every
-//     attempt, EVEN THOUGH ITS POSITION IS FAR AHEAD OF EVERY ADVANCER'S. This
-//     is the fence ORDERING under contention: a store that consulted the
-//     position first would admit this writer's position and hand it a
-//     conflicting answer, and the final cursor would be the superseded lease's.
-//
-// The last one is also what makes the final-position assertion a real probe
-// rather than an arithmetic restatement: a regression in either fence moves the
-// answer somewhere this test can name.
-func TestConcurrentCommandCursorSaversNeverLoseOrRegressAPosition(t *testing.T) {
+//     attempt. Note what this does and does NOT show: it pins the epoch fence
+//     under contention, but because this writer's position is far ahead it
+//     would be refused on the epoch under either fence ordering, so it says
+//     nothing about which fence runs first. The ordering probe lives in
+//     TestSaveCursorFencesTheEpochBeforeTheOrder's `earlier_epoch, earlier_order`
+//     row, and this test deliberately does not claim it.
+func TestConcurrentCursorSaversNeverLoseOrRegressAPosition(t *testing.T) {
 	t.Parallel()
 
 	store := consumptionFixture(t, memstore.New())
 	mustSaveCursor(t, store, consumptionEpoch, consumptionOrder)
 
 	const (
-		advancers = 12
-		attempts  = 8
-		// staleOrder is below the committed position and superseded* is below
-		// the committed epoch while naming a position far above every
-		// advancer's, so admitting it would be unmistakable.
+		advancers           = 12
+		attempts            = 8
 		staleOrder          = consumptionOrder - 1
 		supersededEpoch     = consumptionEpoch - 1
 		supersededFarAhead  = consumptionOrder + advancers + 1000
@@ -814,14 +1335,12 @@ func TestConcurrentCommandCursorSaversNeverLoseOrRegressAPosition(t *testing.T) 
 		accepted[order] = true
 	}
 
-	// The advancers. Each offers ONE position, repeatedly; the highest of them
-	// retries until it is durable.
 	for i := 1; i <= advancers; i++ {
 		wg.Add(1)
 		go func(order uint64, mustWin bool) {
 			defer wg.Done()
 			for attempt := 0; attempt < attempts || mustWin; attempt++ {
-				entry, err := store.SaveCommandCursor(
+				entry, err := store.SaveDispositionCommandCursor(
 					context.Background(), testSaveCursorRequest(consumptionEpoch, order))
 				if err == nil {
 					note(entry.Cursor.ConsumedOrder)
@@ -832,13 +1351,11 @@ func TestConcurrentCommandCursorSaversNeverLoseOrRegressAPosition(t *testing.T) 
 				}
 				typed := &InboxError{}
 				if !errors.As(err, &typed) {
-					t.Errorf("SaveCommandCursor: %T %v, want *InboxError", err, err)
+					t.Errorf("SaveDispositionCommandCursor: %T %v, want *InboxError", err, err)
 					return
 				}
 				switch typed.Code {
 				case InboxErrorConflict:
-					// A lost compare-and-swap is the one refusal a caller
-					// retries, so the writer that must win does.
 				case InboxErrorOrder:
 					if mustWin {
 						t.Errorf("the highest advancer was refused on the order fence at %d", order)
@@ -848,7 +1365,7 @@ func TestConcurrentCommandCursorSaversNeverLoseOrRegressAPosition(t *testing.T) 
 					t.Errorf("an advancer holding the committed epoch was refused on the epoch fence")
 					return
 				default:
-					t.Errorf("SaveCommandCursor refused with %q", typed.Code)
+					t.Errorf("SaveDispositionCommandCursor refused with %q", typed.Code)
 					return
 				}
 				if attempt > 100000 {
@@ -859,7 +1376,6 @@ func TestConcurrentCommandCursorSaversNeverLoseOrRegressAPosition(t *testing.T) 
 		}(consumptionOrder+uint64(i), i == advancers)
 	}
 
-	// The two writers whose refusal is unconditional.
 	for _, stale := range []struct {
 		name         string
 		epoch, order uint64
@@ -872,11 +1388,11 @@ func TestConcurrentCommandCursorSaversNeverLoseOrRegressAPosition(t *testing.T) 
 		go func(name string, epoch, order uint64, want InboxErrorCode) {
 			defer wg.Done()
 			for range attempts {
-				_, err := store.SaveCommandCursor(
+				_, err := store.SaveDispositionCommandCursor(
 					context.Background(), testSaveCursorRequest(epoch, order))
 				typed := &InboxError{}
 				if !errors.As(err, &typed) {
-					t.Errorf("%s: SaveCommandCursor = %v, want a refusal", name, err)
+					t.Errorf("%s: SaveDispositionCommandCursor = %v, want a refusal", name, err)
 					return
 				}
 				if typed.Code != want {
@@ -906,150 +1422,68 @@ func TestConcurrentCommandCursorSaversNeverLoseOrRegressAPosition(t *testing.T) 
 	}
 }
 
-// TestCommandCursorIsPerSessionAndPerTenant keeps one session's cursor out of
-// another's, in both directions.
-func TestCommandCursorIsPerSessionAndPerTenant(t *testing.T) {
-	t.Parallel()
-
-	store := consumptionFixture(t, memstore.New())
-	mustSaveCursor(t, store, consumptionEpoch, consumptionOrder)
-
-	for _, tt := range []struct {
-		name    string
-		tenant  sessionwire.TenantID
-		session sessionwire.SessionID
-	}{
-		{name: "another session", tenant: catalogTenant, session: "session-b"},
-		{name: "another tenant", tenant: "tenant-b", session: catalogSession},
-	} {
-		// Each neighbour is made to exist, so "it has no cursor" is an answer
-		// about ITS cursor rather than about its whole scope.
-		admitSessionCommands(t, store, tt.tenant, tt.session, "neighbour", 1)
-		t.Run(tt.name, func(t *testing.T) {
-			entry, err := store.LoadCommandCursor(context.Background(),
-				LoadCommandCursorRequest{TenantID: tt.tenant, SessionID: tt.session})
-			if err != nil {
-				t.Fatalf("LoadCommandCursor: %v", err)
-			}
-			if entry != (CommandCursorEntry{}) {
-				t.Fatalf("%s reported %+v, want the zero entry", tt.name, entry)
-			}
-		})
-	}
+// hidingCursorGet is a provider whose cursor Get reports the row absent while
+// Create stays truthful. It is the exact interleaving of a LOST CREATE RACE:
+// this caller's read found nothing, and a competitor committed before its
+// Create ran.
+type hidingCursorGet struct {
+	storage.OrderedIndex
 }
 
-// TestCursorOperationsRefuseASessionWithNoDurableData states the boundary of
-// the zero-means-none answer, in the direction that is easy to over-read.
-//
-// A session with no durable data has no collision witnesses, and every NAMED
-// read in this package refuses one rather than answering about a scope it
-// cannot verify — getPointer, readCatalogEntry and GetCommand all do. These two
-// are no different, and the reason to pin it is that "Load returns zero when
-// none has been recorded" is a sentence a reader could stretch into "Load
-// always succeeds". It does not: it answers zero for a session that EXISTS and
-// has no cursor, and refuses a session that does not exist.
-//
-// This is a residue rather than a closure. It enumerates the two cursor
-// operations and the listing; it does not claim to enumerate every operation in
-// this package whose answer depends on a bound scope, and a reader must not
-// take the absence of an operation here as evidence about it.
-func TestCursorOperationsRefuseASessionWithNoDurableData(t *testing.T) {
-	t.Parallel()
-
-	const unborn = sessionwire.SessionID("session-never-written")
-	store := consumptionFixture(t, memstore.New())
-
-	if _, err := store.LoadCommandCursor(context.Background(),
-		LoadCommandCursorRequest{TenantID: catalogTenant, SessionID: unborn}); err == nil {
-		t.Fatal("LoadCommandCursor answered about a session with no durable data")
+func (o hidingCursorGet) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
+	if id.Namespace == dispositionCursorNamespace {
+		return storage.OrderedRecord{}, &storage.OrderedRecordNotFoundError{ID: id}
 	}
-	if _, err := store.ListSessionCommands(context.Background(), ListSessionCommandsRequest{
-		TenantID: catalogTenant, SessionID: unborn, Limit: 10,
-	}); err == nil {
-		t.Fatal("ListSessionCommands answered about a session with no durable data")
-	}
-	// A SAVE is the control, and it must NOT refuse: a save binds the scope, so
-	// it is the operation that makes such a session exist. Without this the two
-	// refusals above would also pass against a store that refused every request
-	// naming this session forever.
-	mustSaveCursorFor(t, store, catalogTenant, unborn, consumptionEpoch, consumptionOrder)
-	entry, err := store.LoadCommandCursor(context.Background(),
-		LoadCommandCursorRequest{TenantID: catalogTenant, SessionID: unborn})
-	if err != nil {
-		t.Fatalf("LoadCommandCursor after a save: %v", err)
-	}
-	if entry.Cursor.ConsumedOrder != consumptionOrder {
-		t.Fatalf("cursor after a save = %d, want %d", entry.Cursor.ConsumedOrder, consumptionOrder)
-	}
+	return o.OrderedIndex.Get(ctx, id)
 }
 
-func mustSaveCursorFor(
-	t *testing.T,
-	store *Store,
-	tenant sessionwire.TenantID,
-	session sessionwire.SessionID,
-	epoch, order uint64,
-) CommandCursorEntry {
-	t.Helper()
-	entry, err := store.SaveCommandCursor(context.Background(), SaveCommandCursorRequest{
-		TenantID: tenant, SessionID: session, LeaseEpoch: epoch, ConsumedOrder: order,
-	})
-	if err != nil {
-		t.Fatalf("SaveCommandCursor(%q,%q): %v", tenant, session, err)
-	}
-	return entry
-}
-
-// TestListSessionCommandsRefusesAContinuationOnAnExhaustedPage is the empty
-// page's half of the continuation check, and it is a separate test because it
-// is a separate branch: the page with rows compares against the last row, and
-// the page WITHOUT rows has no row to compare against and must insist on zero.
+// TestALostCreateRaceIsAConflictAndNotACorruptRecord pins the "you raced" arm of
+// the three-answer contract on the one path where racing is most likely.
 //
-// The hazard is specific. An exhausted stream's answer is "keep the bound you
-// asked with"; a provider that answered an empty page with a position would
-// hand a consumer a bound it was never given rows for, and the consumer would
-// resume from it — stepping over every command admitted between the two.
-func TestListSessionCommandsRefusesAContinuationOnAnExhaustedPage(t *testing.T) {
+// TWO PROPERTIES, AND THE SECOND IS THE ONE WITH NO OTHER PROBE. The safety
+// property — the loser does not overwrite the winner — is also enforced by
+// verifyDispositionCursorBytes, which sees the winner's bytes and refuses. So a
+// test that only checked the stored row would pass even if the conflict branch
+// were deleted. What would change is the ANSWER: the caller would be told
+// InboxErrorIdentity, "your record is corrupt, do not retry", when the correct
+// instruction is InboxErrorConflict, "you raced, re-read and try again". Two
+// Hosts booting on a session that has never had a cursor is exactly this race.
+func TestALostCreateRaceIsAConflictAndNotACorruptRecord(t *testing.T) {
 	t.Parallel()
 
 	backend := memstore.New()
 	ordered := backend.OrderedIndex
 	store := consumptionFixture(t, backend)
-	admitSessionCommands(t, store, catalogTenant, catalogSession, "mine", 3)
-	full := walkSessionCommands(t, store, catalogTenant, catalogSession, 0, 100)
-	end := full[len(full)-1].AcceptedOrder
+	// The winner commits first, at marks far above the loser's, so a loser that
+	// somehow succeeded would be visible as a regression as well as a wrong code.
+	mustSaveCursor(t, store, consumptionEpoch+5, consumptionOrder+500)
 
-	// The CONTROL: past the end, a faithful provider reports no continuation
-	// and this store passes it through.
-	page, err := store.ListSessionCommands(context.Background(), ListSessionCommandsRequest{
-		TenantID: catalogTenant, SessionID: catalogSession, AfterOrder: end, Limit: 10,
-	})
-	if err != nil {
-		t.Fatalf("ListSessionCommands past the end: %v", err)
+	store.backend.OrderedIndex = hidingCursorGet{OrderedIndex: ordered}
+	_, err := store.SaveDispositionCommandCursor(context.Background(), testSaveCursorRequest(1, 1))
+	got := assertInboxCode(t, err, InboxErrorConflict)
+	if got.Field != "create" {
+		t.Fatalf("lost create refused on field %q, want %q", got.Field, "create")
 	}
-	if len(page.Commands) != 0 || page.NextAfterOrder != 0 {
-		t.Fatalf("exhausted page = %d rows continuing at %d", len(page.Commands), page.NextAfterOrder)
+	if got.Revision == 0 {
+		t.Fatal("a lost create reported no revision to re-read at")
 	}
 
-	store.backend.OrderedIndex = bentOrderedPage{OrderedIndex: ordered, bend: func(p storage.OrderedPage) storage.OrderedPage {
-		if len(p.Records) == 0 {
-			p.NextAfterOrder = end + 1
-		}
-		return p
-	}}
-	_, err = store.ListSessionCommands(context.Background(), ListSessionCommandsRequest{
-		TenantID: catalogTenant, SessionID: catalogSession, AfterOrder: end, Limit: 10,
-	})
-	assertInboxCode(t, err, InboxErrorIdentity)
+	// And the winner is untouched.
+	store.backend.OrderedIndex = ordered
+	final := mustLoadCursor(t, store)
+	if final.Cursor.ConsumedOrder != consumptionOrder+500 || final.Cursor.LeaseEpoch != consumptionEpoch+5 {
+		t.Fatalf("the winner's cursor was disturbed: %+v", final.Cursor)
+	}
 }
 
-// bentCursorRow is a provider that answers a cursor Get with a row filed
-// somewhere other than where this package files one.
+// bentCursorRow is a provider that answers a cursor Get with a row this store
+// must not take on trust — either filed somewhere other than where this package
+// files one, or carrying bytes that are not this session's.
 //
 // memstore cannot produce these answers and a conforming provider never will,
-// which is exactly why the filing checks have to be tested against a
-// non-conforming one: a fake no looser than the real store would leave every
-// one of those checks unexercised, and a check nothing exercises is a comment.
+// which is exactly why the checks have to be tested against a non-conforming
+// one: a fake no looser than the real store would leave every one of those
+// checks unexercised, and a check nothing exercises is a comment.
 type bentCursorRow struct {
 	storage.OrderedIndex
 	bend func(storage.OrderedRecord) storage.OrderedRecord
@@ -1057,20 +1491,33 @@ type bentCursorRow struct {
 
 func (o bentCursorRow) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
 	stored, err := o.OrderedIndex.Get(ctx, id)
-	if err != nil || id.Namespace != commandCursorNamespace {
+	if err != nil || id.Namespace != dispositionCursorNamespace {
 		return stored, err
 	}
 	return o.bend(stored), nil
 }
 
-// TestLoadCommandCursorHoldsTheProvidersRowToItsFiling drives every component
-// of the filing commandCursorEntryFor checks.
+// TestLoadCursorHoldsTheProvidersRowToItsFilingAndItsBytes drives every
+// component of what commandCursorEntryFor checks, on BOTH of its axes.
 //
-// Each case is one thing a provider could get wrong about WHERE a row lives, as
-// opposed to what is in it, and each has its own answer so a check that had
-// collapsed into another would be visible.
-func TestLoadCommandCursorHoldsTheProvidersRowToItsFiling(t *testing.T) {
+// The two axes are the point. A filing check reads what the PROVIDER says about
+// where the row lives; the identity check reads the ROW'S OWN BYTES. They come
+// from different sources, so a provider that filed a row perfectly and answered
+// with another session's bytes passes every filing check — and would hand this
+// caller another session's consumption position as its own. That last case is a
+// cross-session position leak and it is the reason this matrix has a bytes row
+// as well as filing rows.
+func TestLoadCursorHoldsTheProvidersRowToItsFilingAndItsBytes(t *testing.T) {
 	t.Parallel()
+
+	// A perfectly-formed cursor record belonging to somebody else.
+	foreign, _, err := encodeDispositionCursor(DispositionCommandCursor{
+		TenantID: catalogTenant, SessionID: "session-elsewhere",
+		LeaseEpoch: consumptionEpoch + 1, ConsumedOrder: 999999, UpdatedAt: consumptionUpdatedAt,
+	})
+	if err != nil {
+		t.Fatalf("encodeDispositionCursor: %v", err)
+	}
 
 	tests := []struct {
 		name  string
@@ -1081,6 +1528,12 @@ func TestLoadCommandCursorHoldsTheProvidersRowToItsFiling(t *testing.T) {
 		{
 			name: "faithful",
 			bend: func(r storage.OrderedRecord) storage.OrderedRecord { return r },
+		},
+		{
+			name:  "another session's bytes, filed perfectly",
+			bend:  func(r storage.OrderedRecord) storage.OrderedRecord { r.Value = foreign; return r },
+			want:  InboxErrorIdentity,
+			field: "record",
 		},
 		{
 			name:  "filed under another stable key",
@@ -1129,7 +1582,7 @@ func TestLoadCommandCursorHoldsTheProvidersRowToItsFiling(t *testing.T) {
 			mustSaveCursor(t, store, consumptionEpoch, consumptionOrder)
 			store.backend.OrderedIndex = bentCursorRow{OrderedIndex: ordered, bend: tt.bend}
 
-			entry, err := store.LoadCommandCursor(context.Background(), testLoadCursorRequest())
+			entry, err := store.LoadDispositionCommandCursor(context.Background(), testLoadCursorRequest())
 			if tt.want == "" {
 				if err != nil {
 					t.Fatalf("a faithfully filed row was refused: %v", err)
@@ -1147,8 +1600,8 @@ func TestLoadCommandCursorHoldsTheProvidersRowToItsFiling(t *testing.T) {
 	}
 }
 
-// TestSaveCommandCursorHoldsTheProvidersReplyToTheBytesItWrote is the one check
-// on this record that a reply consistent with ITSELF still cannot satisfy.
+// TestSaveCursorHoldsTheProvidersReplyToTheBytesItWrote is the one check on
+// this record that a reply consistent with ITSELF still cannot satisfy.
 //
 // Every other check asks whether the row the provider returned is internally
 // coherent, which a SUBSTITUTED row answers just as well as the real one. On a
@@ -1156,7 +1609,7 @@ func TestLoadCommandCursorHoldsTheProvidersRowToItsFiling(t *testing.T) {
 // bytes — and the reply is what the caller takes away and what the next write
 // is fenced against, so a provider that answered with another lease's epoch
 // would have its answer adopted as the record's own history.
-func TestSaveCommandCursorHoldsTheProvidersReplyToTheBytesItWrote(t *testing.T) {
+func TestSaveCursorHoldsTheProvidersReplyToTheBytesItWrote(t *testing.T) {
 	t.Parallel()
 
 	for _, path := range []string{"create", "update"} {
@@ -1165,14 +1618,11 @@ func TestSaveCommandCursorHoldsTheProvidersReplyToTheBytesItWrote(t *testing.T) 
 			backend := memstore.New()
 			ordered := backend.OrderedIndex
 			store := consumptionFixture(t, backend)
-			// The scope is bound first so the create path is reached with the
-			// substituting provider already installed.
-			admitSessionCommands(t, store, catalogTenant, catalogSession, "mine", 1)
 			if path == "update" {
 				mustSaveCursor(t, store, consumptionEpoch, consumptionOrder)
 			}
 
-			substitute, _, err := encodeCommandCursor(CommandCursor{
+			substitute, _, err := encodeDispositionCursor(DispositionCommandCursor{
 				TenantID: catalogTenant, SessionID: catalogSession,
 				// A HIGHER epoch and position than the write names, which is
 				// the shape that matters: adopted, it would raise a fence the
@@ -1181,11 +1631,11 @@ func TestSaveCommandCursorHoldsTheProvidersReplyToTheBytesItWrote(t *testing.T) 
 				UpdatedAt: consumptionUpdatedAt,
 			})
 			if err != nil {
-				t.Fatalf("encodeCommandCursor: %v", err)
+				t.Fatalf("encodeDispositionCursor: %v", err)
 			}
 			store.backend.OrderedIndex = substitutingCursorWriter{OrderedIndex: ordered, value: substitute}
 
-			_, err = store.SaveCommandCursor(context.Background(),
+			_, err = store.SaveDispositionCommandCursor(context.Background(),
 				testSaveCursorRequest(consumptionEpoch, consumptionOrder+1))
 			got := assertInboxCode(t, err, InboxErrorIdentity)
 			if got.Field != "value" {
@@ -1205,7 +1655,7 @@ type substitutingCursorWriter struct {
 func (o substitutingCursorWriter) Create(
 	ctx context.Context, id storage.OrderedID, rankingScope string, value []byte, rank storage.Rank, due storage.Due,
 ) (storage.OrderedRecord, bool, error) {
-	if id.Namespace == commandCursorNamespace {
+	if id.Namespace == dispositionCursorNamespace {
 		value = o.value
 	}
 	return o.OrderedIndex.Create(ctx, id, rankingScope, value, rank, due)
@@ -1214,8 +1664,40 @@ func (o substitutingCursorWriter) Create(
 func (o substitutingCursorWriter) Update(
 	ctx context.Context, id storage.OrderedID, expectedRevision uint64, value []byte, rank storage.Rank, due storage.Due,
 ) (storage.OrderedRecord, error) {
-	if id.Namespace == commandCursorNamespace {
+	if id.Namespace == dispositionCursorNamespace {
 		value = o.value
 	}
 	return o.OrderedIndex.Update(ctx, id, expectedRevision, value, rank, due)
+}
+
+// TestCursorIsPerSessionAndPerTenant keeps one session's cursor out of
+// another's, in both directions.
+func TestCursorIsPerSessionAndPerTenant(t *testing.T) {
+	t.Parallel()
+
+	store := consumptionFixture(t, memstore.New())
+	mustSaveCursor(t, store, consumptionEpoch, consumptionOrder)
+
+	for _, tt := range []struct {
+		name    string
+		tenant  sessionwire.TenantID
+		session sessionwire.SessionID
+	}{
+		{name: "another session", tenant: catalogTenant, session: "session-b"},
+		{name: "another tenant", tenant: "tenant-b", session: catalogSession},
+	} {
+		// Each neighbour is made to exist, so "it has no cursor" is an answer
+		// about ITS cursor rather than about its whole scope.
+		createDispositionCatalogFor(t, store, tt.tenant, tt.session)
+		t.Run(tt.name, func(t *testing.T) {
+			entry, err := store.LoadDispositionCommandCursor(context.Background(),
+				LoadDispositionCommandCursorRequest{TenantID: tt.tenant, SessionID: tt.session})
+			if err != nil {
+				t.Fatalf("LoadDispositionCommandCursor: %v", err)
+			}
+			if entry != (DispositionCommandCursorEntry{}) {
+				t.Fatalf("%s reported %+v, want the zero entry", tt.name, entry)
+			}
+		})
+	}
 }

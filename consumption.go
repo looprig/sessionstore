@@ -13,29 +13,45 @@ import (
 
 // A SESSION'S COMMANDS ARE CONSUMED IN THE ORDER THEY WERE ACCEPTED, AND HOW
 // FAR A CONSUMER HAS GOT IS DURABLE. This file is those two things and nothing
-// else: one per-session ascending read of the inbox, and one small permanent
-// row per session recording a position in it.
+// else: one per-session ascending read of the disposition inbox, and one small
+// permanent row per session recording a position in it.
 //
-// WHY THE LISTING IS NOT THE DUE VIEW, which is the question a reader of
-// shards.go will arrive with. ListDueCommands answers "what in this SHARD needs
-// attention by this instant". It is cross-session by its request type, it is
-// ordered by a deadline, and a terminal command leaves it altogether because
-// inboxDue files one NOT DUE. Every one of those is right for a reconciler and
-// wrong for a consumer: a consumer reads ONE session, in the order the commands
-// were accepted, and must still see a command it has already settled — that is
-// what makes a cursor meaningful. The two are therefore two provider views of
-// the same rows rather than one view with a filter over it, and neither is
+// WHY THE DISPOSITION FAMILY, WHICH IS THE FIRST QUESTION TO ANSWER. There are
+// two command families here, and they are mutually exclusive per session by
+// construction: a session's protocol mode is a create-only immutable pin
+// (session_binding.go), the legacy inbox binds ProtocolModeLegacy on admission,
+// and the disposition inbox binds ProtocolModeDisposition. A CONSUMER cannot
+// choose — AcquireResidency (residency.go) REFUSES any session whose catalog
+// binding is not ProtocolModeDisposition, so every session a Host can hold a
+// residency over, and therefore every session anything can consume commands
+// for, is disposition-bound. A per-session listing and cursor over the LEGACY
+// inbox would be correct code that no consumer could ever call: the cursor's
+// first write would try to pin legacy on a scope already pinned disposition and
+// be refused with a catalog conflict, permanently and unfixably by retry. That
+// is not a hypothetical — it is what the first version of this file did, and it
+// is why both operations here take the disposition family's authority check.
+//
+// WHY THE LISTING IS NOT THE DUE VIEW, which is the second. ListDueDispositionCommands
+// answers "what in this SHARD needs attention by this instant". It is
+// cross-session by its request type, it is ordered by a deadline, and a settled
+// command leaves it altogether because dispositionInboxDue files a terminal
+// record NOT DUE. Every one of those is right for a reconciler and wrong for a
+// consumer: a consumer reads ONE session, in the order the commands were
+// accepted, and must still see a command it has already settled — that is what
+// makes a cursor meaningful. The two are therefore two provider views of the
+// same rows rather than one view with a filter over it, and neither is
 // derivable from the other. The rows, the namespace and the filing checks are
 // shared; the view is not.
 //
 // WHY THE CURSOR IS NOT A PAGE TOKEN. Every sessionwire.Cursor this package
 // issues is a position inside one query's result, valid until the query ends
 // and durable nowhere. This cursor is the opposite: it outlives every query,
-// every process and every lease, and it is the thing a Host reads at startup to
-// learn where the last Host stopped. They share a word and nothing else.
+// every process and every residency, and it is the thing a Host reads at
+// startup to learn where the last Host stopped. They share a word and nothing
+// else.
 
 const (
-	// commandCursorNamespace holds one consumption cursor per session.
+	// dispositionCursorNamespace holds one consumption cursor per session.
 	//
 	// It is UNSHARDED, unlike the inbox it points into, and the reason is the
 	// one sessionPointerDue gives: a shard exists to bound a DUE SWEEP, these
@@ -43,39 +59,47 @@ const (
 	// read by name. A sharded namespace would buy a partition for a sweep that
 	// does not exist and cannot be added without answering what removes a row
 	// from it.
-	commandCursorNamespace = "sessionstore/command-cursors"
+	//
+	// IT NAMES THE DISPOSITION FAMILY IN ITS OWN NAME, deliberately. An
+	// acceptance order from the legacy inbox and one from the disposition inbox
+	// are positions in two different provider streams with unrelated numbering,
+	// so a row that recorded one and was later read as the other would be a
+	// silently wrong position rather than a decode failure. Should a legacy
+	// cursor ever be owed, it gets its own namespace and the two can never be
+	// confused for each other.
+	dispositionCursorNamespace = "sessionstore/disposition-command-cursors"
 
-	// commandCursorStableKey separates cursor ROLES within one session, of
+	// dispositionCursorStableKey separates cursor ROLES within one session, of
 	// which there is currently one. It is a package constant rather than the
 	// session identity for the reason sessionPointerID's stable key is the
 	// pointer kind: the ordering scope already names the session, so the stable
 	// key's whole job is to keep this session's roles apart, and no
 	// caller-supplied text reaches this name.
-	commandCursorStableKey = "command-consumption"
+	dispositionCursorStableKey = "disposition-command-consumption"
 
-	// CommandCursorRecordVersion is the independent version of the stored
-	// cursor. A reader fails closed on any other version rather than guessing
-	// which members a future encoder meant.
-	CommandCursorRecordVersion uint8 = 1
+	// DispositionCommandCursorRecordVersion is the independent version of the
+	// stored cursor. A reader fails closed on any other version rather than
+	// guessing which members a future encoder meant.
+	DispositionCommandCursorRecordVersion uint8 = 1
 
-	// MaxCommandCursorRecordBytes bounds an encoded cursor. The record is two
-	// identities, two integers and an instant, so this is generous by more than
-	// an order of magnitude; what it is for is that an oversized record is
-	// refused HERE rather than by the provider, so a record this package
-	// accepted can always be rewritten.
-	MaxCommandCursorRecordBytes = 4 << 10
+	// MaxDispositionCommandCursorRecordBytes bounds an encoded cursor. The
+	// record is two identities, two integers and an instant, so this is
+	// generous by more than an order of magnitude; what it is for is that an
+	// oversized record is refused HERE rather than by the provider, so a record
+	// this package accepted can always be rewritten.
+	MaxDispositionCommandCursorRecordBytes = 4 << 10
 )
 
 // Stated as an unsigned constant for the reason the other records state theirs:
 // prose cannot enforce the relationship between this bound and the provider's.
-const _ = uint(storage.MaxOrderedValueBytes - MaxCommandCursorRecordBytes)
+const _ = uint(storage.MaxOrderedValueBytes - MaxDispositionCommandCursorRecordBytes)
 
 // ---------------------------------------------------------------------------
 // The per-session ordered listing
 // ---------------------------------------------------------------------------
 
-// ListSessionCommandsRequest positions one bounded page of ONE session's inbox
-// in immutable acceptance order.
+// ListSessionDispositionCommandsRequest positions one bounded page of ONE
+// session's disposition inbox in immutable acceptance order.
 //
 // AfterOrder is an EXCLUSIVE lower bound and is the caller's. Zero starts at
 // the head of the session's stream, which is the provider's own spelling and is
@@ -91,10 +115,11 @@ const _ = uint(storage.MaxOrderedValueBytes - MaxCommandCursorRecordBytes)
 //
 // There is no Cursor member, deliberately. A page token would be a second way
 // to say the one thing AfterOrder says, and the two would have to be reconciled
-// on every continuation — which is the failure ListDueCommandsRequest documents
-// at length for a query whose bound genuinely cannot be restated. This one's
-// can: the bound IS a row's order, and a caller that has the row has the bound.
-type ListSessionCommandsRequest struct {
+// on every continuation — which is the failure ListDueDispositionCommandsRequest
+// documents at length for a query whose bound genuinely cannot be restated.
+// This one's can: the bound IS a row's order, and a caller that has the row has
+// the bound.
+type ListSessionDispositionCommandsRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
 
@@ -102,13 +127,15 @@ type ListSessionCommandsRequest struct {
 	Limit      int
 }
 
-// SessionCommandPage is one bounded ascending page of one session's inbox.
+// SessionDispositionCommandPage is one bounded ascending page of one session's
+// disposition inbox.
 //
-// Commands are in strictly increasing AcceptedOrder, every one of them above
-// the request's bound. They are the SAME InboxEntry values a named read of each
-// command returns, held to the same filing checks — there is no weaker
-// sweep-shaped variant, because a consumer acts on these rows and every write
-// it then makes is a compare-and-swap against the revision reported here.
+// Commands are in STRICTLY increasing AcceptedOrder, every one of them strictly
+// above the request's bound. They are the SAME DispositionInboxEntry values a
+// named read of each command returns, held to the same filing checks and to the
+// same catalog binding — there is no weaker sweep-shaped variant, because a
+// consumer acts on these rows and every write it then makes is a
+// compare-and-swap against the revision reported here.
 //
 // LIMIT is the EFFECTIVE limit after a zero request limit has been resolved to
 // the store's page size, so a caller that named no limit can still tell a full
@@ -121,35 +148,43 @@ type ListSessionCommandsRequest struct {
 // with.
 //
 // There is no Unreadable count, and its absence is the contract rather than an
-// omission — see ListSessionCommands.
-type SessionCommandPage struct {
-	Commands       []InboxEntry
+// omission — see ListSessionDispositionCommands.
+type SessionDispositionCommandPage struct {
+	Commands       []DispositionInboxEntry
 	Limit          int
 	NextAfterOrder uint64
 }
 
-// ListSessionCommands returns one bounded page of one session's commands in
-// ascending immutable acceptance order, strictly after the caller's bound.
+// ListSessionDispositionCommands returns one bounded page of one session's
+// disposition commands in ascending immutable acceptance order, strictly after
+// the caller's bound.
 //
 // It is a READ. It claims nothing, settles nothing and writes nothing; it does
 // not move the consumption cursor, which is a separate durable decision a
-// caller makes with SaveCommandCursor after it has acted.
+// caller makes with SaveDispositionCommandCursor after it has acted.
 //
-// ITS COST IS THE PAGE. One ListOrdered against one (namespace, ordering scope)
-// pair returns at most Limit rows, and nothing here reads the catalog, the
-// journal, an object or any other session. The deployment's tenant count, the
-// shard's population and the session's terminal history above the bound do not
-// appear in it. The session's terminal history BELOW the bound does not either,
-// which is the point of the bound.
+// ITS COST IS THE PAGE PLUS ONE CATALOG READ. One ListOrdered against one
+// (namespace, ordering scope) pair returns at most Limit rows, and the catalog
+// is read ONCE for the whole page rather than once per row — which is the one
+// place this listing is cheaper than ListDueDispositionCommands rather than
+// merely different, and it is cheaper for a reason rather than by luck: a due
+// sweep is handed rows from many sessions and must ask the binding question per
+// row, while every row here belongs to the one session the caller named.
+// Nothing here reads the journal, an object or any other session. The
+// deployment's tenant count, the shard's population and the session's settled
+// history above the bound do not appear in the cost. The session's settled
+// history BELOW the bound does not either, which is the point of the bound.
 //
-// IT VERIFIES THE SESSION'S WITNESSES, unlike ListDueCommands, and the
-// difference is the same one that decides every other read in this package: a
-// due sweep is HANDED its rows by the provider and derives no name, while this
-// call DERIVES the ordering scope from caller-supplied identities and must not
-// trust a derived name on its own. readInboxCommands makes that check before
-// the provider is asked for anything.
+// IT VERIFIES THE SESSION'S WITNESSES AND ITS CATALOG BINDING, unlike
+// ListDueDispositionCommands' per-row skipping, and the difference is the same
+// one that decides every other named read in this package: a due sweep is
+// HANDED its rows by the provider and derives no name, while this call DERIVES
+// the ordering scope from caller-supplied identities and must not trust a
+// derived name on its own. dispositionCatalog makes both checks — readCatalogEntry
+// verifies the collision witnesses, and the binding must be
+// ProtocolModeDisposition — before the provider is asked for a single row.
 //
-// IT FAILS CLOSED ON A ROW IT CANNOT VOUCH FOR, which is the other deliberate
+// IT FAILS CLOSED ON A ROW IT CANNOT VOUCH FOR, which is the deliberate
 // divergence from the due sweep, and it is worth stating as a decision rather
 // than discovering as a difference. The due view counts an unreadable row and
 // steps over it, because failing would switch reconciliation off for every
@@ -160,42 +195,54 @@ type SessionCommandPage struct {
 // command would never be applied and nothing would ever look at it again. And
 // the blast radius of failing is one session rather than one shard. So a row
 // that does not decode, that disagrees with its filing, or that carries another
-// session's identities fails the whole page, with the same typed error a named
-// read of that command would return. A PROVIDER TOMBSTONE fails it too, and for
-// the strongest reason of the set: nothing in this package deletes a command
-// row, so a tombstone in this stream is a record destroyed by something outside
-// it, and a consumer stepping over one would step over a command whose own
-// bytes it can no longer see.
+// session's identities or another binding fails the whole page, with the same
+// typed error a named read of that command would return. A PROVIDER TOMBSTONE
+// fails it too, and for the strongest reason of the set: nothing in this
+// package deletes a disposition command row, so a tombstone in this stream is a
+// record destroyed by something outside it, and a consumer stepping over one
+// would step over a command whose own bytes it can no longer see.
 //
 // WHAT FAILING CLOSED COSTS, stated plainly: one unreadable row stops that
-// session's consumer at that row, permanently, until the row is repaired. There
-// is no skip, no quarantine and no reporting channel — this package has neither
-// a logger nor anywhere in this page to record a skip, which is the same
-// limitation DueCommandPage states about locating an unreadable row. What an
-// operator has is the failure's field, the session's identities, and the fact
-// that the bound the page was read at narrows the row to the first one above
-// it.
-func (s *Store) ListSessionCommands(ctx context.Context, req ListSessionCommandsRequest) (SessionCommandPage, error) {
+// session's consumer at that row, permanently. There is no skip, no quarantine
+// and no reporting channel — this package has neither a logger nor anywhere in
+// this page to record a skip, which is the same limitation
+// DispositionDueCommandPage states about locating an unreadable row. AND THERE
+// IS NO REPAIR OPERATION EITHER: this package offers no way to rewrite a
+// corrupt command row, so "until the row is repaired" would name a remedy that
+// does not exist here. What an operator has is the failure's field, the
+// session's identities, and the fact that the bound the page was read at
+// narrows the row to the first one above it; the repair itself is a
+// provider-level act outside this module.
+func (s *Store) ListSessionDispositionCommands(
+	ctx context.Context, req ListSessionDispositionCommandsRequest,
+) (SessionDispositionCommandPage, error) {
 	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
 	if err != nil {
-		return SessionCommandPage{}, err
+		return SessionDispositionCommandPage{}, err
 	}
 	limit, ok := s.pageLimit(req.Limit)
 	if !ok {
-		return SessionCommandPage{}, inboxInvalid("limit", nil)
+		return SessionDispositionCommandPage{}, inboxInvalid("limit", nil)
 	}
 	opCtx, release, err := s.admitForeground(ctx)
 	if err != nil {
-		return SessionCommandPage{}, err
+		return SessionDispositionCommandPage{}, err
 	}
 	defer release()
-	if err := s.verifySessionScope(opCtx, scope); err != nil {
-		return SessionCommandPage{}, err
+	// The binding is the session's authority AND its witness verification, in
+	// one read, and it is read BEFORE any inbox row: a page of commands from a
+	// session whose catalog says another protocol is a page this store must not
+	// vouch for at all, and finding that out per row would be both slower and
+	// weaker.
+	binding, err := s.dispositionCatalog(opCtx, scope, req.TenantID, req.SessionID)
+	if err != nil {
+		return SessionDispositionCommandPage{}, err
 	}
 	provider, err := s.backend.OrderedIndex.ListOrdered(
-		opCtx, shardNamespace(inboxNamespace, scope.ControlShard), scope.SessionNamespace, req.AfterOrder, limit)
+		opCtx, shardNamespace(dispositionInboxNamespace, scope.ControlShard),
+		scope.SessionNamespace, req.AfterOrder, limit)
 	if err != nil {
-		return SessionCommandPage{}, classifyInboxOrderedError(err, "session_commands")
+		return SessionDispositionCommandPage{}, classifyInboxOrderedError(err, "session_commands")
 	}
 	// The provider's page is held to the request before any row is decoded. A
 	// reply longer than the limit is a backend failure rather than a bonus:
@@ -203,48 +250,68 @@ func (s *Store) ListSessionCommands(ctx context.Context, req ListSessionCommands
 	// work, and a caller that asked for one row and received a thousand has
 	// been handed an unbounded page by something it cannot see.
 	if len(provider.Records) > limit {
-		return SessionCommandPage{}, inboxErr(InboxErrorBackend, "limit", nil)
+		return SessionDispositionCommandPage{}, inboxErr(InboxErrorBackend, "limit", nil)
 	}
-	page := SessionCommandPage{Commands: make([]InboxEntry, 0, len(provider.Records)), Limit: limit}
+	page := SessionDispositionCommandPage{
+		Commands: make([]DispositionInboxEntry, 0, len(provider.Records)),
+		Limit:    limit,
+	}
+	// SEEDED WITH THE CALLER'S BOUND, not with zero, and that single assignment
+	// carries the word "strictly" in this method's contract. It makes the loop
+	// below enforce TWO things with one comparison: that the provider's rows
+	// ascend, and that the FIRST of them is strictly above the bound the caller
+	// gave. A provider that answered from the head of the stream, or handed
+	// back the row sitting exactly at the exclusive bound, is caught here and
+	// nowhere else.
 	previous := req.AfterOrder
 	for _, stored := range provider.Records {
 		if err := opCtx.Err(); err != nil {
-			return SessionCommandPage{}, err
+			return SessionDispositionCommandPage{}, err
 		}
 		// THE ORDER IS HELD TO THE CLAIM THIS CALL MAKES ABOUT IT, row by row,
-		// and this is the one check that cannot be delegated to inboxEntryFor.
-		// Every other check asks whether a row is what it says it is; this one
-		// asks whether the SEQUENCE the provider returned is the ascending,
-		// strictly-bounded one this method's documentation promises. A caller
-		// is forbidden from sorting the page for itself, so if the store does
-		// not verify the ordering nothing does, and "ascending acceptance
-		// order" becomes a sentence with no probe behind it.
+		// and this is the one check that cannot be delegated to
+		// dispositionInboxEntryFor. Every other check asks whether a row is
+		// what it says it is; this one asks whether the SEQUENCE the provider
+		// returned is the ascending, strictly-bounded one this method's
+		// documentation promises. A caller is forbidden from sorting the page
+		// for itself, so if the store does not verify the ordering nothing
+		// does, and "ascending acceptance order" becomes a sentence with no
+		// probe behind it.
+		//
+		// THE COMPARISON IS `<=` RATHER THAN `<`, and the difference is not
+		// pedantry. `<` would admit two rows carrying the SAME acceptance
+		// order — which for a consumption stream means the same command handed
+		// to a consumer twice in one page — and would admit a first row sitting
+		// exactly AT the caller's exclusive bound, which is the one row the
+		// caller has already consumed. Both are driven.
 		if stored.Order <= previous {
-			return SessionCommandPage{}, inboxIdentity("order", nil)
+			return SessionDispositionCommandPage{}, inboxIdentity("order", nil)
 		}
 		previous = stored.Order
-		// The row is decoded here and again inside inboxEntryFor, which is the
-		// same deliberate double decode dueCommandFor performs and for a
-		// related reason: this reader has no command identity to hold the row
-		// to, so it learns one from the row and then asks inboxEntryFor the
-		// same filing question a named read asks. Saving the second decode
-		// would mean a second, weaker check that only this listing uses.
+		// The row is decoded here and again inside dispositionInboxEntryFor,
+		// which is the same deliberate double decode dueDispositionFor performs
+		// and for a related reason: this reader has no command identity to hold
+		// the row to, so it learns one from the row and then asks
+		// dispositionInboxEntryFor the same filing question a named read asks.
+		// Saving the second decode would mean a second, weaker check that only
+		// this listing uses.
 		//
-		// NOTHING ELSE IS READ FROM record HERE, and the redundant identity
-		// comparison that used to stand at this point was removed rather than
-		// kept: inboxEntryFor already holds the row's own TenantID and
-		// SessionID to the two identities passed to it, so the check was a
+		// NOTHING ELSE IS READ FROM record HERE, and a redundant identity
+		// comparison that once stood at this point was removed rather than
+		// kept: dispositionInboxEntryFor already holds the row's own TenantID
+		// and SessionID to the two identities passed to it, so the check was a
 		// second copy of a rule that lives there, and mutation testing
 		// confirmed no test could tell the two copies apart. A guard that
 		// cannot fail independently of the guard beside it is not a second
 		// guard.
-		record, err := decodeInboxRecord(stored.Value)
+		record, err := decodeDispositionInboxRecord(stored.Value)
 		if err != nil {
-			return SessionCommandPage{}, err
+			return SessionDispositionCommandPage{}, err
 		}
-		entry, err := inboxEntryFor(stored, scope, req.TenantID, req.SessionID, record.CommandID)
+		entry, err := dispositionInboxEntryFor(
+			stored, scope, req.TenantID, req.SessionID, record.Descriptor.CommandID, binding)
 		if err != nil {
-			return SessionCommandPage{}, err
+			return SessionDispositionCommandPage{}, err
 		}
 		page.Commands = append(page.Commands, entry)
 	}
@@ -254,12 +321,12 @@ func (s *Store) ListSessionCommands(ctx context.Context, req ListSessionCommands
 		// provider answering an empty page with a position cannot hand a caller
 		// a bound it was never given rows for.
 		if provider.NextAfterOrder != 0 {
-			return SessionCommandPage{}, inboxIdentity("next_after_order", nil)
+			return SessionDispositionCommandPage{}, inboxIdentity("next_after_order", nil)
 		}
 		return page, nil
 	}
 	if provider.NextAfterOrder != previous {
-		return SessionCommandPage{}, inboxIdentity("next_after_order", nil)
+		return SessionDispositionCommandPage{}, inboxIdentity("next_after_order", nil)
 	}
 	page.NextAfterOrder = provider.NextAfterOrder
 	return page, nil
@@ -269,14 +336,16 @@ func (s *Store) ListSessionCommands(ctx context.Context, req ListSessionCommands
 // The durable consumption cursor
 // ---------------------------------------------------------------------------
 
-// CommandCursor is the durable record of how far one session's command consumer
-// has got, and of the lease epoch that last said so.
+// DispositionCommandCursor is the durable record of how far one session's
+// disposition command consumer has got, and of the residency epoch that last
+// said so.
 //
-// WHAT IT IS. ConsumedOrder is an immutable acceptance order from this
-// session's inbox, and the record's meaning is exactly: SOME CONSUMER ASSERTED
-// IT WAS DONE WITH EVERY COMMAND AT OR BELOW THIS POSITION. LeaseEpoch is the
-// epoch of the grant that last wrote the record and is its fencing high-water
-// mark; it never falls, which is why this record is never deleted.
+// WHAT IT IS. ConsumedOrder is an immutable acceptance order from THIS
+// session's DISPOSITION inbox, and the record's meaning is exactly: SOME
+// CONSUMER ASSERTED IT WAS DONE WITH EVERY COMMAND AT OR BELOW THIS POSITION.
+// LeaseEpoch is the epoch of the grant that last wrote the record and is its
+// fencing high-water mark; it never falls, which is why this record is never
+// deleted.
 //
 // WHAT IT IS NOT, and this half matters more, because the obvious reading of a
 // durable cursor is far stronger than what this row can support. It follows the
@@ -290,19 +359,19 @@ func (s *Store) ListSessionCommands(ctx context.Context, req ListSessionCommands
 //     command is its own record's State, reachable by name, and nothing here
 //     substitutes for reading it.
 //
-//  2. IT IS NOT PROOF THAT THE SAVER HELD A LIVE LEASE. The fence establishes
-//     that LeaseEpoch is at or above the greatest epoch previously committed to
-//     this row; it does not establish that the grant was still held at the
-//     compare-and-swap, and NO PATH IN THIS PACKAGE READS A LIVE LEASE on this
-//     record. Read the field as "who asked, at or above the mark", never as
-//     "who validly consumed".
+//  2. IT IS NOT PROOF THAT THE SAVER HELD A LIVE RESIDENCY. The fence
+//     establishes that LeaseEpoch is at or above the greatest epoch previously
+//     committed to this row; it does not establish that the grant was still
+//     held at the compare-and-swap, and NO PATH IN THIS PACKAGE READS A LIVE
+//     LEASE on this record. Read the field as "who asked, at or above the
+//     mark", never as "who validly consumed".
 //
 //  3. IT AUTHORIZES NOTHING. It licenses no claim, no dispatch, no settlement
 //     and no read. Every one of those goes through its own operation, with its
 //     own preconditions, and none of them consults this row.
 //
 //  4. IT SAYS NOTHING ABOUT COMMANDS ABOVE IT. In particular a command above
-//     the cursor may be applied, terminal, or claimed by someone else; the
+//     the cursor may be applied, settled, or claimed by someone else; the
 //     cursor is a consumer's position, not a watermark the inbox respects.
 //
 //  5. ZERO IS NOT PROOF THAT NOTHING WAS CONSUMED. It is proof that nothing was
@@ -311,6 +380,11 @@ func (s *Store) ListSessionCommands(ctx context.Context, req ListSessionCommands
 //     as history rather than as a starting position would re-present all
 //     hundred. Re-presentation is safe — command application is idempotent by
 //     identity — but a caller must know that is what it is relying on.
+//
+//  6. IT IS NOT COMPARABLE ACROSS SESSIONS OR PROTOCOLS, for the reason
+//     DispositionInboxEntry states about AcceptedOrder itself: the number is a
+//     position in one session's disposition stream and means nothing in any
+//     other.
 //
 // UpdatedAt is the STORE's clock, read when the request is validated and before
 // any provider call, exactly as SessionPointer's is and for the same reason:
@@ -323,7 +397,7 @@ func (s *Store) ListSessionCommands(ctx context.Context, req ListSessionCommands
 // the only safe reaper is one that removes the session's whole scope at once,
 // because deleting this row alone destroys a fence while leaving the session
 // writable.
-type CommandCursor struct {
+type DispositionCommandCursor struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
 
@@ -333,7 +407,7 @@ type CommandCursor struct {
 	UpdatedAt time.Time
 }
 
-// CommandCursorEntry is a cursor together with the revision a later
+// DispositionCommandCursorEntry is a cursor together with the revision a later
 // compare-and-swap names.
 //
 // The ZERO ENTRY is the answer for a session that has never recorded one, and
@@ -341,30 +415,30 @@ type CommandCursor struct {
 // exactly when nothing is recorded, because a zero order is refused on the way
 // in and no provider allocates one. A caller may therefore test the entry, the
 // cursor, or the order and get the same answer from all three.
-type CommandCursorEntry struct {
-	Cursor   CommandCursor
+type DispositionCommandCursorEntry struct {
+	Cursor   DispositionCommandCursor
 	Revision uint64
 }
 
-// LoadCommandCursorRequest reads one session's consumption cursor.
-type LoadCommandCursorRequest struct {
+// LoadDispositionCommandCursorRequest reads one session's consumption cursor.
+type LoadDispositionCommandCursorRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
 }
 
-// SaveCommandCursorRequest records one session's consumption cursor.
+// SaveDispositionCommandCursorRequest records one session's consumption cursor.
 //
-// LeaseEpoch is the grant's epoch and is compared against the record's
-// committed high-water mark. ConsumedOrder is the acceptance order the consumer
-// is done through and is compared against the record's committed order; both
-// are high-water marks and neither ever falls.
+// LeaseEpoch is the consumer's residency epoch and is compared against the
+// record's committed high-water mark. ConsumedOrder is the acceptance order the
+// consumer is done through and is compared against the record's committed
+// order; both are high-water marks and neither ever falls.
 //
 // There is no expected revision and no timestamp, for the reason
 // SetSessionPointerRequest carries neither: a cursor is not a decision a caller
 // makes about a record it has read — it is the current truth about how far a
 // consumer has got — so the write is closed against the revision this store
 // reads for itself.
-type SaveCommandCursorRequest struct {
+type SaveDispositionCommandCursorRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
 
@@ -372,8 +446,8 @@ type SaveCommandCursorRequest struct {
 	ConsumedOrder uint64
 }
 
-// LoadCommandCursor returns one session's consumption cursor, or the zero entry
-// when none has been recorded.
+// LoadDispositionCommandCursor returns one session's consumption cursor, or the
+// zero entry when none has been recorded.
 //
 // A MISSING CURSOR IS NOT AN ERROR, and that is the requirement rather than a
 // convenience. "Nothing has been consumed" is a complete, true and actionable
@@ -381,34 +455,46 @@ type SaveCommandCursorRequest struct {
 // reporting it as a failure would make every caller translate a not-found code
 // back into the zero it already means, and one caller would get it wrong.
 //
-// IT IS NOT WIDER THAN THAT. A stored row this reader cannot decode is NOT an
-// absent cursor; it is a fencing high-water mark that cannot be evaluated, and
-// it is reported as the typed failure it is. The hazard is entirely in that
-// direction: absence licenses SaveCommandCursor to create a fresh record at
-// whatever epoch and order the caller named, so a reader that reported an
-// unreadable row as absence would let any caller reset the fence.
+// IT IS NOT WIDER THAN THAT, in two directions a caller must know about.
 //
-// It verifies the session's collision witnesses before any provider read, so a
-// derived name is never trusted on its own.
-func (s *Store) LoadCommandCursor(ctx context.Context, req LoadCommandCursorRequest) (CommandCursorEntry, error) {
+// First, a stored row this reader cannot decode is NOT an absent cursor; it is
+// a fencing high-water mark that cannot be evaluated, and it is reported as the
+// typed failure it is. The hazard is entirely in that direction: absence
+// licenses SaveDispositionCommandCursor to create a fresh record at whatever
+// epoch and order the caller named, so a reader that reported an undecodable
+// row as absence would let any caller reset the fence.
+//
+// Second, this is a NAMED READ of the disposition family and takes that
+// family's authority check: it reads the catalog first, which verifies the
+// session's collision witnesses and requires ProtocolModeDisposition, exactly
+// as GetDispositionCommand does. A session with no catalog record, or one bound
+// to another protocol, is REFUSED rather than answered "zero". That refusal is
+// a *CatalogError and a caller must not translate it into "no commands"; the
+// zero entry is the answer for a session that EXISTS and has no cursor.
+func (s *Store) LoadDispositionCommandCursor(
+	ctx context.Context, req LoadDispositionCommandCursorRequest,
+) (DispositionCommandCursorEntry, error) {
 	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
 	if err != nil {
-		return CommandCursorEntry{}, err
+		return DispositionCommandCursorEntry{}, err
 	}
 	opCtx, release, err := s.admitForeground(ctx)
 	if err != nil {
-		return CommandCursorEntry{}, err
+		return DispositionCommandCursorEntry{}, err
 	}
 	defer release()
-	entry, _, err := s.readCommandCursor(opCtx, scope, req.TenantID, req.SessionID)
+	if _, err := s.dispositionCatalog(opCtx, scope, req.TenantID, req.SessionID); err != nil {
+		return DispositionCommandCursorEntry{}, err
+	}
+	entry, _, err := s.readDispositionCursor(opCtx, scope, req.TenantID, req.SessionID)
 	if err != nil {
-		return CommandCursorEntry{}, err
+		return DispositionCommandCursorEntry{}, err
 	}
 	return entry, nil
 }
 
-// SaveCommandCursor records how far a session's consumer has got, under the
-// caller's lease epoch.
+// SaveDispositionCommandCursor records how far a session's consumer has got,
+// under the caller's residency epoch.
 //
 // THE CONCURRENCY CONTRACT, stated in full because a consumer designs against
 // it. Three rules, in the order they are applied:
@@ -424,41 +510,58 @@ func (s *Store) LoadCommandCursor(ctx context.Context, req LoadCommandCursorRequ
 //     committed position. An equal one is admitted, so a save retried after an
 //     ambiguous outcome succeeds rather than reporting a regression.
 //
-//     THE ORDER OF THE TWO IS LOAD-BEARING and is the same argument setPointer
-//     makes: a superseded lease carrying a newer position must be told it has
-//     lost the session, not told to fetch newer data and retry, and a live
-//     lease carrying an older position must be told its position is stale, not
-//     that its authority is in doubt. The two failures ask for opposite
-//     responses, and reversing the checks would give a superseded Host an
-//     InboxErrorOrder it would retry forever.
+//     THE ORDER OF THE TWO IS LOAD-BEARING, AND THE CASE THAT DECIDES IT IS A
+//     CALLER BELOW *BOTH* MARKS. That is worth stating precisely, because the
+//     obvious candidate is the wrong one: a caller with a LOW EPOCH and a HIGH
+//     POSITION passes the order fence and is then refused by the epoch fence,
+//     so it receives InboxErrorEpoch under EITHER ordering and tells you
+//     nothing about which ran first. The caller whose answer actually changes
+//     is the one below both — a superseded lease that also holds a stale
+//     position. Epoch-first tells it "you have lost the session", which is
+//     terminal and correct; order-first would tell it "your position is stale",
+//     which invites it to fetch newer data and retry forever against a session
+//     it no longer owns. TestSaveDispositionCommandCursorFencesTheEpochBeforeTheOrder's
+//     `earlier_epoch, earlier_order` row is that probe, and it is the ONLY row
+//     that changes answer when the two calls are swapped.
 //
 //  3. THE WRITE IS A COMPARE-AND-SWAP on the revision this call just read. Two
 //     savers under the SAME epoch are therefore ordered by the provider, and
 //     the loser receives InboxErrorConflict carrying the actual revision rather
-//     than overwriting the winner. There is no lost update and no silent
-//     regression: a caller that retries re-reads, meets both fences again, and
-//     either advances the position or is told why it may not.
+//     than overwriting the winner. A LOST CREATE RACE IS THE SAME ANSWER: a
+//     create that finds the identity already present reports conflict, not
+//     success and not a corrupt-record failure, because the caller's correct
+//     response is identical — re-read and meet both fences.
 //
 // So the contract is: MANY CONCURRENT SAVERS ARE SAFE, the stored position is
-// non-decreasing under every interleaving, and every refusal is one of exactly
-// three typed answers — you have lost the session, your position is stale, or
-// you raced and should retry. What it is NOT is a lock: this call never waits,
-// never retries for a caller, and never blocks a second writer.
+// non-decreasing under every interleaving, and every CONCURRENCY refusal — that
+// is, every refusal of a well-formed request against a readable row — is one of
+// exactly three typed answers: you have lost the session (InboxErrorEpoch),
+// your position is stale (InboxErrorOrder), or you raced (InboxErrorConflict).
+// A MALFORMED REQUEST OR AN UNREADABLE ROW IS NOT ONE OF THOSE THREE and is not
+// claimed to be: an invalid request is InboxErrorInvalid, an undecodable row is
+// InboxErrorMalformed, a provider tombstone is InboxErrorDeleted, a session
+// bound to another protocol is a *CatalogError, and a provider failure is
+// InboxErrorBackend. A consumer's error classification must cover those too.
 //
-// WHAT A SUCCESSFUL SAVE PROVES is only what CommandCursor says it does. In
-// particular it is not evidence that the saver held a live lease at the swap;
-// the fence establishes an ordering against what is stored, and nothing in this
-// package reads a live lease here.
-func (s *Store) SaveCommandCursor(ctx context.Context, req SaveCommandCursorRequest) (CommandCursorEntry, error) {
+// What this is NOT is a lock: this call never waits, never retries for a
+// caller, and never blocks a second writer.
+//
+// WHAT A SUCCESSFUL SAVE PROVES is only what DispositionCommandCursor says it
+// does. In particular it is not evidence that the saver held a live residency
+// at the swap; the fence establishes an ordering against what is stored, and
+// nothing in this package reads a live lease here.
+func (s *Store) SaveDispositionCommandCursor(
+	ctx context.Context, req SaveDispositionCommandCursorRequest,
+) (DispositionCommandCursorEntry, error) {
 	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
 	if err != nil {
-		return CommandCursorEntry{}, err
+		return DispositionCommandCursorEntry{}, err
 	}
 	// Encoding validates, so an invalid request is refused before any provider
-	// work — including before the session's witnesses are bound. It returns the
-	// CANONICAL record over the request-shaped one built here, so nothing below
-	// can reach a form the stored bytes are not in.
-	value, cursor, err := encodeCommandCursor(CommandCursor{
+	// work — including before the catalog is read. It returns the CANONICAL
+	// record over the request-shaped one built here, so nothing below can reach
+	// a form the stored bytes are not in.
+	value, cursor, err := encodeDispositionCursor(DispositionCommandCursor{
 		TenantID:      req.TenantID,
 		SessionID:     req.SessionID,
 		LeaseEpoch:    req.LeaseEpoch,
@@ -466,49 +569,58 @@ func (s *Store) SaveCommandCursor(ctx context.Context, req SaveCommandCursorRequ
 		UpdatedAt:     s.clock.Now(),
 	})
 	if err != nil {
-		return CommandCursorEntry{}, err
+		return DispositionCommandCursorEntry{}, err
 	}
 	opCtx, release, err := s.admitForeground(ctx)
 	if err != nil {
-		return CommandCursorEntry{}, err
+		return DispositionCommandCursorEntry{}, err
 	}
 	defer release()
-	// A cursor is durable session data and may be the first record a session
-	// has — a Host can be handed a session whose commands are all still to come
-	// — so writing one binds the session's collision witnesses exactly as
-	// admitting a command does. The binding is create-only and idempotent.
-	if err := s.bindSessionScope(opCtx, scope); err != nil {
-		return CommandCursorEntry{}, err
+	// THE CATALOG IS THE AUTHORITY AND IT IS READ BEFORE ANYTHING IS WRITTEN.
+	// A cursor is a position in the disposition inbox, so a session whose
+	// catalog is not disposition-bound has no such positions and must not
+	// acquire a row claiming otherwise. This also verifies the collision
+	// witnesses, so a derived name is never trusted on its own.
+	if _, err := s.dispositionCatalog(opCtx, scope, req.TenantID, req.SessionID); err != nil {
+		return DispositionCommandCursorEntry{}, err
 	}
-	current, found, err := s.readCommandCursor(opCtx, scope, req.TenantID, req.SessionID)
+	// The protocol witness is bound as every disposition write binds it. On
+	// this path the catalog read above has already established the mode, so
+	// this is idempotent rather than decisive — it is here so that the set of
+	// disposition writes that bind the witness has no exceptions somebody has
+	// to remember.
+	if err := s.bindSessionScopeMode(opCtx, scope, ProtocolModeDisposition); err != nil {
+		return DispositionCommandCursorEntry{}, err
+	}
+	current, found, err := s.readDispositionCursor(opCtx, scope, req.TenantID, req.SessionID)
 	if err != nil {
-		return CommandCursorEntry{}, err
+		return DispositionCommandCursorEntry{}, err
 	}
 	if !found {
-		return s.createCommandCursor(opCtx, scope, cursor, value)
+		return s.createDispositionCursor(opCtx, scope, cursor, value)
 	}
-	if err := commandCursorEpochFence(current.Cursor, req.LeaseEpoch); err != nil {
-		return CommandCursorEntry{}, err
+	if err := dispositionCursorEpochFence(current.Cursor, req.LeaseEpoch); err != nil {
+		return DispositionCommandCursorEntry{}, err
 	}
-	if err := commandCursorOrderFence(current.Cursor, req.ConsumedOrder); err != nil {
-		return CommandCursorEntry{}, err
+	if err := dispositionCursorOrderFence(current.Cursor, req.ConsumedOrder); err != nil {
+		return DispositionCommandCursorEntry{}, err
 	}
-	return s.writeCommandCursor(opCtx, scope, cursor, value, current.Revision)
+	return s.writeDispositionCursor(opCtx, scope, cursor, value, current.Revision)
 }
 
-// commandCursorEpochFence admits a write against the cursor's committed
+// dispositionCursorEpochFence admits a write against the cursor's committed
 // high-water epoch. It is epochFence in the inbox's vocabulary, for the reason
 // pointerEpochFence is in the pointer's: the rule is shared, the NAME of a
 // violation belongs to the record.
 //
 // The refusal carries both marks, because a caller that has to raise its epoch
-// will have to satisfy the order too and one round trip is enough to learn
+// will have to satisfy the position too and one round trip is enough to learn
 // both.
 //
-// The zero check is deliberately NOT here: encodeCommandCursor makes it before
-// the read, so an epochless request is refused as the caller mistake it is
-// rather than being reported as whatever the read happened to find.
-func commandCursorEpochFence(current CommandCursor, epoch uint64) error {
+// The zero check is deliberately NOT here: encodeDispositionCursor makes it
+// before the read, so an epochless request is refused as the caller mistake it
+// is rather than being reported as whatever the read happened to find.
+func dispositionCursorEpochFence(current DispositionCommandCursor, epoch uint64) error {
 	return epochFence(current.LeaseEpoch, epoch, func(committed uint64) error {
 		return &InboxError{
 			Code:  InboxErrorEpoch,
@@ -519,14 +631,14 @@ func commandCursorEpochFence(current CommandCursor, epoch uint64) error {
 	})
 }
 
-// commandCursorOrderFence admits a write whose position is at least as far as
-// the one already recorded.
+// dispositionCursorOrderFence admits a write whose position is at least as far
+// as the one already recorded.
 //
 // It is the SAME SHAPE as the epoch fence and a different fact, which is why it
 // is a second function rather than a second call to the first: an equal order
 // is admitted, because a save retried after an ambiguous outcome must be able
 // to succeed, and only a strictly lower one is a regression.
-func commandCursorOrderFence(current CommandCursor, order uint64) error {
+func dispositionCursorOrderFence(current DispositionCommandCursor, order uint64) error {
 	if order < current.ConsumedOrder {
 		return &InboxError{
 			Code:  InboxErrorOrder,
@@ -538,7 +650,8 @@ func commandCursorOrderFence(current CommandCursor, order uint64) error {
 	return nil
 }
 
-// readCommandCursor reads the RAW stored cursor under an already-derived scope.
+// readDispositionCursor reads the RAW stored cursor under an already-derived
+// scope whose catalog its caller has already checked.
 //
 // It reports absence as a boolean rather than as an error because its two
 // callers give absence different meanings — a load answers zero, a save creates
@@ -549,81 +662,96 @@ func commandCursorOrderFence(current CommandCursor, order uint64) error {
 // an absent record: it is a fencing high-water mark that cannot be evaluated,
 // and reporting it as absence would let a save create straight over it at any
 // epoch and any position.
-func (s *Store) readCommandCursor(
+func (s *Store) readDispositionCursor(
 	ctx context.Context,
 	scope sessionScope,
 	tenant sessionwire.TenantID,
 	session sessionwire.SessionID,
-) (CommandCursorEntry, bool, error) {
-	if err := s.verifySessionScope(ctx, scope); err != nil {
-		return CommandCursorEntry{}, false, err
-	}
-	stored, err := s.backend.OrderedIndex.Get(ctx, commandCursorID(scope))
+) (DispositionCommandCursorEntry, bool, error) {
+	stored, err := s.backend.OrderedIndex.Get(ctx, dispositionCursorID(scope))
 	if err != nil {
 		if errors.As(err, new(*storage.OrderedRecordNotFoundError)) {
-			return CommandCursorEntry{}, false, nil
+			return DispositionCommandCursorEntry{}, false, nil
 		}
-		return CommandCursorEntry{}, false, classifyInboxOrderedError(err, "get")
+		return DispositionCommandCursorEntry{}, false, classifyInboxOrderedError(err, "get")
 	}
-	entry, err := commandCursorEntryFor(stored, scope, tenant, session)
+	entry, err := dispositionCursorEntryFor(stored, scope, tenant, session)
 	if err != nil {
-		return CommandCursorEntry{}, false, err
+		return DispositionCommandCursorEntry{}, false, err
 	}
 	return entry, true, nil
 }
 
-// createCommandCursor creates the first cursor a session has ever had.
+// createDispositionCursor creates the first cursor a session has ever had.
 //
-// A create that finds the identity already there is a lost race and is reported
-// as a conflict carrying the current revision, rather than being turned into an
-// update here. The reason is the fences: the record that arrived while this
-// call was in flight carries two high-water marks this request has never been
-// compared against, and evaluating them on this path would put a second copy of
-// both in the file. A caller retries and meets them on the ordinary path.
-func (s *Store) createCommandCursor(
+// A create that finds the identity already there is a LOST RACE and is reported
+// as InboxErrorConflict carrying the current revision, rather than being turned
+// into an update here. Two reasons, and the second is the one that makes this
+// branch worth its own test.
+//
+// The first is the fences: the record that arrived while this call was in
+// flight carries two high-water marks this request has never been compared
+// against, and evaluating them on this path would put a second copy of both in
+// the file. A caller retries and meets them on the ordinary path.
+//
+// The second is the ANSWER. Without this branch the call would fall through to
+// verifyCommandCursorBytes, which does catch the substitution — the winner's
+// bytes are not this caller's — but reports InboxErrorIdentity, "your record is
+// corrupt". That is the wrong instruction: a racing caller must retry, and
+// identity says do not. The SAFETY property would survive removing this branch;
+// the "you raced" arm of the three-answer contract would not. Two Hosts booting
+// on a session that has never had a cursor is exactly where this races.
+func (s *Store) createDispositionCursor(
 	ctx context.Context,
 	scope sessionScope,
-	cursor CommandCursor,
+	cursor DispositionCommandCursor,
 	value []byte,
-) (CommandCursorEntry, error) {
+) (DispositionCommandCursorEntry, error) {
 	stored, created, err := s.backend.OrderedIndex.Create(
-		ctx, commandCursorID(scope), scope.SessionNamespace, value, storage.Rank{}, commandCursorDue(cursor))
+		ctx, dispositionCursorID(scope), scope.SessionNamespace, value,
+		storage.Rank{}, dispositionCursorDue(cursor))
 	if err != nil {
-		return CommandCursorEntry{}, classifyInboxOrderedError(err, "create")
-	}
-	entry, err := commandCursorEntryFor(stored, scope, cursor.TenantID, cursor.SessionID)
-	if err != nil {
-		return CommandCursorEntry{}, err
+		return DispositionCommandCursorEntry{}, classifyInboxOrderedError(err, "create")
 	}
 	if !created {
-		return CommandCursorEntry{}, &InboxError{Code: InboxErrorConflict, Field: "create", Revision: entry.Revision}
+		// The revision is read from the provider's own reply rather than from a
+		// decode of it: a racing winner's row may be anything, including a row
+		// this reader would refuse, and a caller that lost a race needs to be
+		// told it lost regardless of what the winner wrote.
+		return DispositionCommandCursorEntry{}, &InboxError{
+			Code: InboxErrorConflict, Field: "create", Revision: stored.Revision}
 	}
-	return entry, verifyCommandCursorBytes(stored, value)
+	entry, err := dispositionCursorEntryFor(stored, scope, cursor.TenantID, cursor.SessionID)
+	if err != nil {
+		return DispositionCommandCursorEntry{}, err
+	}
+	return entry, verifyDispositionCursorBytes(stored, value)
 }
 
-// writeCommandCursor compare-and-swaps one cursor onto the revision its caller
-// read.
-func (s *Store) writeCommandCursor(
+// writeDispositionCursor compare-and-swaps one cursor onto the revision its
+// caller read.
+func (s *Store) writeDispositionCursor(
 	ctx context.Context,
 	scope sessionScope,
-	cursor CommandCursor,
+	cursor DispositionCommandCursor,
 	value []byte,
 	expectedRevision uint64,
-) (CommandCursorEntry, error) {
+) (DispositionCommandCursorEntry, error) {
 	stored, err := s.backend.OrderedIndex.Update(
-		ctx, commandCursorID(scope), expectedRevision, value, storage.Rank{}, commandCursorDue(cursor))
+		ctx, dispositionCursorID(scope), expectedRevision, value,
+		storage.Rank{}, dispositionCursorDue(cursor))
 	if err != nil {
-		return CommandCursorEntry{}, classifyInboxOrderedError(err, "update")
+		return DispositionCommandCursorEntry{}, classifyInboxOrderedError(err, "update")
 	}
-	entry, err := commandCursorEntryFor(stored, scope, cursor.TenantID, cursor.SessionID)
+	entry, err := dispositionCursorEntryFor(stored, scope, cursor.TenantID, cursor.SessionID)
 	if err != nil {
-		return CommandCursorEntry{}, err
+		return DispositionCommandCursorEntry{}, err
 	}
-	return entry, verifyCommandCursorBytes(stored, value)
+	return entry, verifyDispositionCursorBytes(stored, value)
 }
 
-// verifyCommandCursorBytes holds a write's reply to the bytes the write handed
-// the provider.
+// verifyDispositionCursorBytes holds a write's reply to the bytes the write
+// handed the provider.
 //
 // Every other check on this path holds the reply to the RECORD'S OWN bytes,
 // which a substituted record satisfies exactly as well as the real one. On a
@@ -634,26 +762,26 @@ func (s *Store) writeCommandCursor(
 // against.
 //
 // The comparison is exact because canonicalization is a fixed point: the bytes
-// were produced by encodeCommandCursor from a record that decodes and
+// were produced by encodeDispositionCursor from a record that decodes and
 // re-encodes to them.
-func verifyCommandCursorBytes(stored storage.OrderedRecord, value []byte) error {
+func verifyDispositionCursorBytes(stored storage.OrderedRecord, value []byte) error {
 	if !bytes.Equal(stored.Value, value) {
 		return inboxIdentity("value", nil)
 	}
 	return nil
 }
 
-// commandCursorID names the one ordered record per session per cursor role.
-func commandCursorID(scope sessionScope) storage.OrderedID {
+// dispositionCursorID names the one ordered record per session per cursor role.
+func dispositionCursorID(scope sessionScope) storage.OrderedID {
 	return storage.OrderedID{
-		Namespace:     commandCursorNamespace,
+		Namespace:     dispositionCursorNamespace,
 		OrderingScope: scope.SessionNamespace,
-		StableKey:     commandCursorStableKey,
+		StableKey:     dispositionCursorStableKey,
 	}
 }
 
-// commandCursorDue is the single definition of a cursor's due state, and like
-// its siblings it is a function of the RECORD rather than of the operation
+// dispositionCursorDue is the single definition of a cursor's due state, and
+// like its siblings it is a function of the RECORD rather than of the operation
 // writing it. Every write path calls it and the filing check compares against
 // it, so no path can file a due state a reader cannot rebuild from the bytes.
 //
@@ -669,9 +797,9 @@ func commandCursorID(scope sessionScope) storage.OrderedID {
 // read, so an operation-derived due makes every concurrent reader fail with an
 // identity error no retry can fix. It must also answer what removes a row from
 // that page, because nothing here does.
-func commandCursorDue(CommandCursor) storage.Due { return storage.Due{} }
+func dispositionCursorDue(DispositionCommandCursor) storage.Due { return storage.Due{} }
 
-// commandCursorEntryFor decodes one stored cursor and holds every
+// dispositionCursorEntryFor decodes one stored cursor and holds every
 // provider-supplied component of its filing to what the record's own bytes say
 // it should be, plus the identity the caller asked for.
 //
@@ -684,12 +812,15 @@ func commandCursorDue(CommandCursor) storage.Due { return storage.Due{} }
 //     outside this package, and the only safe answer is to refuse every read
 //     and write of that identity rather than let the next save create a fresh
 //     record.
-//   - The record's own TenantID and SessionID — held to the request, so a
-//     provider returning another session's row cannot hand a caller a position
-//     into someone else's inbox.
+//   - The record's OWN TenantID and SessionID — held to the request. This is
+//     NOT a restatement of checkFiledScope below, and the difference is the
+//     whole reason both exist: that check reads the PROVIDER-SUPPLIED FILING,
+//     this one reads the RECORD'S OWN BYTES, and the two come from different
+//     sources. A provider that filed a row correctly and answered with another
+//     session's bytes would pass the filing check and hand this caller another
+//     session's consumption position as its own.
 //   - StableKey — held to this package's constant. It asks whether the provider
-//     FILED the row where it said it did, which is a different question from
-//     whether the bytes are this session's.
+//     FILED the row where it said it did, which is a different question again.
 //   - OrderingScope, RankingScope and Due — the triad every session-scoped
 //     record files identically, through checkFiledScope.
 //   - Rank — compared as a WHOLE VALUE against what this file files. This
@@ -707,41 +838,44 @@ func commandCursorDue(CommandCursor) storage.Due { return storage.Due{} }
 //     expose it and nothing lists this namespace.
 //   - Revision is provider state with no meaning in the record; it is returned
 //     for a later compare-and-swap rather than verified.
-func commandCursorEntryFor(
+func dispositionCursorEntryFor(
 	stored storage.OrderedRecord,
 	scope sessionScope,
 	tenant sessionwire.TenantID,
 	session sessionwire.SessionID,
-) (CommandCursorEntry, error) {
+) (DispositionCommandCursorEntry, error) {
 	if stored.Deleted {
-		return CommandCursorEntry{}, inboxErr(InboxErrorDeleted, "record", nil)
+		return DispositionCommandCursorEntry{}, inboxErr(InboxErrorDeleted, "record", nil)
 	}
-	cursor, err := decodeCommandCursor(stored.Value)
+	cursor, err := decodeDispositionCursor(stored.Value)
 	if err != nil {
-		return CommandCursorEntry{}, err
+		return DispositionCommandCursorEntry{}, err
 	}
 	if cursor.TenantID != tenant || cursor.SessionID != session {
-		return CommandCursorEntry{}, inboxIdentity("record", nil)
+		return DispositionCommandCursorEntry{}, inboxIdentity("record", nil)
 	}
-	if stored.ID.StableKey != commandCursorStableKey {
-		return CommandCursorEntry{}, inboxIdentity("stable_key", nil)
+	if stored.ID.StableKey != dispositionCursorStableKey {
+		return DispositionCommandCursorEntry{}, inboxIdentity("stable_key", nil)
 	}
-	if err := checkFiledScope(stored, scope.SessionNamespace, commandCursorDue(cursor), inboxIdentity); err != nil {
-		return CommandCursorEntry{}, err
+	if err := checkFiledScope(stored, scope.SessionNamespace, dispositionCursorDue(cursor), inboxIdentity); err != nil {
+		return DispositionCommandCursorEntry{}, err
 	}
 	if stored.Rank != (storage.Rank{}) {
-		return CommandCursorEntry{}, inboxIdentity("rank", nil)
+		return DispositionCommandCursorEntry{}, inboxIdentity("rank", nil)
 	}
-	return CommandCursorEntry{Cursor: cursor, Revision: stored.Revision}, nil
+	return DispositionCommandCursorEntry{Cursor: cursor, Revision: stored.Revision}, nil
 }
 
-// commandCursorWire is the stored JSON shape.
+// dispositionCursorWire is the stored JSON shape.
 //
 // It is a PRIVATE DTO for the reason the disposition record's is: it fixes this
 // record's durable member names independently of the exported struct's Go field
 // names, so renaming an exported field cannot silently rewrite a stored record.
-// TestCommandCursorWireGolden pins the spelling with a byte literal.
-type commandCursorWire struct {
+// The exported DispositionCommandCursor deliberately carries NO JSON tags at
+// all, so there is nothing decorative for a reader to mistake for the durable
+// spelling. TestDispositionCommandCursorWireGolden pins that spelling with a
+// byte literal.
+type dispositionCursorWire struct {
 	RecordVersion uint8                 `json:"record_version"`
 	TenantID      sessionwire.TenantID  `json:"tenant_id"`
 	SessionID     sessionwire.SessionID `json:"session_id"`
@@ -750,20 +884,20 @@ type commandCursorWire struct {
 	UpdatedAt     time.Time             `json:"updated_at"`
 }
 
-// encodeCommandCursor validates and encodes one cursor, returning the CANONICAL
-// record beside the bytes.
+// encodeDispositionCursor validates and encodes one cursor, returning the
+// CANONICAL record beside the bytes.
 //
 // A caller must carry that record forward rather than the request-shaped value
 // it passed in, for the reason encodeSessionPointer states: the due state is
 // derived from the record, and deriving one from a record the stored bytes are
 // not in is exactly the divergence that makes every concurrent reader fail.
-func encodeCommandCursor(cursor CommandCursor) ([]byte, CommandCursor, error) {
-	cursor, err := canonicalCommandCursor(cursor)
+func encodeDispositionCursor(cursor DispositionCommandCursor) ([]byte, DispositionCommandCursor, error) {
+	cursor, err := canonicalDispositionCursor(cursor)
 	if err != nil {
-		return nil, CommandCursor{}, err
+		return nil, DispositionCommandCursor{}, err
 	}
-	encoded, err := json.Marshal(commandCursorWire{
-		RecordVersion: CommandCursorRecordVersion,
+	encoded, err := json.Marshal(dispositionCursorWire{
+		RecordVersion: DispositionCommandCursorRecordVersion,
 		TenantID:      cursor.TenantID,
 		SessionID:     cursor.SessionID,
 		LeaseEpoch:    cursor.LeaseEpoch,
@@ -771,25 +905,25 @@ func encodeCommandCursor(cursor CommandCursor) ([]byte, CommandCursor, error) {
 		UpdatedAt:     cursor.UpdatedAt,
 	})
 	if err != nil {
-		return nil, CommandCursor{}, inboxInvalid("record", err)
+		return nil, DispositionCommandCursor{}, inboxInvalid("record", err)
 	}
-	if len(encoded) > MaxCommandCursorRecordBytes {
-		return nil, CommandCursor{}, inboxErr(InboxErrorTooLarge, "record", nil)
+	if len(encoded) > MaxDispositionCommandCursorRecordBytes {
+		return nil, DispositionCommandCursor{}, inboxErr(InboxErrorTooLarge, "record", nil)
 	}
 	return encoded, cursor, nil
 }
 
-// decodeCommandCursor strictly decodes one stored cursor and re-validates it,
-// so a record corrupted in place cannot be handed to a caller or, worse, be
+// decodeDispositionCursor strictly decodes one stored cursor and re-validates
+// it, so a record corrupted in place cannot be handed to a caller or, worse, be
 // used as a fence a later write is measured against.
-func decodeCommandCursor(value []byte) (CommandCursor, error) {
-	wire, err := decodeVersionedRecord[commandCursorWire](
-		value, MaxCommandCursorRecordBytes, CommandCursorRecordVersion,
+func decodeDispositionCursor(value []byte) (DispositionCommandCursor, error) {
+	wire, err := decodeVersionedRecord[dispositionCursorWire](
+		value, MaxDispositionCommandCursorRecordBytes, DispositionCommandCursorRecordVersion,
 		versionedRecordFields{Record: "record", Version: "record_version"}, inboxRecordFailure)
 	if err != nil {
-		return CommandCursor{}, err
+		return DispositionCommandCursor{}, err
 	}
-	return canonicalCommandCursor(CommandCursor{
+	return canonicalDispositionCursor(DispositionCommandCursor{
 		TenantID:      wire.TenantID,
 		SessionID:     wire.SessionID,
 		LeaseEpoch:    wire.LeaseEpoch,
@@ -798,38 +932,45 @@ func decodeCommandCursor(value []byte) (CommandCursor, error) {
 	})
 }
 
-// canonicalCommandCursor validates a cursor and returns its one canonical
+// canonicalDispositionCursor validates a cursor and returns its one canonical
 // spelling. Encoding and decoding both end here, so a record read back is
 // byte-identical to the record written and two encoders cannot disagree.
 //
 // A ZERO CONSUMED ORDER IS REFUSED, and that refusal is what makes the zero
-// entry a complete answer. No provider allocates order zero — inboxEntryFor
-// rejects a row that claims one — so zero is not a position; it is this
-// record's spelling of "nothing recorded". Admitting a stored zero would make
-// an absent cursor and a recorded one indistinguishable to LoadCommandCursor,
-// and the zero-means-none contract would quietly stop being decidable.
+// entry a complete answer. No provider allocates order zero —
+// dispositionInboxEntryFor rejects a row that claims one — so zero is not a
+// position; it is this record's spelling of "nothing recorded". Admitting a
+// stored zero would make an absent cursor and a recorded one indistinguishable
+// to LoadDispositionCommandCursor, and the zero-means-none contract would
+// quietly stop being decidable.
 //
 // A ZERO LEASE EPOCH IS REFUSED for the reason canonicalSessionPointer refuses
 // one: the epoch is a fence, and a fence minted at zero admits every writer.
 //
+// THE INSTANT IS NORMALIZED TO UTC, and that line is load-bearing even though
+// nothing decides on UpdatedAt. Production's clock is time.Now(), so without it
+// two stores in different zones would write different durable spellings of the
+// same instant — and this record's "one canonical spelling, byte-identical on
+// read-back" property is exactly what verifyDispositionCursorBytes compares.
+//
 // The instant bounds are this package's own, as they are for every other
 // record: a year Go's JSON encoder cannot spell would otherwise be refused at
 // Marshal with an untyped failure rather than here.
-func canonicalCommandCursor(cursor CommandCursor) (CommandCursor, error) {
+func canonicalDispositionCursor(cursor DispositionCommandCursor) (DispositionCommandCursor, error) {
 	if err := cursor.TenantID.Validate(); err != nil {
-		return CommandCursor{}, inboxInvalid("tenant_id", err)
+		return DispositionCommandCursor{}, inboxInvalid("tenant_id", err)
 	}
 	if err := cursor.SessionID.Validate(); err != nil {
-		return CommandCursor{}, inboxInvalid("session_id", err)
+		return DispositionCommandCursor{}, inboxInvalid("session_id", err)
 	}
 	if cursor.LeaseEpoch == 0 {
-		return CommandCursor{}, inboxInvalid("lease_epoch", nil)
+		return DispositionCommandCursor{}, inboxInvalid("lease_epoch", nil)
 	}
 	if cursor.ConsumedOrder == 0 {
-		return CommandCursor{}, inboxInvalid("consumed_order", nil)
+		return DispositionCommandCursor{}, inboxInvalid("consumed_order", nil)
 	}
 	if !rankableTime(cursor.UpdatedAt) {
-		return CommandCursor{}, inboxInvalid("updated_at", nil)
+		return DispositionCommandCursor{}, inboxInvalid("updated_at", nil)
 	}
 	cursor.UpdatedAt = cursor.UpdatedAt.UTC()
 	return cursor, nil

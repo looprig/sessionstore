@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// FuzzCommandCursorCodec fuzzes stored consumption-cursor bytes. Its seeds are
+// FuzzDispositionCommandCursorCodec fuzzes stored consumption-cursor bytes. Its seeds are
 // real encodings rather than hand-written JSON, so a mutation starts from a
 // value that already reaches the strict decoder, the two zero refusals and the
 // instant rules, instead of bouncing off the first json.Unmarshal.
@@ -24,13 +24,13 @@ import (
 // whose stored bytes were never re-encoded through this path would otherwise
 // disagree with the bytes a write produces — which verifyCommandCursorBytes
 // compares exactly.
-func FuzzCommandCursorCodec(f *testing.F) {
-	base := CommandCursor{
+func FuzzDispositionCommandCursorCodec(f *testing.F) {
+	base := DispositionCommandCursor{
 		TenantID: catalogTenant, SessionID: catalogSession,
 		LeaseEpoch: consumptionEpoch, ConsumedOrder: consumptionOrder,
 		UpdatedAt: consumptionUpdatedAt,
 	}
-	seed, _, err := encodeCommandCursor(base)
+	seed, _, err := encodeDispositionCursor(base)
 	if err != nil {
 		f.Fatalf("seed does not encode: %v", err)
 	}
@@ -68,22 +68,22 @@ func FuzzCommandCursorCodec(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, value []byte) {
-		cursor, err := decodeCommandCursor(value)
+		cursor, err := decodeDispositionCursor(value)
 		if err != nil {
 			return
 		}
-		encoded, canonical, err := encodeCommandCursor(cursor)
+		encoded, canonical, err := encodeDispositionCursor(cursor)
 		if err != nil {
 			t.Fatalf("a decoded cursor did not re-encode: %v", err)
 		}
 		if canonical != cursor {
 			t.Fatalf("a decoded cursor was not canonical: %+v want %+v", canonical, cursor)
 		}
-		again, err := decodeCommandCursor(encoded)
+		again, err := decodeDispositionCursor(encoded)
 		if err != nil {
 			t.Fatalf("a re-encoded cursor did not decode: %v", err)
 		}
-		reencoded, _, err := encodeCommandCursor(again)
+		reencoded, _, err := encodeDispositionCursor(again)
 		if err != nil {
 			t.Fatalf("re-encode: %v", err)
 		}

@@ -270,7 +270,8 @@ ledger is append-only, so nothing inside that range can move. A cursor carrying
 an inflated captured tip cannot widen the snapshot.
 
 **The per-session acceptance stream is a third case, and it is strong.**
-`ListSessionCommands` pages one session's inbox by `ListOrdered`, which walks the
+`ListSessionDispositionCommands` pages one session's disposition inbox by
+`ListOrdered`, which walks the
 IMMUTABLE acceptance order rather than a live ranked or due view. A row's order
 never moves, so nothing can be skipped or returned twice across a continuation,
 and the bound is a row's own order rather than an opaque token. It also fails
@@ -745,19 +746,39 @@ settle a `pending` or lapsed-`claimed` command and nothing else.
 
 ## Consuming a session's commands: an immutable stream and a durable cursor
 
-`ListSessionCommands` and `ListDueCommands` read the SAME inbox rows through two
-different provider views, and neither is derivable from the other.
+**These operate on the DISPOSITION command family, and that is not an arbitrary
+choice.** A session's protocol mode is a create-only immutable pin, and
+`AcquireResidency` refuses any session whose catalog binding is not
+`ProtocolModeDisposition`. So every session anything can hold a residency over —
+and therefore every session anything can consume commands for — is
+disposition-bound, and the legacy inbox (`sessionstore/inbox`) is unreachable
+from a consumer. A per-session listing and cursor built over the legacy family
+would be correct code that no consumer could call: the cursor's first write
+would try to pin `legacy` on a scope already pinned `disposition` and be refused
+with a catalog conflict, permanently, with no retry that can help. That is not
+hypothetical — it is what the first version of this pair did.
 
-`ListDueCommands` answers "what in this SHARD needs attention by this instant".
-It is cross-session by its request type, ordered by a deadline, and a terminal
-command leaves it altogether because `inboxDue` files one NOT DUE. Every one of
-those is right for a reconciler and wrong for a consumer.
+`ListSessionDispositionCommands` and `ListDueDispositionCommands` read the SAME
+inbox rows through two different provider views, and neither is derivable from
+the other.
 
-`ListSessionCommands(tenant, session, afterOrder, limit)` answers "what has this
-SESSION accepted, in the order it accepted it, after here". The bound is the
-caller's and the ordering is the store's: a consumer that sorted a page for
-itself would be inferring an order rather than reading one. Terminal commands
-stay in the stream, which is what makes a cursor meaningful at all.
+`ListDueDispositionCommands` answers "what in this SHARD needs attention by this
+instant". It is cross-session by its request type, ordered by a deadline, and a
+settled command leaves it altogether because `dispositionInboxDue` files one NOT
+DUE. Every one of those is right for a reconciler and wrong for a consumer.
+
+`ListSessionDispositionCommands(tenant, session, afterOrder, limit)` answers
+"what has this SESSION accepted, in the order it accepted it, after here". The
+bound is the caller's and the ordering is the store's: a consumer that sorted a
+page for itself would be inferring an order rather than reading one. Settled
+commands stay in the stream, which is what makes a cursor meaningful at all —
+a stream that dropped them would make a cursor name a row it can no longer
+produce.
+
+Its cost is the page plus **one** catalog read, not one per row, because every
+row belongs to the one session the caller named; the due sweep is handed rows
+from many sessions and has to ask the binding question per row. That catalog
+read is also the authority check and the witness verification.
 
 **It fails closed on a row it cannot vouch for**, which is the deliberate
 divergence from the due sweep. The due view counts an unreadable row and steps
@@ -767,42 +788,58 @@ row quietly missing would act on what it received and then advance its durable
 cursor PAST the row, so the command would never be applied and nothing would
 look at it again — and the blast radius of failing is one session rather than one
 shard. The cost is real and is not hidden: one unreadable row stops that
-session's consumer at that row until the row is repaired, and there is no skip,
-no quarantine and no reporting channel.
+session's consumer at that row, there is no skip, no quarantine and no reporting
+channel, **and this package offers no repair operation for a command row** — the
+remedy, if there is one, is a provider-level act outside this module.
 
-`LoadCommandCursor` and `SaveCommandCursor` are the durable consumption cursor —
-one permanent, epoch-fenced row per session, in its own unsharded namespace.
-`LoadCommandCursor` answers the ZERO ENTRY for a session that has recorded none,
-because "nothing has been consumed" is exactly the starting position of a fresh
-consumer. That answer is narrow: an undecodable stored row is NOT an absent
-cursor, it is a fence that cannot be evaluated, and it is reported as the typed
-failure it is.
+`LoadDispositionCommandCursor` and `SaveDispositionCommandCursor` are the durable
+consumption cursor — one permanent, epoch-fenced row per session, in its own
+unsharded namespace, whose name carries the disposition family because an
+acceptance order from one inbox means nothing in the other.
+`LoadDispositionCommandCursor` answers the ZERO ENTRY for a session that has
+recorded none, because "nothing has been consumed" is exactly the starting
+position of a fresh consumer. That answer is narrow in two directions: an
+undecodable stored row is NOT an absent cursor, it is a fence that cannot be
+evaluated; and a session with no disposition catalog is REFUSED rather than
+answered zero, because both operations take the disposition family's authority
+check exactly as `GetDispositionCommand` does.
 
-A save is fenced twice, epoch first and position second, for the reason
-`setPointer` gives: a superseded lease carrying a newer position must be told it
-has lost the session, and a live lease carrying an older position must be told
-its position is stale. An equal epoch and an equal position are both admitted, so
-one grant may save many times and a save retried after an ambiguous outcome
-succeeds. The write itself is a revision compare-and-swap, so concurrent savers
-under one epoch are ordered by the provider and the loser is told to retry rather
-than overwriting the winner. Every refusal is one of exactly three typed answers:
-you have lost the session, your position is stale, or you raced.
+A save is fenced twice, **epoch first and position second**. The case that
+decides the ordering is a caller below **both** marks, and it is worth naming
+precisely because the obvious candidate is the wrong one: a caller with a low
+epoch and a *high* position passes the position fence and is refused by the
+epoch fence, so it is told the same thing under either ordering. The caller
+whose answer changes is the superseded lease that *also* holds a stale position.
+Epoch-first tells it "you have lost the session", which is terminal and correct;
+position-first would tell it "your position is stale" and invite it to fetch
+newer data and retry forever against a session it no longer owns.
+
+An equal epoch and an equal position are both admitted, so one grant may save
+many times and a save retried after an ambiguous outcome succeeds. The write
+itself is a revision compare-and-swap, so concurrent savers under one epoch are
+ordered by the provider and the loser is told to retry rather than overwriting
+the winner; a lost *create* race is the same answer, for the same reason.
+
+**Every CONCURRENCY refusal — that is, every refusal of a well-formed request
+against a readable row — is one of exactly three typed answers**: you have lost
+the session (`epoch`), your position is stale (`order`), or you raced
+(`conflict`). That scope is the whole sentence and not a hedge: a malformed
+request is `invalid`, an undecodable row is `malformed`, a provider tombstone is
+`deleted`, a session bound to another protocol is a `*CatalogError`, and a
+provider failure is `backend`. A consumer's error classification must cover
+those too.
 
 **The cursor is consumption context, not authority**, in the same sense
 `SettlingResidencyEpoch` is settlement context. It does not prove any command
 was applied — a consumer that rejected three of ten writes the same row as one
 that applied all ten, and the authoritative state of a command is its own
-record's. It does not prove the saver held a LIVE lease at the swap; no path in
-this package reads a live lease on this record, so read the stored epoch as "who
-asked, at or above the mark". It authorizes nothing. It says nothing about
-commands above it. And zero does not prove nothing was consumed — it proves
-nothing was RECORDED, so a consumer that crashed before its first save leaves
-zero, and a successor re-presents work it is relying on being idempotent by
-identity.
-
-Both operations verify the session's collision witnesses, like every other named
-read here, so a session with no durable data at all is refused rather than
-answered about. A save is the operation that BINDS such a session.
+record's. It does not prove the saver held a LIVE residency at the swap; no path
+in this package reads a live lease on this record, so read the stored epoch as
+"who asked, at or above the mark". It authorizes nothing. It says nothing about
+commands above it. It is not comparable across sessions or protocols. And zero
+does not prove nothing was consumed — it proves nothing was RECORDED, so a
+consumer that crashed before its first save leaves zero, and a successor
+re-presents work it is relying on being idempotent by identity.
 
 ## Recovering an application from the journal
 
