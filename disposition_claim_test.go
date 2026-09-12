@@ -408,6 +408,54 @@ func TestDispositionClaimEdgesValidateBeforeAnyRead(t *testing.T) {
 			}
 		})
 	}
+
+	// The claim edge's numbered refusal 0. — a residency that is not a grant this
+	// store issued for this session is refused "before anything is read" — is the
+	// newest of these and was the one this instrument did not measure. It is a
+	// separate case rather than a table row because it has no reject-edge
+	// counterpart: that edge takes a bare epoch and has no grant to refuse.
+	t.Run("a residency this store did not issue", func(t *testing.T) {
+		backend := memstore.New()
+		counter := &countingOrderedIndex{OrderedIndex: backend.OrderedIndex}
+		backend.OrderedIndex = counter
+		clock := newMovableClock(settlementNow)
+		s := openStore(t, backend, WithClock(clock))
+		_, _, admitted, grant := withClaimFixture(t, s, clock)
+
+		for _, tc := range []struct {
+			name  string
+			grant *ResidencyGrant
+		}{
+			{"no grant at all", nil},
+			{"a released grant", grant},
+		} {
+			if tc.name == "a released grant" {
+				if err := grant.Release(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			counter.gets = 0
+			_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, tc.grant, settlementExpiry))
+			invalid := assertInboxCode(t, err, InboxErrorInvalid)
+			if ok || invalid.Field != "residency" || counter.gets != 0 {
+				t.Fatalf("%s: field %q ok %v reads %d, want residency false 0", tc.name, invalid.Field, ok, counter.gets)
+			}
+		}
+		// The control: the counter is not stuck at zero. A request that gets past
+		// the request-shaped refusals DOES read.
+		counter.gets = 0
+		if _, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant, settlementExpiry)); ok || err == nil {
+			t.Fatalf("CONTROL: the released grant was accepted on a second call: %v %v", ok, err)
+		}
+		reject := rejectRequest(admitted, 0)
+		counter.gets = 0
+		if _, ok, err := s.RejectDispositionCommand(context.Background(), reject); err != nil || !ok {
+			t.Fatalf("CONTROL setup: %v %v", ok, err)
+		}
+		if counter.gets == 0 {
+			t.Fatal("CONTROL: a request that reaches the record performed zero reads, so counter.gets == 0 proves nothing above")
+		}
+	})
 }
 
 // The claim edge's own request members are validated too, and the expiry bound
@@ -944,6 +992,83 @@ func TestClaimDispositionCommandRefusesAResidencyItDidNotIssue(t *testing.T) {
 		assertDispositionUnchanged(t, s, admitted)
 	})
 
+	// THE TENANT CONJUNCT, which is the one no other fixture in this file can
+	// reach: every other fixture uses catalogTenant and nothing else, so a rule
+	// that only differs when the TENANT differs is invisible to all of them.
+	//
+	// It is load-bearing rather than tidy, and the reason is the Storage contract
+	// the whole capability argument rests on. `Leaser.Acquire` guarantees only
+	// that "a later grant of THE SAME NAME has a strictly greater epoch", and the
+	// residency lease name is scope.SessionNamespace+"/residency/lease", where
+	// deriveSessionScope digests TENANT AND SESSION TOGETHER. So two tenants
+	// sharing a session id have two independent lease sequences, and tenant B's
+	// epoch is a meaningless number in tenant A's record — one that can sit far
+	// above anything A's provider has issued and jam A's command permanently.
+	// This conjunct is exactly what makes the contract's "same name" precondition
+	// hold.
+	t.Run("a grant for another tenant with the same session id", func(t *testing.T) {
+		const otherTenant = sessionwire.TenantID("tenant-b")
+		clock := newMovableClock(settlementNow)
+		s := openStore(t, memstore.New(), WithClock(clock))
+		createDispositionCatalog(t, s)
+		admitted, _, err := s.AdmitDispositionCommand(context.Background(), dispositionRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		victim := acquireTestResidency(t, s)
+
+		// The SAME session id under a different tenant: a different scope, and
+		// therefore a different lease namespace with its own epoch sequence.
+		req := testCreateRequest()
+		req.TenantID = otherTenant
+		req.SessionID = catalogSession
+		req.Binding = testSessionBinding()
+		if _, _, err := s.CreateCatalogEntry(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+		// Run that sequence ahead, so the foreign epoch is one the victim's own
+		// provider has NOT issued and is strictly above the victim's.
+		var foreign *ResidencyGrant
+		for i := 0; i < 4; i++ {
+			g, err := s.AcquireResidency(context.Background(), AcquireResidencyRequest{TenantID: otherTenant, SessionID: catalogSession})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if foreign != nil {
+				if err := foreign.Release(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			foreign = g
+			if i < 3 {
+				if err := foreign.Release(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				foreign = nil
+			}
+		}
+		t.Cleanup(func() { _ = foreign.Release(context.Background()) })
+		if foreign.Epoch() <= victim.Epoch() {
+			t.Fatalf("VACUOUS: the foreign tenant's epoch %d is not above the victim's %d, so accepting it would not jam the record and this test could pass for the wrong reason", foreign.Epoch(), victim.Epoch())
+		}
+		if admitted.Record.Descriptor.SessionID != req.SessionID {
+			t.Fatalf("VACUOUS: the two sessions do not share an id (%q vs %q), so this is the cross-SESSION case again rather than the cross-TENANT one", admitted.Record.Descriptor.SessionID, req.SessionID)
+		}
+
+		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, foreign, settlementExpiry))
+		invalid := assertInboxCode(t, err, InboxErrorInvalid)
+		if ok || invalid.Field != "residency" {
+			t.Fatalf("field = %q, want residency (ok=%v)", invalid.Field, ok)
+		}
+		assertDispositionUnchanged(t, s, admitted)
+		// And the victim's own Host is still able to claim, which is what the
+		// refusal above protects: accepting the foreign grant would have stored
+		// its epoch as the mark and locked this out permanently.
+		if _, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, victim, settlementExpiry)); err != nil || !ok {
+			t.Fatalf("the victim's own Host was locked out of its own command: %v %v", ok, err)
+		}
+	})
+
 	t.Run("a grant from another store", func(t *testing.T) {
 		s, _, admitted, _ := claimFixture(t)
 		other := openStore(t, memstore.New(), WithClock(newMovableClock(settlementNow)))
@@ -970,23 +1095,48 @@ func TestClaimDispositionCommandRefusesAResidencyItDidNotIssue(t *testing.T) {
 	})
 }
 
-// F1's structural half. The capability only bounds the mark while the claim edge
-// stays the ONLY thing that writes a DispositionClaim, so that is checked against
-// the sources rather than asserted in prose.
+// F1's structural half: a TRIPWIRE, not a boundary, and the difference is stated
+// here because a reader will otherwise credit it with more than it does.
 //
-// It is a spelling lock, like TestEveryDispositionTerminalCallSiteIsDriven, and
-// the trade is the same: a new writer fails here loudly instead of widening the
-// mark's provenance silently. A writer that legitimately needs to exist adds
-// itself to the allowed set, which is a one-line change and a decision someone
-// has to make on purpose.
+// # What it is NOT
+//
+// It is NOT what makes the mark's provenance safe. That is the capability: the
+// exported request carries a *ResidencyGrant, so no caller outside this package
+// can express an epoch the provider did not issue, whatever this scan says. This
+// test narrows the ways a NEW IN-PACKAGE WRITER can appear without anyone
+// noticing. It is a spelling lock, like TestEveryDispositionTerminalCallSiteIsDriven.
+//
+// # What this scan cannot see — the residue, stated as a residue
+//
+// The unit is a syntactic construction of the type in one production file in the
+// package root. So it is blind to, and these are measured rather than supposed:
+//
+//   - A DEREFERENCE COPY. `c := *src; c.ResidencyEpoch = …` constructs a claim
+//     carrying any epoch at all and is invisible here, because the type name
+//     never appears. This is not hypothetical: validateDispositionState already
+//     uses exactly that shape (`claim := *r.Claim` … `r.Claim = &claim`) and is
+//     NOT in the allowed set below. Catching it needs go/types, not go/ast.
+//   - ATTRIBUTION BY BARE FUNCTION NAME. A method named `claim` on any type
+//     inherits the wire decoder's allowance.
+//   - A QUALIFIED type (`sessionstore.DispositionClaim{…}`), which is a
+//     SelectorExpr rather than an Ident. Harmless today only because subpackages
+//     are not scanned at all — which is the fourth blind spot.
+//
+// A writer that legitimately needs to exist adds itself to the allowed set: a
+// one-line change, and a decision someone has to make on purpose.
 func TestOnlyTheClaimEdgeAndTheCodecConstructADispositionClaim(t *testing.T) {
 	t.Parallel()
-	// Each entry is a decision, not a label. Two of the three cannot carry a
-	// caller's number at all, which is why they are harmless:
+	// Each entry is a decision, not a label. The question each answers is not
+	// "does it hold an epoch" but "can it ORIGINATE one that no provider issued".
 	allowed := map[string]string{
-		"ClaimDispositionCommand":    "THE PRODUCER. Gated on a *ResidencyGrant, so its epoch is the provider's",
-		"claim":                      "the wire decoder: rebuilds a claim from bytes already stored",
-		"dispositionRecordHighWater": "a ZERO claim, used only as the absent-mark reader; carries no epoch",
+		"ClaimDispositionCommand": "THE PRODUCER. Gated on a *ResidencyGrant, so its epoch is the provider's",
+		"claim":                   "the wire decoder: rebuilds a claim from bytes already stored, so its epoch was already durable",
+		// NOT "a zero claim carrying no epoch" — that was wrong. The declaration
+		// is a zero value which is then OVERWRITTEN with the record's own stored
+		// claim, epoch and all. What makes it safe is that it never ORIGINATES an
+		// epoch: it copies one that is already in the record, read-only, to hand
+		// to the fence.
+		"dispositionRecordHighWater": "the absent-mark reader: a zero declaration, overwritten with the record's own stored claim; originates no epoch",
 	}
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(".")

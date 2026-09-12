@@ -125,9 +125,37 @@ import (
 //
 // # Why the other edges keep a bare epoch, which is not an inconsistency
 //
-// The distinction is whether the store DECIDES from the value or merely RECORDS
-// it. SettlingResidencyEpoch is recorded and never read back, which is why
-// AGENTS.md can call it settlement context and leave it caller-asserted.
+// The rule, stated so that it actually sorts this package rather than sounding
+// like it does:
+//
+//	A caller-asserted value is safe when it is BOUNDED, SELF-LIMITING, or
+//	COMPARED AND DISCARDED. It must be store-issued when it becomes a MONOTONIC
+//	BOUND ON FUTURE CALLERS that is UNBOUNDED ABOVE and OUTLIVES THE STATE THAT
+//	CARRIED IT.
+//
+// "The store decides from it" is NOT the rule, and the distinction matters
+// because the shorter sentence is the one a reader will remember. Three
+// caller-asserted values in this same file are decided from, two of them are
+// written, and none is store-issued — and all three are fine:
+//
+//   - ExpectedRevision is compared and discarded. Every compare-and-swap here
+//     decides from it, and it never becomes state.
+//   - ClaimExpiresAt is written AND decided from — liveness, the deadline race,
+//     replay identity — but it is BOUNDED (MaxCommandClaimTTL, and it must be in
+//     the future) and SELF-LIMITING: it lapses, and the record recovers.
+//   - ApplyDeadline is written at admission and decides the deadline refusal,
+//     and it is bounded by the same rankable-time rule every stored instant is.
+//
+// Claim.ResidencyEpoch is none of those. It is written, it is UNBOUNDED ABOVE,
+// and — the property that actually does the work — it OUTLIVES THE CLAIM:
+// dispositionRecordHighWater reads it with no liveness test, and the fence runs
+// BEFORE the live check at both edges, so a lapsed claim still supersedes. That
+// is what makes a bad value permanent rather than merely temporary, and it is
+// the whole discriminator. TestClaimDispositionCommandRefusalOrder's "superseded
+// residency before the deadline and a lapsed claim" is the case that proves it.
+//
+// Applying that rule to this protocol's four residency-bearing APIs:
+// SettlingResidencyEpoch is recorded and never read back.
 // BeginDispositionAttempt's epoch is fenced to equal the claim's own, so it
 // cannot raise the mark. RejectDispositionCommand writes no claim at all, so it
 // cannot either — and it must accept a zero, because a reconciler holds no
