@@ -280,10 +280,20 @@ func dispositionInboxID(scope sessionScope, command sessionwire.CommandID) stora
 }
 
 // dispositionInboxDue files a command at its apply deadline until it is
-// settled, and files a settled one nowhere. The deadline is the whole horizon:
-// this protocol has no reclaim horizon to fold in, because an applying command
-// is closed by evidence rather than by a claim lapsing, and a claim edge that
-// would need one does not exist yet.
+// settled, and files a settled one nowhere. The deadline is the whole horizon,
+// and it stays the whole horizon now that ClaimDispositionCommand exists:
+//
+//   - An APPLYING command is closed by evidence rather than by a claim lapsing,
+//     so no claim-shaped horizon could close one.
+//   - A CLAIMED command whose claim has lapsed is already filed at its
+//     deadline, and ClaimDispositionCommand admits an ordinary claim over a
+//     lapsed one at any instant before that deadline, so a second due state
+//     would name a moment nothing needs to be woken for.
+//
+// What that costs is the hazard legacy inboxDue documents, inherited rather
+// than avoided: a claim that outlives the apply deadline occupies a due place
+// it cannot be settled from until it lapses. It is bounded by
+// MaxCommandClaimTTL, which is exactly what that constant exists for.
 func dispositionInboxDue(r DispositionInboxRecord) storage.Due {
 	if r.State.terminal() {
 		return storage.Due{}
@@ -547,7 +557,7 @@ func canonicalDispositionInboxRecord(r DispositionInboxRecord) (DispositionInbox
 // validateDispositionState enumerates the states this record has and states,
 // for each one, exactly which of the three post-admission members it must and
 // must not carry. It is the record's own rule rather than a transition's, so a
-// record assembled by any route — a transition, a decode, a future claim edge —
+// record assembled by any route — a transition, a decode, the claim edge —
 // is held to the same thing, and a member that contradicts the state cannot be
 // stored at all.
 //
@@ -570,8 +580,8 @@ func canonicalDispositionInboxRecord(r DispositionInboxRecord) (DispositionInbox
 func validateDispositionState(r *DispositionInboxRecord) error {
 	if r.Claim != nil {
 		claim := *r.Claim
-		if claim.ResidencyEpoch == 0 || !rankableTime(claim.ExpiresAt) {
-			return inboxInvalid("claim", nil)
+		if err := validateDispositionClaim(claim); err != nil {
+			return err
 		}
 		r.Claim = &claim
 	}
@@ -592,15 +602,17 @@ func validateDispositionState(r *DispositionInboxRecord) error {
 	// The claim and the attempt name the SAME residency whenever both are
 	// present.
 	//
-	// Read this as a constraint on code NOT YET WRITTEN, because that is the
-	// load-bearing half. There is no in-package writer of a DispositionClaim at
-	// all — claims enter only through the wire decoder — so saying "every writer
-	// here already produces the equality" understates it. Any future claim edge
-	// that raises a claim's residency over a stored attempt now makes that record
-	// UNENCODABLE, and will have to clear the attempt or move both members
-	// together. That is the intended constraint and it fails closed, but it
-	// belongs written down here rather than discovered as an encode refusal by
-	// whoever builds that edge.
+	// Read this as a constraint on every WRITER, present and future, because
+	// that is the load-bearing half. When this rule was written there was no in-package
+	// writer of a DispositionClaim at all; ClaimDispositionCommand is now one,
+	// and it satisfies the rule the only way that keeps it satisfiable: it
+	// REFUSES ANY RECORD CARRYING AN ATTEMPT, so it never raises a claim's
+	// residency over a stored attempt and never has to decide whether to clear
+	// one. A record whose two residencies disagreed would be UNENCODABLE, which
+	// is the fail-closed outcome — but it is a worse diagnostic than the state
+	// refusal, so the edge answers first. Any FURTHER writer is under the same
+	// constraint and has the same two options: refuse the attempt, or move both
+	// members together.
 	//
 	// This is a NARROWING of the codec and it is being made while it is
 	// still free: released v0.5.0's canonicalDispositionInboxRecord refuses any
@@ -636,18 +648,18 @@ func validateDispositionState(r *DispositionInboxRecord) error {
 		// been durably authorized, so such a record has no attempt by
 		// definition, has no claim at all when it was still pending, and can
 		// carry no outcome — every outcome here is keyed by the attempt it
-		// settles. This case exists so that shape is STORABLE. The transition
-		// that writes one is NOT implemented and admission still starts every
-		// record pending; a validator that accepts more never invalidates a
-		// stored record, which is why widening it is free before the shape has
-		// a producer and noisy afterwards.
+		// settles. This case exists so that shape is STORABLE, and
+		// RejectDispositionCommand is now its producer; admission still starts
+		// every record pending. The widening landed BEFORE the producer did,
+		// which was the point: a validator that accepts more never invalidates
+		// a stored record, so widening is free beforehand and noisy after.
 		//
 		// Only a rejection may take that shape. Applied always means a runtime
 		// accepted the command under a grant, so it always carries the attempt
 		// that named the grant. The cost of the wider rule is stated plainly:
 		// bytes whose state member alone reads "rejected" are now a valid
 		// tombstone rather than a decode failure, which is one fewer accidental
-		// corruption tripwire on a state no producer writes yet.
+		// corruption tripwire on that state.
 		//
 		// The `r.Outcome != nil` arm below is UNREACHABLE and is kept as a
 		// belt-and-braces restatement, not as the line that decides. An outcome
@@ -672,6 +684,28 @@ func validateDispositionState(r *DispositionInboxRecord) error {
 	}
 	if r.Outcome != nil {
 		return inboxInvalid("outcome", nil)
+	}
+	return nil
+}
+
+// validateDispositionClaim holds a claim to its own well-formedness. A claim
+// with no residency records no authority at all and could not compose with
+// BeginDispositionAttempt, which admits only the claim's own residency and
+// refuses zero itself; an unrankable expiry is not an instant this package
+// stores.
+//
+// It is a function rather than two inlined comparisons because the claim EDGE
+// now has a producer: ClaimDispositionCommand calls this before it writes, so
+// the rule a claim is written under and the rule a stored claim is decoded
+// under are the same code rather than two copies. The relations that involve
+// the store's CLOCK are deliberately not here — they are not properties of a
+// stored record — and live at the edge instead.
+func validateDispositionClaim(c DispositionClaim) error {
+	if c.ResidencyEpoch == 0 {
+		return inboxInvalid("residency_epoch", nil)
+	}
+	if !rankableTime(c.ExpiresAt) {
+		return inboxInvalid("claim_expires_at", nil)
 	}
 	return nil
 }

@@ -86,8 +86,8 @@ import (
 //
 // # What this file does not do
 //
-// It does not claim a command (pending -> claimed has no entry point yet), does
-// not read or write a journal, does not apply anything, and makes no
+// It does not claim or reject a command — disposition_claim.go holds those two
+// edges — does not read or write a journal, does not apply anything, and makes no
 // exactly-once claim about any external effect. It cannot undo a side effect or
 // terminate a remote tool. Reaping, retention and gate continuation are not
 // implemented.
@@ -108,9 +108,10 @@ type DispositionAttemptID string
 
 // DispositionClaim is the residency-guarded claim a command is worked on under.
 //
-// The claim EDGE is not implemented by this step: nothing here moves a pending
-// command into claimed, and this type exists because the attempt below consumes
-// such a record and must say precisely what it requires of one. ExpiresAt is
+// Nothing in THIS file moves a pending command into claimed: the claim edge is
+// ClaimDispositionCommand in disposition_claim.go, and this type is declared
+// here because the attempt below consumes such a record and must say precisely
+// what it requires of one. ExpiresAt is
 // the claimant's own reading of when the claim lapses, evaluated against the
 // STORE's clock exactly as every other liveness guard in this package is.
 type DispositionClaim struct {
@@ -598,9 +599,11 @@ func verifiedDispositionOutcome(attempt DispositionAttempt, e DispositionEvidenc
 // mark, which is its CLAIM's residency. That is the mark epochFence's own doc
 // names for a command, so this is not a second notion of "superseded".
 //
-// It is a named function rather than a second inlined call because the two
-// settlement transitions need different amounts of the same rule, and only one
-// of them wants the whole of dispositionResidencyFence. Copying the
+// It is a named function rather than a second inlined call because the
+// protocol's transitions need different amounts of the same rule and only the
+// attempt edge wants the whole of dispositionResidencyFence. The two edges in
+// disposition_claim.go reach it through dispositionRecordHighWater, which is
+// the same rule again over a record whose claim may be absent. Copying the
 // error-building closure to the second site is precisely the drift epochFence
 // was hoisted to prevent: a duplicate on a path that only runs once a Host has
 // already been superseded, where a weakened check looks exactly like a passing

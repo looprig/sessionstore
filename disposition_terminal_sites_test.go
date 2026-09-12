@@ -173,6 +173,32 @@ var dispositionTerminalSites = []dispositionTerminalSite{
 		},
 	},
 	{
+		fn:   "(*Store).RejectDispositionCommand",
+		what: "the pre-dispatch reject refuses EVERY settled command, and never presents a settled not_applied as its own idempotent result",
+		drive: func(t *testing.T, kind DispositionOutcomeKind) {
+			s, _, settled := settleDispositionOfKind(t, kind)
+			// Every residency a caller could name, including none at all. The
+			// not_applied kind is the sharp one: it settles into `rejected`, so
+			// a terminal check that looked only at the STATE would hand this
+			// call an idempotent success over an evidence-backed tombstone.
+			for _, residency := range []ResidencyEpoch{0, settlementResidenc, settlementResidenc + 1} {
+				_, ok, err := s.RejectDispositionCommand(context.Background(), rejectRequest(settled, residency))
+				assertInboxCode(t, err, InboxErrorTerminal)
+				if ok {
+					t.Fatalf("residency %d: a settled %q command was rejected again", residency, kind)
+				}
+			}
+			got, err := s.GetDispositionCommand(context.Background(), GetDispositionCommandRequest{
+				TenantID:  settled.Record.Descriptor.TenantID,
+				SessionID: settled.Record.Descriptor.SessionID,
+				CommandID: settled.Record.Descriptor.CommandID,
+			})
+			if err != nil || got.Revision != settled.Revision || *got.Record.Outcome != *settled.Record.Outcome {
+				t.Fatalf("a refused rejection disturbed a settled record: %+v %v", got, err)
+			}
+		},
+	},
+	{
 		fn:   "dispositionInboxDue",
 		what: "a settled command leaves the due view",
 		drive: func(t *testing.T, kind DispositionOutcomeKind) {

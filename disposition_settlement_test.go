@@ -13,12 +13,18 @@ import (
 	"github.com/looprig/storage/memstore"
 )
 
-// The disposition protocol's claim edge (pending -> claimed) is deliberately not
-// implemented by this step, so no exported API can put a record into the state
-// this step's compare-and-swap starts from. Tests file one directly through the
-// package's own encoder and the same ordered-index update the transition uses,
-// which is the smallest thing that can stand in for the missing producer: it
-// writes bytes the codec accepts and nothing else.
+// fileDispositionClaim writes a claimed record through the package's own
+// encoder and the same ordered-index update every transition uses.
+//
+// ClaimDispositionCommand now exists and disposition_claim_test.go drives it
+// end to end, so this is NO LONGER a stand-in for a missing producer. It is
+// kept, and these fixtures keep using it, because it reaches claims the EDGE
+// deliberately refuses to write — an expiry beyond MaxCommandClaimTTL, a claim
+// outliving the apply deadline, a residency no provider issued — which is what
+// lets the settlement tests below hold the attempt and settlement edges to the
+// CODEC's domain rather than to the claim edge's narrower one. A fixture that
+// could only produce what the edge produces would shrink those tests silently
+// the next time the edge was narrowed.
 func fileDispositionClaim(t *testing.T, s *Store, entry DispositionInboxEntry, claim DispositionClaim) DispositionInboxEntry {
 	t.Helper()
 	record := entry.Record

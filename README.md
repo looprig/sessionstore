@@ -99,10 +99,11 @@ no online binding or protocol conversion API.
 Zero binding retains the literal version-1 legacy catalog format and its legacy
 retry behavior. Bound records use version 2, require every binding field, and
 reject unknown fields or modes. `ProtocolModeLegacy` selects the released
-single-store protocol. `ProtocolModeDisposition` reserves the independent
-ownership and settlement protocol; its execution APIs are not implemented yet.
-Existing Host/gate, journal, inbox, registration, and pointer writers cannot
-execute that protocol. This prerequisite does not activate Host adoption.
+single-store protocol. `ProtocolModeDisposition` selects the independent
+ownership and settlement protocol, whose command lifecycle is described under
+*The disposition command lifecycle* below. Existing Host/gate, journal,
+registration and pointer writers still cannot execute that protocol, and the
+legacy inbox is unreachable to a disposition session.
 
 A separate create-only KV witness reserves **only the protocol**, before any
 session data is written. It never selects storage configuration or the winning
@@ -114,6 +115,63 @@ previously unused scopes. The legacy single-tenant layout refuses disposition
 sessions. Old binaries must be excluded from stores serving disposition sessions:
 they do not know this witness and cannot be fenced by it.
 
+## The disposition command lifecycle
+
+`pending -> claimed -> applying -> applied | rejected`, plus one shortcut:
+`pending | claimed -> rejected` before any dispatch. Every edge is a revision
+compare-and-swap of one inbox record, under the session's immutable catalog
+binding and its protocol-mode fence.
+
+| Edge | Call | Authority it requires |
+|---|---|---|
+| admit -> `pending` | `AdmitDispositionCommand` | a disposition catalog binding |
+| `pending` -> `claimed` | `ClaimDispositionCommand` | a residency epoch from `AcquireResidency` |
+| `claimed` -> `applying` | `BeginDispositionAttempt` | the CLAIM's own residency, plus the runtime's journal epoch |
+| `applying` -> terminal | `SettleDispositionCommand` | verified evidence; the residency is context only |
+| `pending`/`claimed` -> `rejected` | `RejectDispositionCommand` | none required; a named residency is fenced |
+
+**Three authorities, not one.** The residency epoch guards the claim and the
+attempt, the runtime's JOURNAL epoch guards application, and the revision
+compare-and-swap guards each write. Nothing compares a residency with a journal
+epoch, and neither is derived from the other.
+
+`ClaimDispositionCommand(… ExpectedRevision, ResidencyEpoch, ClaimExpiresAt)`
+refuses a zero residency, holds the expiry to `MaxCommandClaimTTL`, and refuses
+any record carrying an ATTEMPT — applying is a fortress. Its refusals are
+ordered so a caller meeting two at once is told the one that stays true:
+terminal, attempt, superseded residency, exact replay, apply deadline, held
+claim. A residency STRICTLY ABOVE the record's mark may take over a live claim,
+which is failover; the claim's own residency naming a different expiry is a
+RENEWAL and is refused, exactly as legacy `ClaimCommand` refuses one.
+
+**Idempotency is over the reread, not over the lost response.** Re-issuing the
+same request against the record as it now stands returns the stored entry with
+`claimed=false` and writes nothing — so a replay can never extend an expiry.
+Re-issuing it at the revision the caller originally decided on is a `conflict`
+carrying the current revision, which is this module's standing answer to a
+compare-and-swap whose outcome the caller did not learn.
+
+`RejectDispositionCommand` is the PRE-DISPATCH refusal and nothing else. **It
+cannot become a post-attempt rejection**: it refuses every record carrying an
+attempt, applying and terminal alike — including a settled `not_applied`, which
+is a rejection it must never present as its own idempotent result. Its own prior
+result, a terminal `rejected` with no attempt, IS returned idempotently with
+`rejected=false`. It performs no journal scan and needs none: dispatch is
+forbidden without a durably authorized attempt, so a record with no attempt has
+had no dispatch and there is no effect for the rejection to orphan. **It stores
+no reason** — this record has no member for one, and adding a durable member
+would require a record-version bump.
+
+Its residency is OPTIONAL. Zero is the honest statement "I am not acting under a
+residency", and what confines such a caller is the CLAIM RULE, a property of the
+record that applies at every residency: a LIVE claim admits only its own holder,
+so a reconciler may settle a pending command or one whose claim has lapsed, and
+a live claim wins the deadline race outright. A nonzero epoch is a consistency
+check on a view the caller asserts, not an authority boundary — nothing forces a
+caller to name one — but one below the record's high-water mark is told it is
+superseded rather than acted on. A rejection of a CLAIMED command keeps the
+claim, as the durable record of who was working on it.
+
 ## Residency-only grants
 
 `AcquireResidency(ctx, AcquireResidencyRequest{TenantID, SessionID})` requires
@@ -122,8 +180,9 @@ does not authorize acquisition. It acquires the session's separate
 `/residency/lease` namespace without opening, reading or appending its journal.
 The returned `ResidencyGrant` exposes `Epoch() ResidencyEpoch`, `Lost()` and
 `Release(ctx)`. Never compare or substitute a residency epoch for a journal
-epoch. This prerequisite does not implement disposition journal writers,
-attempts, settlement or Host adoption; legacy `OpenJournal` continues to refuse
+epoch. The epoch this returns is the ONLY value `ClaimDispositionCommand` and
+`BeginDispositionAttempt` accept. This module still implements no disposition
+journal writer and no evidence reader; legacy `OpenJournal` continues to refuse
 disposition sessions.
 
 `Lost()` is the actual Storage provider signal. The acquire context bounds only
