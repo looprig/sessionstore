@@ -820,14 +820,21 @@ itself is a revision compare-and-swap, so concurrent savers under one epoch are
 ordered by the provider and the loser is told to retry rather than overwriting
 the winner; a lost *create* race is the same answer, for the same reason.
 
-**Every CONCURRENCY refusal — that is, every refusal of a well-formed request
-against a readable row — is one of exactly three typed answers**: you have lost
-the session (`epoch`), your position is stale (`order`), or you raced
-(`conflict`). That scope is the whole sentence and not a hedge: a malformed
-request is `invalid`, an undecodable row is `malformed`, a provider tombstone is
-`deleted`, a session bound to another protocol is a `*CatalogError`, and a
-provider failure is `backend`. A consumer's error classification must cover
-those too.
+**The two fences and the compare-and-swap have exactly three answers between
+them**: you have lost the session (`epoch`), your position is stale (`order`),
+or you raced (`conflict`). That is a claim about the **fences**, not about the
+call — reaching a fence at all requires a well-formed request, a session this
+store will vouch for, and a stored row this store will vouch for, and each of
+those has refusals of its own: `invalid` for the request, a `*CatalogError` for
+a session that is absent or bound to another protocol, `malformed` / `version` /
+`too_large` for a row that does not decode, `deleted` for a provider tombstone,
+`backend` / `unknown` for the provider, and **`identity` for a row that decodes
+and is still refused** — another session's bytes, a wrong stable key, ordering
+scope, rank or due state, or a write whose reply is not the bytes it sent. That
+last one is reachable from a perfectly well-formed request against a perfectly
+readable row, which is why "well-formed request against a readable row" is not
+the right scope either. A consumer's classification must cover all of them and
+must have a default arm; this list is a residue, not a closure.
 
 **The cursor is consumption context, not authority**, in the same sense
 `SettlingResidencyEpoch` is settlement context. It does not prove any command

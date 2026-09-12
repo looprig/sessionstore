@@ -520,7 +520,7 @@ func (s *Store) LoadDispositionCommandCursor(
 //     position. Epoch-first tells it "you have lost the session", which is
 //     terminal and correct; order-first would tell it "your position is stale",
 //     which invites it to fetch newer data and retry forever against a session
-//     it no longer owns. TestSaveDispositionCommandCursorFencesTheEpochBeforeTheOrder's
+//     it no longer owns. TestSaveCursorFencesTheEpochBeforeTheOrder's
 //     `earlier_epoch, earlier_order` row is that probe, and it is the ONLY row
 //     that changes answer when the two calls are swapped.
 //
@@ -533,15 +533,40 @@ func (s *Store) LoadDispositionCommandCursor(
 //     response is identical — re-read and meet both fences.
 //
 // So the contract is: MANY CONCURRENT SAVERS ARE SAFE, the stored position is
-// non-decreasing under every interleaving, and every CONCURRENCY refusal — that
-// is, every refusal of a well-formed request against a readable row — is one of
-// exactly three typed answers: you have lost the session (InboxErrorEpoch),
-// your position is stale (InboxErrorOrder), or you raced (InboxErrorConflict).
-// A MALFORMED REQUEST OR AN UNREADABLE ROW IS NOT ONE OF THOSE THREE and is not
-// claimed to be: an invalid request is InboxErrorInvalid, an undecodable row is
-// InboxErrorMalformed, a provider tombstone is InboxErrorDeleted, a session
-// bound to another protocol is a *CatalogError, and a provider failure is
-// InboxErrorBackend. A consumer's error classification must cover those too.
+// non-decreasing under every interleaving, and THE TWO FENCES AND THE
+// COMPARE-AND-SWAP HAVE EXACTLY THREE ANSWERS BETWEEN THEM — you have lost the
+// session (InboxErrorEpoch), your position is stale (InboxErrorOrder), or you
+// raced (InboxErrorConflict).
+//
+// THAT IS A CLAIM ABOUT THE FENCES, NOT ABOUT THE CALL, and the difference is
+// exactly what two earlier versions of this sentence got wrong. The first said
+// "every refusal"; the second narrowed it to "every refusal of a well-formed
+// request against a readable row", which is still too wide, because a row can
+// decode perfectly and still be one this store refuses to vouch for. REACHING A
+// FENCE AT ALL requires a well-formed request, a session this store will vouch
+// for, and a stored row this store will vouch for, and each of those has
+// refusals of its own. None of them is one of the three:
+//
+//   - InboxErrorInvalid — the request itself: a zero epoch or a zero position.
+//   - *CatalogError — the session is absent, or is bound to another protocol.
+//   - InboxErrorMalformed, InboxErrorVersion, InboxErrorTooLarge — the stored
+//     row does not decode.
+//   - InboxErrorDeleted — the stored row is a provider tombstone.
+//   - InboxErrorIdentity — THE ARM THAT KEEPS BEING LEFT OUT OF THIS LIST. The
+//     stored row DECODES and is still refused: it carries another session's
+//     identities, or is filed under another stable key, ordering scope, rank or
+//     due state, or a write's reply is not the bytes the write handed the
+//     provider. It is reachable from a perfectly well-formed request against a
+//     perfectly readable row, which is why the narrower scope above did not
+//     save the sentence.
+//   - InboxErrorBackend, InboxErrorUnknown — the provider failed or was
+//     ambiguous.
+//
+// A consumer's classification must cover all of these and MUST HAVE A DEFAULT
+// ARM. This list is a residue, not a closure: it is what the code can produce
+// today, enumerated so the three-answer claim above cannot be read as covering
+// the whole call, and a reader must not treat the absence of a code from it as
+// evidence that the code is unreachable.
 //
 // What this is NOT is a lock: this call never waits, never retries for a
 // caller, and never blocks a second writer.
@@ -873,7 +898,7 @@ func dispositionCursorEntryFor(
 // names, so renaming an exported field cannot silently rewrite a stored record.
 // The exported DispositionCommandCursor deliberately carries NO JSON tags at
 // all, so there is nothing decorative for a reader to mistake for the durable
-// spelling. TestDispositionCommandCursorWireGolden pins that spelling with a
+// spelling. TestCursorWireGolden pins that spelling with a
 // byte literal.
 type dispositionCursorWire struct {
 	RecordVersion uint8                 `json:"record_version"`
