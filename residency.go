@@ -66,6 +66,8 @@ func (e *ResidencyAcquireCleanupError) Release(ctx context.Context) error {
 // Release context cancellation. There is no background retry loop.
 type ResidencyGrant struct {
 	store            *Store
+	tenant           sessionwire.TenantID
+	session          sessionwire.SessionID
 	lease            storage.Lease
 	epoch            ResidencyEpoch
 	mu               sync.Mutex
@@ -73,6 +75,49 @@ type ResidencyGrant struct {
 	released         bool
 	releaseAdmission func()
 	stopShutdown     func() bool
+}
+
+// residencyFor answers "is this grant one I issued, for this session, and not
+// handed back?" and yields its epoch. It is how ClaimDispositionCommand obtains
+// a residency epoch, and the ONLY way that edge obtains one.
+//
+// # What it checks, and why each conjunct is necessary rather than tidy
+//
+//   - A NIL grant, or one whose store is not this one. An epoch is a position in
+//     ONE provider's lease sequence; a grant from another Store may be over
+//     another provider entirely, so its number means nothing here.
+//   - A grant for another TENANT or SESSION. Residency leases are per-session
+//     namespaces (scope.SessionNamespace+"/residency/lease"), so two sessions'
+//     epochs are incomparable and a high number from a busy session would
+//     otherwise ratchet a quiet one's record out of reach.
+//   - A RELEASED grant. The caller has voluntarily handed the residency back, so
+//     it is asserting nothing about the session any more.
+//
+// # What it does NOT establish, stated as exactly as the rest of this package
+//
+// It is NOT proof of a LIVE lease, and no reading of it may be. Nothing here
+// consults the provider and nothing reads Lost(): a grant whose lease expired or
+// was taken over still passes, because `released` records only that Release was
+// CALLED, not that ownership survives. That residue is deliberate — this package
+// reads no live lease anywhere, and a liveness check taken here would be stale by
+// the time the compare-and-swap ran anyway.
+//
+// What it DOES establish is the one thing the record's high-water mark needs:
+// the epoch is a number THIS STORE OBTAINED FROM THE PROVIDER for THIS session,
+// so a stored mark can never exceed what that provider has actually issued. A
+// stale grant names a LOWER epoch, which the fence refuses on its own terms; it
+// cannot name a higher one. See ClaimDispositionCommandRequest.Residency.
+func (g *ResidencyGrant) residencyFor(s *Store, tenant sessionwire.TenantID, session sessionwire.SessionID) (ResidencyEpoch, error) {
+	if g == nil || g.store != s || g.tenant != tenant || g.session != session {
+		return 0, inboxInvalid("residency", nil)
+	}
+	g.mu.Lock()
+	released := g.released
+	g.mu.Unlock()
+	if released {
+		return 0, inboxInvalid("residency", nil)
+	}
+	return g.epoch, nil
 }
 
 // AcquireResidency validates the actual immutable catalog binding and acquires
@@ -110,7 +155,7 @@ func (s *Store) AcquireResidency(ctx context.Context, req AcquireResidencyReques
 		release()
 		return nil, &ResidencyError{Operation: "acquire", Cause: err}
 	}
-	g := &ResidencyGrant{store: s, lease: lease, epoch: ResidencyEpoch(lease.Epoch()), releaseAdmission: release, releaseGate: make(chan struct{}, 1)}
+	g := &ResidencyGrant{store: s, tenant: req.TenantID, session: req.SessionID, lease: lease, epoch: ResidencyEpoch(lease.Epoch()), releaseAdmission: release, releaseGate: make(chan struct{}, 1)}
 	bindCancelHandle(lifeCtx, func() { _ = g.Release(context.Background()) }, func(stop func() bool) bool {
 		g.mu.Lock()
 		defer g.mu.Unlock()

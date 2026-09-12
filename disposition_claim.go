@@ -58,10 +58,13 @@ import (
 // guards application, and a revision compare-and-swap guards the write. Neither
 // edge here touches a journal epoch, and neither derives one from the other.
 //
-// ClaimDispositionCommand REQUIRES A RESIDENCY EPOCH and refuses zero: a claim
-// with no residency is unstorable — validateDispositionClaim refuses it — and
-// it could not compose with BeginDispositionAttempt, which admits only the
-// claim's own residency and refuses zero itself.
+// ClaimDispositionCommand REQUIRES A RESIDENCY GRANT — the *ResidencyGrant
+// AcquireResidency returned, not a number — because it is the only producer of
+// the record's ratcheting high-water mark. See ClaimDispositionCommandRequest
+// for why that one edge is gated when the others are not. A claim with no
+// residency is unstorable in any case (validateDispositionClaim refuses it) and
+// could not compose with BeginDispositionAttempt, which admits only the claim's
+// own residency and refuses zero itself.
 //
 // RejectDispositionCommand's residency is OPTIONAL, for the reason legacy
 // RejectCommandRequest gives: rejecting a command is also what a reconciling
@@ -82,22 +85,60 @@ import (
 // disposition command, which is the state BeginDispositionAttempt starts from.
 //
 // ExpectedRevision is the revision the caller read and decided on, as every
-// compare-and-swap in this package requires. ResidencyEpoch is the Host grant
-// the claimer acts under and must be one AcquireResidency issued; zero is
-// refused. ClaimExpiresAt is the caller's own reading of when the claim lapses,
-// evaluated against the STORE's clock, and it is held to MaxCommandClaimTTL for
-// that constant's stated reason.
+// compare-and-swap in this package requires. ClaimExpiresAt is the caller's own
+// reading of when the claim lapses, evaluated against the STORE's clock, and it
+// is held to MaxCommandClaimTTL for that constant's stated reason. The claim's
+// expiry MAY fall after the command's apply deadline — that is what lets an
+// unexpired claim win the deadline race — but it may not fall in the past.
 //
-// The claim's expiry MAY fall after the command's apply deadline — that is what
-// lets an unexpired claim win the deadline race — but it may not fall in the
-// past.
+// # Residency is a GRANT and not a number, and that is the load-bearing choice
+//
+// Every other residency-taking API in this package takes a bare
+// ResidencyEpoch. This one takes the *ResidencyGrant that AcquireResidency
+// returned, and the epoch is read off it. The caller cannot name an epoch at
+// all.
+//
+// The reason is that THIS EDGE IS THE ONLY PRODUCER OF THE RECORD'S HIGH-WATER
+// MARK, and that mark only ever rises. Three call sites fence against it —
+// this edge, BeginDispositionAttempt and RejectDispositionCommand — so a single
+// stored claim at an epoch no provider ever issued permanently supersedes every
+// real Host for that command: it can never be claimed, attempted or applied
+// again, and its only remaining exit is a zero-residency reconciler rejection
+// once the bogus claim lapses. The command is durably lost, silently, from one
+// well-formed call.
+//
+// A bare number could not be checked. `storage.Leaser` exposes only
+// `Acquire(ctx, name) (Lease, error)`, so there is NO way to read a session's
+// issued epoch without taking the lease away from whoever holds it — the store
+// cannot validate a number a caller hands it, at any price short of a Storage
+// contract change. A grant needs no validation: it is the store's own object,
+// carrying a provider-issued epoch for a named session, so an unissued number
+// is not expressible rather than merely refused.
+//
+// Be exact about what that buys, because the module's own warnings apply here
+// too. It is NOT proof of a live lease — nothing in this package reads one, and
+// a grant whose lease has expired or been taken over still passes. It IS proof
+// that the epoch came from this store's provider for this session, which is the
+// whole of what a ratcheting mark needs: a stale grant names a LOWER epoch and
+// the fence refuses it on its own terms, and it cannot name a higher one. See
+// (*ResidencyGrant).residencyFor for each conjunct.
+//
+// # Why the other edges keep a bare epoch, which is not an inconsistency
+//
+// The distinction is whether the store DECIDES from the value or merely RECORDS
+// it. SettlingResidencyEpoch is recorded and never read back, which is why
+// AGENTS.md can call it settlement context and leave it caller-asserted.
+// BeginDispositionAttempt's epoch is fenced to equal the claim's own, so it
+// cannot raise the mark. RejectDispositionCommand writes no claim at all, so it
+// cannot either — and it must accept a zero, because a reconciler holds no
+// residency. Only this edge writes the mark, so only this edge is gated.
 type ClaimDispositionCommandRequest struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
 	CommandID sessionwire.CommandID
 
 	ExpectedRevision uint64
-	ResidencyEpoch   ResidencyEpoch
+	Residency        *ResidencyGrant
 	ClaimExpiresAt   time.Time
 }
 
@@ -133,6 +174,8 @@ type RejectDispositionCommandRequest struct {
 // It is the order in which the answers become permanent, so a caller meeting
 // two at once is told the one that will still be true after a retry:
 //
+//  0. A residency that is not a live-looking grant this store issued for this
+//     session is refused before anything is read — see the request type.
 //  1. A settled command has no transitions left.
 //  2. A command with a durably authorized ATTEMPT is not claimable at any
 //     residency. Applying is a fortress in this protocol as in the legacy one,
@@ -159,12 +202,20 @@ type RejectDispositionCommandRequest struct {
 // # Idempotency, stated exactly
 //
 // A replay is a RE-ISSUE OF THE SAME REQUEST — same residency, same expiry —
-// against the record as it now stands. It returns the stored entry with
+// against a record whose claim is STILL LIVE. It returns the stored entry with
 // claimed=false and writes nothing, so a replay can never extend an expiry;
 // that is also why a claim CANNOT BE RENEWED, which is legacy ClaimCommand's
 // rule and its reasoning: renewal would let one writer hold a command
 // indefinitely, and the state that legitimately spans a long application is
 // applying.
+//
+// The word LIVE is not decoration, and the third outcome is named here rather
+// than left to be discovered. Once the claim has LAPSED, an exact replay names
+// an expiry that is now in the past, so validateBoundedExpiry refuses the
+// request before the record is read at all: the answer is
+// InboxErrorInvalid on claim_expires_at — neither idempotent nor claim_held. It
+// fails closed, and a caller whose claim has lapsed must choose a new expiry,
+// which is an ordinary re-claim over a lapsed claim rather than a replay.
 //
 // The idempotency is OVER THE REREAD AND NOT OVER THE LOST RESPONSE. A replay
 // carrying the revision the caller originally decided on is a CONFLICT carrying
@@ -190,8 +241,15 @@ func (s *Store) ClaimDispositionCommand(ctx context.Context, req ClaimDispositio
 	if req.ExpectedRevision == 0 {
 		return DispositionInboxEntry{}, false, inboxInvalid("expected_revision", nil)
 	}
+	// The epoch comes off the grant and from nowhere else, so no number a caller
+	// chose can reach the record's mark. Checked before the clock is read and
+	// before any provider call, like every other request-shaped refusal here.
+	residency, err := req.Residency.residencyFor(s, req.TenantID, req.SessionID)
+	if err != nil {
+		return DispositionInboxEntry{}, false, err
+	}
 	now := s.clock.Now()
-	claim := DispositionClaim{ResidencyEpoch: req.ResidencyEpoch, ExpiresAt: req.ClaimExpiresAt}
+	claim := DispositionClaim{ResidencyEpoch: residency, ExpiresAt: req.ClaimExpiresAt}
 	// The record's OWN well-formedness rule, called rather than restated, so a
 	// claim this edge writes and a claim the codec admits cannot drift apart.
 	if err := validateDispositionClaim(claim); err != nil {
@@ -217,7 +275,7 @@ func (s *Store) ClaimDispositionCommand(ctx context.Context, req ClaimDispositio
 	if current.Record.Attempt != nil {
 		return DispositionInboxEntry{}, false, inboxErr(InboxErrorState, "attempt", nil)
 	}
-	if err := dispositionRecordHighWater(current.Record, req.ResidencyEpoch); err != nil {
+	if err := dispositionRecordHighWater(current.Record, residency); err != nil {
 		return DispositionInboxEntry{}, false, err
 	}
 	live := dispositionClaimLive(current.Record, now)
@@ -227,7 +285,7 @@ func (s *Store) ClaimDispositionCommand(ctx context.Context, req ClaimDispositio
 	if !now.Before(current.Record.ApplyDeadline) {
 		return DispositionInboxEntry{}, false, inboxErr(InboxErrorDeadline, "apply_deadline", nil)
 	}
-	if live && current.Record.Claim.ResidencyEpoch == req.ResidencyEpoch {
+	if live && current.Record.Claim.ResidencyEpoch == residency {
 		return DispositionInboxEntry{}, false, inboxErr(InboxErrorClaimHeld, "claim", nil)
 	}
 	next := current.Record
@@ -271,6 +329,24 @@ func (s *Store) ClaimDispositionCommand(ctx context.Context, req ClaimDispositio
 // reconciler may settle a pending command or one whose claim has lapsed, and a
 // live claim wins the deadline race outright — while it holds, the only caller
 // that may reject is its holder, whatever the clock says.
+//
+// A SUCCESSOR IS ANSWERED DIFFERENTLY BY THE TWO EDGES, and the asymmetry is
+// deliberate rather than an oversight. A residency above the record's mark may
+// CLAIM a live claim away from its predecessor — that is failover — but may not
+// REJECT the command under it: it is told claim_held and must take the claim
+// first. Rejecting is a TERMINAL decision about work the holder may be in the
+// middle of, so it belongs to whoever holds the claim; claiming first is the
+// successor's route, and it makes the successor the holder before it decides
+// anything terminal.
+//
+// THE IDEMPOTENT ARM ABOVE SHORT-CIRCUITS BOTH FENCES, which is the opposite
+// ordering from the claim edge and is stated because a reader will expect the
+// claim edge's. A superseded residency replaying a pre-dispatch rejection is
+// given the idempotent success, not InboxErrorEpoch. That is sound because the
+// arm WRITES NOTHING — it is a read of a record that is already terminal, and
+// telling a superseded caller "this was already rejected" is both true and
+// final. The claim edge's replay arm sits after its fence instead because that
+// edge can go on to write.
 //
 // A rejection of a CLAIMED command keeps the claim. It is the durable record of
 // who was working on the command when it was refused, and the codec admits an

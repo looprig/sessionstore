@@ -125,7 +125,7 @@ binding and its protocol-mode fence.
 | Edge | Call | Authority it requires |
 |---|---|---|
 | admit -> `pending` | `AdmitDispositionCommand` | a disposition catalog binding |
-| `pending` -> `claimed` | `ClaimDispositionCommand` | a residency epoch from `AcquireResidency` |
+| `pending` -> `claimed` | `ClaimDispositionCommand` | the `*ResidencyGrant` `AcquireResidency` returned |
 | `claimed` -> `applying` | `BeginDispositionAttempt` | the CLAIM's own residency, plus the runtime's journal epoch |
 | `applying` -> terminal | `SettleDispositionCommand` | verified evidence; the residency is context only |
 | `pending`/`claimed` -> `rejected` | `RejectDispositionCommand` | none required; a named residency is fenced |
@@ -135,9 +135,36 @@ attempt, the runtime's JOURNAL epoch guards application, and the revision
 compare-and-swap guards each write. Nothing compares a residency with a journal
 epoch, and neither is derived from the other.
 
-`ClaimDispositionCommand(… ExpectedRevision, ResidencyEpoch, ClaimExpiresAt)`
-refuses a zero residency, holds the expiry to `MaxCommandClaimTTL`, and refuses
-any record carrying an ATTEMPT — applying is a fortress. Its refusals are
+**The claim edge takes a GRANT, not an epoch, and it is the only edge that
+does.** `ClaimDispositionCommandRequest.Residency` is the `*ResidencyGrant`
+`AcquireResidency` returned; the epoch is read off it and a caller cannot name
+one. The reason is that this edge is the **only producer of the record's
+high-water mark**, and that mark only ever rises: a single stored claim at an
+epoch no provider issued would supersede every real Host for that command
+permanently — it could never be claimed, attempted or applied again, and its
+only exit would be a zero-residency reconciler rejection once the bogus claim
+lapsed. A bare number could not be checked, because `storage.Leaser` exposes
+only `Acquire`, so there is no way to read a session's issued epoch without
+taking the lease away from whoever holds it. A grant needs no check: it is the
+store's own object carrying a provider-issued epoch for a named session.
+
+Be exact about what that buys. It is **not proof of a live lease** — nothing in
+this module reads one, and a grant whose lease has expired or been taken over
+still passes. It **is** proof the epoch came from this store's provider for this
+session, which is all a ratcheting mark needs: a stale grant names a *lower*
+epoch and the fence refuses it on its own terms, and it cannot name a higher one.
+A nil, released, other-session or other-store grant is refused with
+`inbox invalid (residency)`.
+
+The other edges keep a bare epoch, which is not an inconsistency — the test is
+whether the store **decides** from the value or merely **records** it.
+`SettlingResidencyEpoch` is recorded and never read back.
+`BeginDispositionAttempt`'s epoch is fenced to equal the claim's own, so it
+cannot raise the mark. `RejectDispositionCommand` writes no claim, so it cannot
+either, and it must accept a zero because a reconciler holds no residency.
+
+`ClaimDispositionCommand` also holds the expiry to `MaxCommandClaimTTL` and
+refuses any record carrying an ATTEMPT — applying is a fortress. Its refusals are
 ordered so a caller meeting two at once is told the one that stays true:
 terminal, attempt, superseded residency, exact replay, apply deadline, held
 claim. A residency STRICTLY ABOVE the record's mark may take over a live claim,
@@ -145,21 +172,30 @@ which is failover; the claim's own residency naming a different expiry is a
 RENEWAL and is refused, exactly as legacy `ClaimCommand` refuses one.
 
 **Idempotency is over the reread, not over the lost response.** Re-issuing the
-same request against the record as it now stands returns the stored entry with
-`claimed=false` and writes nothing — so a replay can never extend an expiry.
-Re-issuing it at the revision the caller originally decided on is a `conflict`
-carrying the current revision, which is this module's standing answer to a
-compare-and-swap whose outcome the caller did not learn.
+same request against a record whose claim is still **live** returns the stored
+entry with `claimed=false` and writes nothing — so a replay can never extend an
+expiry. "Same request" means the same residency and the same **instant**: the
+expiry is compared by instant, not by `time.Time` value, so a caller may pass it
+in any zone and with or without a monotonic reading. Re-issuing at the revision
+the caller originally decided on is a `conflict` carrying the current revision,
+which is this module's standing answer to a compare-and-swap whose outcome the
+caller did not learn. Once the claim has **lapsed** an exact replay names a past
+expiry and is refused with `invalid (claim_expires_at)` before the record is read
+— neither idempotent nor `claim_held`; choose a new expiry and re-claim.
 
 `RejectDispositionCommand` is the PRE-DISPATCH refusal and nothing else. **It
 cannot become a post-attempt rejection**: it refuses every record carrying an
 attempt, applying and terminal alike — including a settled `not_applied`, which
 is a rejection it must never present as its own idempotent result. Its own prior
 result, a terminal `rejected` with no attempt, IS returned idempotently with
-`rejected=false`. It performs no journal scan and needs none: dispatch is
-forbidden without a durably authorized attempt, so a record with no attempt has
-had no dispatch and there is no effect for the rejection to orphan. **It stores
-no reason** — this record has no member for one, and adding a durable member
+`rejected=false`. It performs no journal scan and needs none — but the premise is a **consumer
+obligation, not a store-enforced invariant**, and the distinction matters because
+the omission rests on it. The store cannot observe a dispatch; what it enforces
+is that `BeginDispositionAttempt` is the only writer of an attempt, and that a
+non-terminal record carries one exactly when it is `applying`. **A Host must not
+dispatch until that call has returned successfully.** Given that obligation, a
+record with no attempt has had no dispatch and there is no effect for the
+rejection to orphan. **It stores no reason** — this record has no member for one, and adding a durable member
 would require a record-version bump.
 
 Its residency is OPTIONAL. Zero is the honest statement "I am not acting under a
@@ -172,6 +208,22 @@ caller to name one — but one below the record's high-water mark is told it is
 superseded rather than acted on. A rejection of a CLAIMED command keeps the
 claim, as the durable record of who was working on it.
 
+**The two edges answer a SUCCESSOR differently**, and the asymmetry is
+deliberate. A residency above the record's mark may **claim** a live claim away
+from its predecessor — that is failover — but may **not reject** the command
+under it: it is told `claim_held` and must take the claim first. Rejecting is a
+terminal decision about work the holder may be in the middle of, so it belongs to
+whoever holds the claim; claiming first makes the successor the holder before it
+decides anything terminal.
+
+One ordering note, because it is the opposite of the claim edge's: the reject
+edge's **idempotent arm runs before both fences**, so a superseded residency
+replaying a pre-dispatch rejection gets the idempotent success rather than
+`epoch`. That arm writes nothing — it reads a record that is already terminal —
+and telling a superseded caller "this was already rejected" is both true and
+final. The claim edge's replay arm sits *after* its fence because that edge can
+go on to write.
+
 ## Residency-only grants
 
 `AcquireResidency(ctx, AcquireResidencyRequest{TenantID, SessionID})` requires
@@ -180,8 +232,9 @@ does not authorize acquisition. It acquires the session's separate
 `/residency/lease` namespace without opening, reading or appending its journal.
 The returned `ResidencyGrant` exposes `Epoch() ResidencyEpoch`, `Lost()` and
 `Release(ctx)`. Never compare or substitute a residency epoch for a journal
-epoch. The epoch this returns is the ONLY value `ClaimDispositionCommand` and
-`BeginDispositionAttempt` accept. This module still implements no disposition
+epoch. `ClaimDispositionCommand` takes the **grant itself** rather than its
+epoch, and `BeginDispositionAttempt` accepts only the epoch of the grant the
+claim was taken under. This module still implements no disposition
 journal writer and no evidence reader; legacy `OpenJournal` continues to refuse
 disposition sessions.
 

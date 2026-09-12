@@ -4,6 +4,11 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,9 +81,9 @@ func acquireTestResidency(t *testing.T, s *Store) *ResidencyGrant {
 
 // mustClaimDisposition takes a claim and fails unless the store actually wrote one, so a
 // downstream assertion can never be reached with a zero entry.
-func mustClaimDisposition(t *testing.T, s *Store, entry DispositionInboxEntry, residency ResidencyEpoch, expires time.Time) DispositionInboxEntry {
+func mustClaimDisposition(t *testing.T, s *Store, entry DispositionInboxEntry, grant *ResidencyGrant, expires time.Time) DispositionInboxEntry {
 	t.Helper()
-	claimed, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(entry, residency, expires))
+	claimed, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(entry, grant, expires))
 	if err != nil || !ok {
 		t.Fatalf("ClaimDispositionCommand: %v %v", ok, err)
 	}
@@ -93,14 +98,14 @@ func mustClaimDisposition(t *testing.T, s *Store, entry DispositionInboxEntry, r
 // the deadline race expressible: a live claim past the deadline.
 var claimPastDeadline = settlementNow.Add(55 * time.Minute)
 
-func claimRequest(entry DispositionInboxEntry, residency ResidencyEpoch, expires time.Time) ClaimDispositionCommandRequest {
+func claimRequest(entry DispositionInboxEntry, grant *ResidencyGrant, expires time.Time) ClaimDispositionCommandRequest {
 	d := entry.Record.Descriptor
 	return ClaimDispositionCommandRequest{
 		TenantID:         d.TenantID,
 		SessionID:        d.SessionID,
 		CommandID:        d.CommandID,
 		ExpectedRevision: entry.Revision,
-		ResidencyEpoch:   residency,
+		Residency:        grant,
 		ClaimExpiresAt:   expires,
 	}
 }
@@ -116,6 +121,12 @@ func rejectRequest(entry DispositionInboxEntry, residency ResidencyEpoch) Reject
 	}
 }
 
+// Claim comparisons in this file go through sameDispositionClaim rather than
+// struct equality. Both operands always come back through the codec today, so
+// `==` would agree — but this package has just paid for learning that struct
+// equality over a time.Time is unsafe, and an assertion that later compares a
+// codec value against a caller-constructed one would regress silently in exactly
+// that class.
 func getDisposition(t *testing.T, s *Store, entry DispositionInboxEntry) DispositionInboxEntry {
 	t.Helper()
 	d := entry.Record.Descriptor
@@ -140,7 +151,7 @@ func assertDispositionUnchanged(t *testing.T, s *Store, want DispositionInboxEnt
 // precondition consumes.
 func TestClaimDispositionCommandMovesPendingToClaimed(t *testing.T) {
 	s, _, admitted, grant := claimFixture(t)
-	claimed, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant.Epoch(), settlementExpiry))
+	claimed, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant, settlementExpiry))
 	if err != nil || !ok {
 		t.Fatalf("ClaimDispositionCommand: %v %v", ok, err)
 	}
@@ -186,18 +197,18 @@ func TestClaimDispositionCommandMovesPendingToClaimed(t *testing.T) {
 // a compare-and-swap whose outcome the caller did not learn.
 func TestClaimDispositionCommandIsIdempotentOnReplay(t *testing.T) {
 	s, _, admitted, grant := claimFixture(t)
-	claimed, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant.Epoch(), settlementExpiry))
+	claimed, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant, settlementExpiry))
 	if err != nil || !ok {
 		t.Fatalf("first claim: %v %v", ok, err)
 	}
-	again, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant.Epoch(), settlementExpiry))
+	again, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant, settlementExpiry))
 	if err != nil || ok {
 		t.Fatalf("replayed claim: %+v %v %v", again, ok, err)
 	}
-	if again.Revision != claimed.Revision || *again.Record.Claim != *claimed.Record.Claim {
+	if again.Revision != claimed.Revision || !sameDispositionClaim(*again.Record.Claim, *claimed.Record.Claim) {
 		t.Fatalf("replay wrote: %+v, want %+v", again, claimed)
 	}
-	stale, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant.Epoch(), settlementExpiry))
+	stale, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant, settlementExpiry))
 	conflict := assertInboxCode(t, err, InboxErrorConflict)
 	if ok || conflict.Revision != claimed.Revision {
 		t.Fatalf("stale replay = %+v %v, conflict revision %d, want %d", stale, ok, conflict.Revision, claimed.Revision)
@@ -211,12 +222,12 @@ func TestClaimDispositionCommandIsIdempotentOnReplay(t *testing.T) {
 // what keeps the idempotent arm above from being a renewal in disguise.
 func TestClaimDispositionCommandRefusesRenewal(t *testing.T) {
 	s, _, admitted, grant := claimFixture(t)
-	claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), settlementExpiry)
+	claimed := mustClaimDisposition(t, s, admitted, grant, settlementExpiry)
 	later := settlementExpiry.Add(5 * time.Minute)
 	if later.After(inboxDeadline) {
 		t.Fatal("vacuous: the renewal this test refuses would also be refused by the apply deadline")
 	}
-	_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant.Epoch(), later))
+	_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant, later))
 	assertInboxCode(t, err, InboxErrorClaimHeld)
 	if ok {
 		t.Fatal("renewal accepted")
@@ -232,9 +243,9 @@ func TestClaimDispositionCommandRefusesRenewal(t *testing.T) {
 func TestClaimDispositionCommandAdmitsALapsedClaimAndASuccessor(t *testing.T) {
 	t.Run("lapsed claim at the same residency", func(t *testing.T) {
 		s, clock, admitted, grant := claimFixture(t)
-		claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), settlementExpiry)
+		claimed := mustClaimDisposition(t, s, admitted, grant, settlementExpiry)
 		clock.set(settlementExpiry)
-		renewed, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant.Epoch(), settlementExpiry.Add(10*time.Minute)))
+		renewed, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant, settlementExpiry.Add(10*time.Minute)))
 		if err != nil || !ok {
 			t.Fatalf("re-claim over a lapsed claim: %v %v", ok, err)
 		}
@@ -245,7 +256,7 @@ func TestClaimDispositionCommandAdmitsALapsedClaimAndASuccessor(t *testing.T) {
 
 	t.Run("successor residency over a live claim", func(t *testing.T) {
 		s, _, admitted, first := claimFixture(t)
-		claimed := mustClaimDisposition(t, s, admitted, first.Epoch(), settlementExpiry)
+		claimed := mustClaimDisposition(t, s, admitted, first, settlementExpiry)
 		if err := first.Release(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -253,7 +264,7 @@ func TestClaimDispositionCommandAdmitsALapsedClaimAndASuccessor(t *testing.T) {
 		if second.Epoch() <= first.Epoch() {
 			t.Fatalf("vacuous: successor residency %d is not above %d, so this is not a successor at all", second.Epoch(), first.Epoch())
 		}
-		stolen, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, second.Epoch(), settlementExpiry))
+		stolen, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, second, settlementExpiry))
 		if err != nil || !ok {
 			t.Fatalf("successor claim over a live claim: %v %v", ok, err)
 		}
@@ -269,19 +280,26 @@ func TestClaimDispositionCommandRefusalOrder(t *testing.T) {
 	// An applying record has already authorized a dispatch. That fact stays
 	// true, so it answers ahead of the residency fence — which would otherwise
 	// have a claim to measure a superseded caller against.
+	//
+	// The record is filed through the codec at a residency ABOVE the grant's, so
+	// the caller below is genuinely superseded and the fence has something to
+	// answer with. A grant cannot express that — which is the point of the
+	// capability — so fileDispositionClaim is the only way to reach it, exactly
+	// as its own doc says.
 	t.Run("an authorized attempt before the residency fence", func(t *testing.T) {
 		s, _, admitted, grant := claimFixture(t)
-		claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), settlementExpiry)
-		req := beginRequest(claimed)
-		req.ResidencyEpoch = grant.Epoch()
-		applying, err := s.BeginDispositionAttempt(context.Background(), req)
+		claimed := fileDispositionClaim(t, s, admitted, DispositionClaim{ResidencyEpoch: settlementResidenc, ExpiresAt: settlementExpiry})
+		applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if applying.Record.Claim == nil {
 			t.Fatal("vacuous: an applying record has no claim for the fence to consult")
 		}
-		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(applying, grant.Epoch()-1, settlementExpiry))
+		if grant.Epoch() >= applying.Record.Claim.ResidencyEpoch {
+			t.Fatalf("vacuous: the grant's epoch %d is not below the record's mark %d, so the fence would not fire anyway", grant.Epoch(), applying.Record.Claim.ResidencyEpoch)
+		}
+		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(applying, grant, settlementExpiry))
 		state := assertInboxCode(t, err, InboxErrorState)
 		if ok || state.Field != "attempt" {
 			t.Fatalf("field = %q, want attempt (ok=%v)", state.Field, ok)
@@ -293,12 +311,18 @@ func TestClaimDispositionCommandRefusalOrder(t *testing.T) {
 	// the answer that is permanent.
 	t.Run("superseded residency before the deadline and a lapsed claim", func(t *testing.T) {
 		s, clock, admitted, grant := claimFixture(t)
-		claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), settlementExpiry)
+		claimed := fileDispositionClaim(t, s, admitted, DispositionClaim{ResidencyEpoch: settlementResidenc, ExpiresAt: settlementExpiry})
+		if grant.Epoch() >= settlementResidenc {
+			t.Fatalf("vacuous: the grant's epoch %d is not below the mark %d", grant.Epoch(), settlementResidenc)
+		}
 		clock.set(inboxDeadline)
-		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant.Epoch()-1, inboxDeadline.Add(time.Minute)))
+		if clock.Now().Before(claimed.Record.Claim.ExpiresAt) || clock.Now().Before(claimed.Record.ApplyDeadline) {
+			t.Fatal("vacuous: this case requires the claim to have lapsed AND the deadline to have passed")
+		}
+		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant, inboxDeadline.Add(time.Minute)))
 		epoch := assertInboxCode(t, err, InboxErrorEpoch)
-		if ok || epoch.Field != "residency_epoch" || epoch.Epoch != uint64(grant.Epoch()) {
-			t.Fatalf("epoch refusal = %+v (ok=%v), want field residency_epoch at %d", epoch, ok, grant.Epoch())
+		if ok || epoch.Field != "residency_epoch" || epoch.Epoch != uint64(settlementResidenc) {
+			t.Fatalf("epoch refusal = %+v (ok=%v), want field residency_epoch at %d", epoch, ok, settlementResidenc)
 		}
 	})
 
@@ -306,12 +330,12 @@ func TestClaimDispositionCommandRefusalOrder(t *testing.T) {
 	// answers ahead of the held-claim refusal, which merely expires.
 	t.Run("the deadline before a held claim", func(t *testing.T) {
 		s, clock, admitted, grant := claimFixture(t)
-		claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), claimPastDeadline)
+		claimed := mustClaimDisposition(t, s, admitted, grant, claimPastDeadline)
 		clock.set(inboxDeadline)
 		if !clock.Now().Before(claimed.Record.Claim.ExpiresAt) {
 			t.Fatal("vacuous: the claim this case requires to still be live has lapsed")
 		}
-		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant.Epoch(), claimPastDeadline.Add(time.Minute)))
+		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant, claimPastDeadline.Add(time.Minute)))
 		deadline := assertInboxCode(t, err, InboxErrorDeadline)
 		if ok || deadline.Field != "apply_deadline" {
 			t.Fatalf("field = %q, want apply_deadline (ok=%v)", deadline.Field, ok)
@@ -323,9 +347,9 @@ func TestClaimDispositionCommandRefusalOrder(t *testing.T) {
 	t.Run("an exact replay before the deadline", func(t *testing.T) {
 		s, clock, admitted, grant := claimFixture(t)
 		expires := claimPastDeadline
-		claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), expires)
+		claimed := mustClaimDisposition(t, s, admitted, grant, expires)
 		clock.set(inboxDeadline)
-		again, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant.Epoch(), expires))
+		again, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant, expires))
 		if err != nil || ok || again.Revision != claimed.Revision {
 			t.Fatalf("replay past the deadline = %+v %v %v", again, ok, err)
 		}
@@ -365,7 +389,7 @@ func TestDispositionClaimEdgesValidateBeforeAnyRead(t *testing.T) {
 			s := openStore(t, backend, WithClock(clock))
 			_, _, admitted, grant := withClaimFixture(t, s, clock)
 
-			claim := claimRequest(admitted, grant.Epoch(), settlementExpiry)
+			claim := claimRequest(admitted, grant, settlementExpiry)
 			tc.claim(&claim)
 			counter.gets = 0
 			_, ok, err := s.ClaimDispositionCommand(context.Background(), claim)
@@ -395,18 +419,16 @@ func TestClaimDispositionCommandValidatesItsClaim(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		expires time.Time
-		epoch   func(ResidencyEpoch) ResidencyEpoch
 		field   string
 	}{
-		{"zero residency", settlementExpiry, func(ResidencyEpoch) ResidencyEpoch { return 0 }, "residency_epoch"},
-		{"unset expiry", time.Time{}, func(e ResidencyEpoch) ResidencyEpoch { return e }, "claim_expires_at"},
-		{"expiry in the past", settlementNow.Add(-time.Second), func(e ResidencyEpoch) ResidencyEpoch { return e }, "claim_expires_at"},
-		{"expiry at now", settlementNow, func(e ResidencyEpoch) ResidencyEpoch { return e }, "claim_expires_at"},
-		{"expiry beyond the TTL", settlementNow.Add(MaxCommandClaimTTL + time.Second), func(e ResidencyEpoch) ResidencyEpoch { return e }, "claim_expires_at"},
+		{"unset expiry", time.Time{}, "claim_expires_at"},
+		{"expiry in the past", settlementNow.Add(-time.Second), "claim_expires_at"},
+		{"expiry at now", settlementNow, "claim_expires_at"},
+		{"expiry beyond the TTL", settlementNow.Add(MaxCommandClaimTTL + time.Second), "claim_expires_at"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, admitted, grant := claimFixture(t)
-			req := claimRequest(admitted, tc.epoch(grant.Epoch()), tc.expires)
+			req := claimRequest(admitted, grant, tc.expires)
 			_, ok, err := s.ClaimDispositionCommand(context.Background(), req)
 			invalid := assertInboxCode(t, err, InboxErrorInvalid)
 			if ok || invalid.Field != tc.field {
@@ -419,7 +441,7 @@ func TestClaimDispositionCommandValidatesItsClaim(t *testing.T) {
 	// the refusals above are the bound rather than a blanket rejection.
 	t.Run("the TTL boundary is inclusive", func(t *testing.T) {
 		s, _, admitted, grant := claimFixture(t)
-		if _, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant.Epoch(), settlementNow.Add(MaxCommandClaimTTL))); err != nil || !ok {
+		if _, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant, settlementNow.Add(MaxCommandClaimTTL))); err != nil || !ok {
 			t.Fatalf("the TTL bound itself was refused: %v %v", ok, err)
 		}
 	})
@@ -455,7 +477,7 @@ func TestRejectDispositionCommandRejectsAPendingCommand(t *testing.T) {
 // precisely because an attemptless rejection may have one.
 func TestRejectDispositionCommandKeepsTheClaimItRefuses(t *testing.T) {
 	s, _, admitted, grant := claimFixture(t)
-	claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), settlementExpiry)
+	claimed := mustClaimDisposition(t, s, admitted, grant, settlementExpiry)
 	rejected, ok, err := s.RejectDispositionCommand(context.Background(), rejectRequest(claimed, grant.Epoch()))
 	if err != nil || !ok {
 		t.Fatalf("reject a claimed command: %v %v", ok, err)
@@ -463,7 +485,7 @@ func TestRejectDispositionCommandKeepsTheClaimItRefuses(t *testing.T) {
 	if rejected.Record.State != InboxStateRejected || rejected.Record.Claim == nil {
 		t.Fatalf("rejection dropped the claim: %+v", rejected.Record)
 	}
-	if *rejected.Record.Claim != *claimed.Record.Claim {
+	if !sameDispositionClaim(*rejected.Record.Claim, *claimed.Record.Claim) {
 		t.Fatalf("claim = %+v, want %+v", *rejected.Record.Claim, *claimed.Record.Claim)
 	}
 	if rejected.Record.Attempt != nil || rejected.Record.Outcome != nil {
@@ -478,7 +500,7 @@ func TestRejectDispositionCommandKeepsTheClaimItRefuses(t *testing.T) {
 // writes not_applied under a strictly later journal grant.
 func TestRejectDispositionCommandRefusesACommandWithAnAttempt(t *testing.T) {
 	s, _, admitted, grant := claimFixture(t, WithDispositionEvidence(&fakeEvidence{evidence: appliedEvidence()}))
-	claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), settlementExpiry)
+	claimed := mustClaimDisposition(t, s, admitted, grant, settlementExpiry)
 	req := beginRequest(claimed)
 	req.ResidencyEpoch = grant.Epoch()
 	applying, err := s.BeginDispositionAttempt(context.Background(), req)
@@ -530,7 +552,7 @@ func TestRejectDispositionCommandNeedsNoResidency(t *testing.T) {
 	})
 	t.Run("a lapsed claim", func(t *testing.T) {
 		s, clock, admitted, grant := claimFixture(t)
-		claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), settlementExpiry)
+		claimed := mustClaimDisposition(t, s, admitted, grant, settlementExpiry)
 		clock.set(settlementExpiry)
 		if _, ok, err := s.RejectDispositionCommand(context.Background(), rejectRequest(claimed, 0)); err != nil || !ok {
 			t.Fatalf("reconciler rejection over a lapsed claim: %v %v", ok, err)
@@ -538,7 +560,7 @@ func TestRejectDispositionCommandNeedsNoResidency(t *testing.T) {
 	})
 	t.Run("a live claim is not the reconciler's to settle", func(t *testing.T) {
 		s, _, admitted, grant := claimFixture(t)
-		claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), settlementExpiry)
+		claimed := mustClaimDisposition(t, s, admitted, grant, settlementExpiry)
 		_, ok, err := s.RejectDispositionCommand(context.Background(), rejectRequest(claimed, 0))
 		held := assertInboxCode(t, err, InboxErrorClaimHeld)
 		if ok || held.Field != "claim" {
@@ -554,7 +576,7 @@ func TestRejectDispositionCommandNeedsNoResidency(t *testing.T) {
 // still worth running, exactly as legacy RejectCommand states.
 func TestRejectDispositionCommandFencesAVolunteeredResidency(t *testing.T) {
 	s, clock, admitted, grant := claimFixture(t)
-	claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), settlementExpiry)
+	claimed := mustClaimDisposition(t, s, admitted, grant, settlementExpiry)
 	clock.set(settlementExpiry)
 	_, ok, err := s.RejectDispositionCommand(context.Background(), rejectRequest(claimed, grant.Epoch()-1))
 	epoch := assertInboxCode(t, err, InboxErrorEpoch)
@@ -568,25 +590,46 @@ func TestRejectDispositionCommandFencesAVolunteeredResidency(t *testing.T) {
 	}
 }
 
-// Both edges are ordinary disposition transitions: they read the immutable
-// catalog binding and re-fence the session's protocol mode, so a legacy session
-// is refused with a CatalogError about the binding rather than an InboxError
-// about the command.
+// A legacy session is refused by both edges, and they refuse it DIFFERENTLY now
+// that the claim edge takes a grant. The reject edge takes a bare epoch, reaches
+// the catalog and answers with a CatalogError about the binding, as every other
+// disposition transition does. The claim edge cannot be reached for a legacy
+// session at all: AcquireResidency refuses to issue a grant over one, so there
+// is no value of the request's Residency member that names it.
+//
+// That is a real consequence of the capability and is asserted rather than
+// assumed — a reader should not expect a CatalogError from the claim edge here.
 func TestDispositionClaimEdgesRefuseALegacySession(t *testing.T) {
 	s := openStore(t, memstore.New(), WithClock(newMovableClock(settlementNow)))
 	if _, _, err := s.CreateCatalogEntry(context.Background(), testCreateRequest()); err != nil {
 		t.Fatal(err)
 	}
 	entry := DispositionInboxEntry{Record: DispositionInboxRecord{Descriptor: DispositionCommandDescriptor{TenantID: catalogTenant, SessionID: catalogSession, CommandID: "public/command:1"}}, Revision: 1}
-	_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(entry, 1, settlementExpiry))
+
+	_, ok, err := s.RejectDispositionCommand(context.Background(), rejectRequest(entry, 1))
 	catalog := assertCatalogCode(t, err, CatalogErrorInvalid)
 	if ok || catalog.Field != "binding.protocol_mode" {
-		t.Fatalf("claim: field %q ok %v", catalog.Field, ok)
-	}
-	_, ok, err = s.RejectDispositionCommand(context.Background(), rejectRequest(entry, 1))
-	catalog = assertCatalogCode(t, err, CatalogErrorInvalid)
-	if ok || catalog.Field != "binding.protocol_mode" {
 		t.Fatalf("reject: field %q ok %v", catalog.Field, ok)
+	}
+
+	// No grant is obtainable for this session, so the claim edge has no reachable
+	// request naming it.
+	if _, err := s.AcquireResidency(context.Background(), AcquireResidencyRequest{TenantID: catalogTenant, SessionID: catalogSession}); err == nil {
+		t.Fatal("AcquireResidency issued a grant over a LEGACY session")
+	} else {
+		catalog = assertCatalogCode(t, err, CatalogErrorInvalid)
+		if catalog.Field != "binding.protocol_mode" {
+			t.Fatalf("acquire: field %q", catalog.Field)
+		}
+	}
+	// And a grant issued for ANOTHER session cannot be pointed at this one.
+	other := openStore(t, memstore.New(), WithClock(newMovableClock(settlementNow)))
+	createDispositionCatalog(t, other)
+	foreign := acquireTestResidency(t, other)
+	_, ok, err = s.ClaimDispositionCommand(context.Background(), claimRequest(entry, foreign, settlementExpiry))
+	invalid := assertInboxCode(t, err, InboxErrorInvalid)
+	if ok || invalid.Field != "residency" {
+		t.Fatalf("claim with a foreign grant: field %q ok %v", invalid.Field, ok)
 	}
 }
 
@@ -596,7 +639,7 @@ func TestDispositionClaimEdgesSurviveReopen(t *testing.T) {
 	clock := newMovableClock(settlementNow)
 	first := openStore(t, backend, WithClock(clock))
 	_, _, admitted, grant := withClaimFixture(t, first, clock)
-	claimed, _, err := first.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant.Epoch(), settlementExpiry))
+	claimed, _, err := first.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant, settlementExpiry))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -609,7 +652,7 @@ func TestDispositionClaimEdgesSurviveReopen(t *testing.T) {
 	if got.Revision != rejected.Revision || got.Record.State != InboxStateRejected || got.Record.Attempt != nil || got.Record.Outcome != nil {
 		t.Fatalf("reopened record = %+v, want the pre-dispatch rejection at revision %d", got, rejected.Revision)
 	}
-	if got.Record.Claim == nil || *got.Record.Claim != *claimed.Record.Claim {
+	if got.Record.Claim == nil || !sameDispositionClaim(*got.Record.Claim, *claimed.Record.Claim) {
 		t.Fatalf("reopened claim = %+v, want %+v", got.Record.Claim, claimed.Record.Claim)
 	}
 }
@@ -661,7 +704,7 @@ func TestFactoryAuthorityForBothDispositionEdges(t *testing.T) {
 	forClaim := admit(t, "claim")
 	if _, ok, err := s.ClaimDispositionCommand(context.Background(), ClaimDispositionCommandRequest{
 		TenantID: tenant, SessionID: session, CommandID: forClaim.Record.Descriptor.CommandID, ExpectedRevision: forClaim.Revision,
-		ResidencyEpoch: grant.Epoch(), ClaimExpiresAt: settlementExpiry,
+		Residency: grant, ClaimExpiresAt: settlementExpiry,
 	}); err != nil || !ok {
 		t.Fatalf("Factory cannot claim with a residency it acquired itself: %v %v", ok, err)
 	}
@@ -681,7 +724,7 @@ func TestClaimDispositionCommandRefusesAPreDispatchRejection(t *testing.T) {
 	if rejected.Record.Attempt != nil || rejected.Record.Claim != nil {
 		t.Fatalf("vacuous: this record carries a member a later guard would refuse it on: %+v", rejected.Record)
 	}
-	_, ok, err = s.ClaimDispositionCommand(context.Background(), claimRequest(rejected, grant.Epoch(), settlementExpiry))
+	_, ok, err = s.ClaimDispositionCommand(context.Background(), claimRequest(rejected, grant, settlementExpiry))
 	terminal := assertInboxCode(t, err, InboxErrorTerminal)
 	if ok || terminal.Field != "state" {
 		t.Fatalf("field = %q, want state (ok=%v)", terminal.Field, ok)
@@ -799,9 +842,10 @@ func TestADecodedDispositionClaimIsHeldToItsOwnBounds(t *testing.T) {
 // the difference, and without it the idempotent arm is asserted only for callers
 // that were never going to expose it.
 //
-// Both representations here are the real ones a consumer produces: a claim
-// expiry computed in a non-UTC zone, and one carrying a monotonic reading from
-// time.Now.
+// The MONOTONIC half of the same defect needs a clock this file's fixtures
+// cannot provide and lives in its own test below; a row here claiming to cover
+// it would be a no-op, because settlementExpiry is a constructed time.Date and
+// Round(0) on such a value is the identity.
 func TestClaimDispositionCommandReplaysAcrossTimeRepresentations(t *testing.T) {
 	zone := time.FixedZone("Test/Plus0530", 5*3600+1800)
 	for _, tc := range []struct {
@@ -811,15 +855,14 @@ func TestClaimDispositionCommandReplaysAcrossTimeRepresentations(t *testing.T) {
 	}{
 		{"a non-UTC zone", settlementExpiry.In(zone), settlementExpiry.In(zone)},
 		{"UTC then the same instant elsewhere", settlementExpiry, settlementExpiry.In(zone)},
-		{"a monotonic reading against a stored wall clock", settlementExpiry, settlementExpiry.Round(0).Add(0)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, admitted, grant := claimFixture(t)
-			claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), tc.first)
+			claimed := mustClaimDisposition(t, s, admitted, grant, tc.first)
 			if !claimed.Record.Claim.ExpiresAt.Equal(tc.again) {
 				t.Fatalf("vacuous: the stored expiry %v is not the instant being replayed %v", claimed.Record.Claim.ExpiresAt, tc.again)
 			}
-			again, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant.Epoch(), tc.again))
+			again, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant, tc.again))
 			if err != nil || ok || again.Revision != claimed.Revision {
 				t.Fatalf("a replay naming the same instant was not idempotent: %+v %v %v", again, ok, err)
 			}
@@ -830,11 +873,303 @@ func TestClaimDispositionCommandReplaysAcrossTimeRepresentations(t *testing.T) {
 	// and not to nothing.
 	t.Run("a different instant is still a renewal", func(t *testing.T) {
 		s, _, admitted, grant := claimFixture(t)
-		claimed := mustClaimDisposition(t, s, admitted, grant.Epoch(), settlementExpiry.In(zone))
-		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant.Epoch(), settlementExpiry.In(zone).Add(time.Second)))
+		claimed := mustClaimDisposition(t, s, admitted, grant, settlementExpiry.In(zone))
+		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant, settlementExpiry.In(zone).Add(time.Second)))
 		assertInboxCode(t, err, InboxErrorClaimHeld)
 		if ok {
 			t.Fatal("CONTROL: a renewal one second later was accepted as a replay")
 		}
 	})
+}
+
+// F1. THE CLAIM EDGE IS THE ONLY PRODUCER OF THE RECORD'S HIGH-WATER MARK, and
+// that mark only ever rises, so an epoch no provider issued would supersede every
+// real Host for that command permanently. The capability is what makes such an
+// epoch INEXPRESSIBLE rather than merely refused: the request carries a
+// *ResidencyGrant, and the epoch is read off it.
+//
+// What can still be attempted is handing the edge a grant it should not honour,
+// and each conjunct of residencyFor is driven here.
+func TestClaimDispositionCommandRefusesAResidencyItDidNotIssue(t *testing.T) {
+	t.Run("no grant at all", func(t *testing.T) {
+		s, _, admitted, _ := claimFixture(t)
+		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, nil, settlementExpiry))
+		invalid := assertInboxCode(t, err, InboxErrorInvalid)
+		if ok || invalid.Field != "residency" {
+			t.Fatalf("field = %q, want residency (ok=%v)", invalid.Field, ok)
+		}
+		assertDispositionUnchanged(t, s, admitted)
+	})
+
+	t.Run("a released grant", func(t *testing.T) {
+		s, _, admitted, grant := claimFixture(t)
+		if err := grant.Release(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, grant, settlementExpiry))
+		invalid := assertInboxCode(t, err, InboxErrorInvalid)
+		if ok || invalid.Field != "residency" {
+			t.Fatalf("field = %q, want residency (ok=%v)", invalid.Field, ok)
+		}
+		assertDispositionUnchanged(t, s, admitted)
+	})
+
+	t.Run("a grant for another session", func(t *testing.T) {
+		backend := memstore.New()
+		clock := newMovableClock(settlementNow)
+		s := openStore(t, backend, WithClock(clock))
+		createDispositionCatalog(t, s)
+		admitted, _, err := s.AdmitDispositionCommand(context.Background(), dispositionRequest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A second disposition session in the SAME store, whose residency lease is
+		// a different namespace and whose epochs are therefore incomparable.
+		req := testCreateRequest()
+		req.SessionID = "session-b"
+		req.Binding = testSessionBinding()
+		if _, _, err := s.CreateCatalogEntry(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+		foreign, err := s.AcquireResidency(context.Background(), AcquireResidencyRequest{TenantID: catalogTenant, SessionID: "session-b"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = foreign.Release(context.Background()) })
+		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, foreign, settlementExpiry))
+		invalid := assertInboxCode(t, err, InboxErrorInvalid)
+		if ok || invalid.Field != "residency" {
+			t.Fatalf("field = %q, want residency (ok=%v)", invalid.Field, ok)
+		}
+		assertDispositionUnchanged(t, s, admitted)
+	})
+
+	t.Run("a grant from another store", func(t *testing.T) {
+		s, _, admitted, _ := claimFixture(t)
+		other := openStore(t, memstore.New(), WithClock(newMovableClock(settlementNow)))
+		createDispositionCatalog(t, other)
+		foreign := acquireTestResidency(t, other)
+		_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(admitted, foreign, settlementExpiry))
+		invalid := assertInboxCode(t, err, InboxErrorInvalid)
+		if ok || invalid.Field != "residency" {
+			t.Fatalf("field = %q, want residency (ok=%v)", invalid.Field, ok)
+		}
+		assertDispositionUnchanged(t, s, admitted)
+	})
+
+	// The control. The SAME store, session and command with the store's OWN live
+	// grant is accepted, and the epoch it stores is the grant's — so the refusals
+	// above are the grant check and not a blanket refusal, and the stored mark
+	// demonstrably comes from the provider rather than from the caller.
+	t.Run("the store's own grant is accepted and supplies the epoch", func(t *testing.T) {
+		s, _, admitted, grant := claimFixture(t)
+		claimed := mustClaimDisposition(t, s, admitted, grant, settlementExpiry)
+		if claimed.Record.Claim.ResidencyEpoch != grant.Epoch() {
+			t.Fatalf("stored mark = %d, want the grant's %d", claimed.Record.Claim.ResidencyEpoch, grant.Epoch())
+		}
+	})
+}
+
+// F1's structural half. The capability only bounds the mark while the claim edge
+// stays the ONLY thing that writes a DispositionClaim, so that is checked against
+// the sources rather than asserted in prose.
+//
+// It is a spelling lock, like TestEveryDispositionTerminalCallSiteIsDriven, and
+// the trade is the same: a new writer fails here loudly instead of widening the
+// mark's provenance silently. A writer that legitimately needs to exist adds
+// itself to the allowed set, which is a one-line change and a decision someone
+// has to make on purpose.
+func TestOnlyTheClaimEdgeAndTheCodecConstructADispositionClaim(t *testing.T) {
+	t.Parallel()
+	// Each entry is a decision, not a label. Two of the three cannot carry a
+	// caller's number at all, which is why they are harmless:
+	allowed := map[string]string{
+		"ClaimDispositionCommand":    "THE PRODUCER. Gated on a *ResidencyGrant, so its epoch is the provider's",
+		"claim":                      "the wire decoder: rebuilds a claim from bytes already stored",
+		"dispositionRecordHighWater": "a ZERO claim, used only as the absent-mark reader; carries no epoch",
+	}
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, scanned := map[string]int{}, 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		scanned++
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		var fn string
+		note := func(site string) {
+			found[fn]++
+			if _, ok := allowed[fn]; !ok {
+				t.Errorf("%s constructs a DispositionClaim (%s) in %s. Only the claim edge may produce the record's high-water mark, and it is gated on a grant so the epoch cannot be a caller's number. Route this through ClaimDispositionCommand, or add it to the allowed set deliberately", fn, site, name)
+			}
+		}
+		isClaim := func(e ast.Expr) bool {
+			id, ok := e.(*ast.Ident)
+			return ok && id.Name == "DispositionClaim"
+		}
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.FuncDecl:
+				fn = node.Name.Name
+			case *ast.CompositeLit:
+				if isClaim(node.Type) {
+					note("composite literal")
+				}
+			case *ast.ValueSpec:
+				// `var claim DispositionClaim` is a construction too, and it is
+				// the shape dispositionRecordHighWater uses; a scan that saw only
+				// literals would report that site as absent and go vacuous.
+				if node.Type != nil && isClaim(node.Type) {
+					note("zero-value declaration")
+				}
+			}
+			return true
+		})
+	}
+	if scanned == 0 {
+		t.Fatal("vacuous: no production files were scanned")
+	}
+	// Non-vacuity both ways: the producer must actually have been seen, and a
+	// stale allowance is an error too, or the set grows without limit.
+	if found["ClaimDispositionCommand"] == 0 {
+		t.Error("vacuous: ClaimDispositionCommand no longer constructs a DispositionClaim, so this guard is watching nothing")
+	}
+	for fn, why := range allowed {
+		if found[fn] == 0 {
+			t.Errorf("%q is allowed to construct a DispositionClaim (%s) and no longer does; remove the allowance", fn, why)
+		}
+	}
+}
+
+// F2. THE MONOTONIC HALF, driven for real.
+//
+// `time.Time` carries three things struct equality compares: the wall clock, a
+// *Location pointer, and a monotonic reading. The test above covers the zone;
+// this covers the monotonic reading, and it needs its own fixture because every
+// time in this package is a constructed `time.Date` literal — on which `Round(0)`
+// is the IDENTITY, so a row built from one measures nothing at all.
+//
+// A value with a real monotonic reading can only come from time.Now, and
+// validateBoundedExpiry measures the expiry against the STORE's clock — so the
+// store's clock has to track real time for such an expiry to be inside
+// MaxCommandClaimTTL at all. That is the whole awkwardness, and it is why this is
+// a separate fixture rather than a table row.
+//
+// Both non-vacuity guards are load-bearing: without them this test would pass
+// under struct equality exactly as the row it replaces did.
+func TestClaimDispositionCommandReplaysAnExpiryCarryingAMonotonicReading(t *testing.T) {
+	base := time.Now()
+	s := openStore(t, memstore.New(), WithClock(newMovableClock(base)))
+	createDispositionCatalog(t, s)
+	req := dispositionRequest()
+	req.AcceptedAt = base.Round(0).UTC()
+	req.ApplyDeadline = base.Round(0).UTC().Add(2 * time.Hour)
+	admitted, created, err := s.AdmitDispositionCommand(context.Background(), req)
+	if err != nil || !created {
+		t.Fatalf("admit: %v %v", created, err)
+	}
+	grant := acquireTestResidency(t, s)
+
+	expires := time.Now().Add(30 * time.Minute)
+	if expires.Round(0) == expires {
+		t.Fatal("VACUOUS: the requested expiry carries no monotonic reading, so struct equality would match it and this test would prove nothing")
+	}
+	claimed := mustClaimDisposition(t, s, admitted, grant, expires)
+	stored := claimed.Record.Claim.ExpiresAt
+	if stored.Round(0) != stored {
+		t.Fatal("VACUOUS: the STORED expiry kept a monotonic reading, so struct equality would match it too")
+	}
+	if !stored.Equal(expires) {
+		t.Fatalf("the codec did not preserve the instant: stored %v (%d ns), requested %v (%d ns)", stored, stored.Nanosecond(), expires, expires.Nanosecond())
+	}
+	again, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant, expires))
+	if err != nil || ok || again.Revision != claimed.Revision {
+		t.Fatalf("a replay whose expiry carries a monotonic reading was not idempotent: %+v %v %v", again, ok, err)
+	}
+}
+
+// F4. THE LESSON GENERALISED, and the reason this test exists.
+//
+// The UTC blind spot was not "we forgot a zone". It was: EVERY FIXTURE SHARED A
+// VALUE, so a property that only differs when that value differs cannot be
+// measured — by a test or by a mutant. Mutation testing cannot find such a gap,
+// because the mutant and the original agree on every input the suite can build.
+//
+// Asking "what else do all the fixtures share?" answers it. They share a zero
+// SUB-SECOND component: settlementNow, settlementExpiry, inboxAcceptedAt and
+// inboxDeadline are all time.Date(..., 0, 0, time.UTC) and every derived value
+// adds whole minutes. So nothing pinned the replay comparison finer than one
+// second, and truncating it to a second survived the whole suite — while every
+// real caller using time.Now().Add(ttl) lands on a sub-second boundary.
+func TestClaimDispositionCommandDistinguishesClaimsInsideOneSecond(t *testing.T) {
+	s, _, admitted, grant := claimFixture(t)
+	first := settlementExpiry.Add(250 * time.Millisecond)
+	near := settlementExpiry.Add(750 * time.Millisecond)
+	if first.Truncate(time.Second) != near.Truncate(time.Second) {
+		t.Fatal("VACUOUS: the two instants are not inside the same second, so a second-resolution comparison would already tell them apart")
+	}
+	if first.Equal(near) {
+		t.Fatal("VACUOUS: the two instants are equal")
+	}
+	claimed := mustClaimDisposition(t, s, admitted, grant, first)
+	_, ok, err := s.ClaimDispositionCommand(context.Background(), claimRequest(claimed, grant, near))
+	held := assertInboxCode(t, err, InboxErrorClaimHeld)
+	if ok || held.Field != "claim" {
+		t.Fatalf("a renewal 500ms later was accepted as a replay: field %q ok %v", held.Field, ok)
+	}
+	if !getDisposition(t, s, claimed).Record.Claim.ExpiresAt.Equal(first) {
+		t.Fatal("the sub-second renewal moved the stored expiry")
+	}
+}
+
+// F3. A LIVE CLAIM ADMITS ONLY ITS OWN HOLDER, at EVERY residency — and the
+// successor is the one that could distinguish the rule from a weaker one. The
+// two residencies the other tests drive (zero and the holder's own) are both
+// refused by `Claim.ResidencyEpoch > req.ResidencyEpoch` as well, so without this
+// case that weakening is invisible.
+//
+// It also pins THE ASYMMETRY BETWEEN THE TWO EDGES, which is real and worth
+// stating: a successor may CLAIM a live claim away from its predecessor
+// (failover), but may not REJECT the command under it. Rejecting is a terminal
+// decision about work someone may be in the middle of, so it is the claim
+// holder's alone; taking the claim first is the successor's route, and it makes
+// the successor the holder before it decides anything terminal.
+func TestRejectDispositionCommandRefusesASuccessorOverALiveClaim(t *testing.T) {
+	s, _, admitted, first := claimFixture(t)
+	claimed := mustClaimDisposition(t, s, admitted, first, settlementExpiry)
+	if err := first.Release(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second := acquireTestResidency(t, s)
+	if second.Epoch() <= first.Epoch() {
+		t.Fatalf("vacuous: %d is not a successor of %d", second.Epoch(), first.Epoch())
+	}
+	if !dispositionClaimLive(getDisposition(t, s, claimed).Record, settlementNow) {
+		t.Fatal("vacuous: the claim this case requires to be live has lapsed")
+	}
+	_, ok, err := s.RejectDispositionCommand(context.Background(), rejectRequest(claimed, second.Epoch()))
+	held := assertInboxCode(t, err, InboxErrorClaimHeld)
+	if ok || held.Field != "claim" {
+		t.Fatalf("a successor rejected a live claim it does not hold: field %q ok %v", held.Field, ok)
+	}
+	assertDispositionUnchanged(t, s, claimed)
+
+	// The other half of the asymmetry, in the same fixture so the two cannot
+	// drift apart: the SAME successor may take the claim, and having taken it may
+	// then reject.
+	stolen := mustClaimDisposition(t, s, claimed, second, settlementExpiry)
+	if stolen.Record.Claim.ResidencyEpoch != second.Epoch() {
+		t.Fatalf("claim residency = %d, want the successor's %d", stolen.Record.Claim.ResidencyEpoch, second.Epoch())
+	}
+	if _, ok, err := s.RejectDispositionCommand(context.Background(), rejectRequest(stolen, second.Epoch())); err != nil || !ok {
+		t.Fatalf("the successor could not reject the claim it had taken: %v %v", ok, err)
+	}
 }
