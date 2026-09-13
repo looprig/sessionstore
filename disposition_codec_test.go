@@ -94,8 +94,9 @@ func FuzzDispositionInboxCodec(f *testing.F) {
 	r.Descriptor.PayloadDigest = digest
 	claim := &DispositionClaim{ResidencyEpoch: 4, ExpiresAt: settlementExpiry}
 	attempt := &DispositionAttempt{AttemptID: "attempt/A:B", JournalEpoch: 9, ResidencyEpoch: 4, StartedAt: settlementNow}
-	applied := &DispositionOutcome{Kind: DispositionApplied, AttemptID: attempt.AttemptID, AttemptJournalEpoch: 9, AuthorJournalEpoch: 9, DispositionSeq: 12, EventID: "01J0000000000000000000EVNT", EventSeq: 12, SettlingResidencyEpoch: 4, SettledAt: settlementNow}
+	applied := &DispositionOutcome{Kind: DispositionApplied, AttemptID: attempt.AttemptID, AttemptJournalEpoch: 9, AuthorJournalEpoch: 9, DispositionSeq: 12, SettlingResidencyEpoch: 4, SettledAt: settlementNow}
 	closure := &DispositionOutcome{Kind: DispositionNotApplied, AttemptID: attempt.AttemptID, AttemptJournalEpoch: 9, AuthorJournalEpoch: 10, DispositionSeq: 31, AuthorFenceSeq: 30, SettlingResidencyEpoch: 7, SettledAt: settlementNow}
+	refusal := &DispositionOutcome{Kind: DispositionRefused, AttemptID: attempt.AttemptID, AttemptJournalEpoch: 9, AuthorJournalEpoch: 9, DispositionSeq: 12, SettlingResidencyEpoch: 4, SettledAt: settlementNow}
 	noOp := &DispositionOutcome{Kind: DispositionNoOp, AttemptID: attempt.AttemptID, AttemptJournalEpoch: 9, AuthorJournalEpoch: 9, DispositionSeq: 12, SettlingResidencyEpoch: 4, SettledAt: settlementNow}
 	for _, seed := range []DispositionInboxRecord{
 		{State: InboxStateClaimed, Claim: claim},
@@ -103,6 +104,7 @@ func FuzzDispositionInboxCodec(f *testing.F) {
 		{State: InboxStateApplied, Claim: claim, Attempt: attempt, Outcome: applied},
 		{State: InboxStateApplied, Claim: claim, Attempt: attempt, Outcome: noOp},
 		{State: InboxStateRejected, Claim: claim, Attempt: attempt, Outcome: closure},
+		{State: InboxStateRejected, Claim: claim, Attempt: attempt, Outcome: refusal},
 		{State: InboxStateRejected},
 		{State: InboxStateRejected, Claim: claim},
 	} {

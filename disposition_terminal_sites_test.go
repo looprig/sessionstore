@@ -85,6 +85,7 @@ func TestInboxStateTerminalPartitionsTheStateSpace(t *testing.T) {
 var dispositionSettlementKinds = map[DispositionOutcomeKind]func() DispositionEvidence{
 	DispositionApplied:    appliedEvidence,
 	DispositionNoOp:       noOpEvidence,
+	DispositionRefused:    refusedEvidence,
 	DispositionNotApplied: notAppliedEvidence,
 }
 

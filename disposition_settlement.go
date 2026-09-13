@@ -142,10 +142,23 @@ type DispositionAttempt struct {
 type DispositionOutcomeKind string
 
 const (
-	// DispositionApplied means the runtime durably accepted the specific
-	// control and committed its effect in the same journal envelope. It does
-	// NOT mean the model work or the external tools that control introduced
-	// have finished.
+	// DispositionApplied means that, under the ATTEMPT's journal grant, the
+	// runtime durably recorded that it accepted this command into its
+	// execution path. That is the whole of it, and the narrowness is the
+	// point.
+	//
+	// It does NOT mean the effect is in the same journal envelope — an earlier
+	// spelling of this comment said so and it was FALSE.
+	// SessionJournal.Append takes exactly one record, encodes one body, frames
+	// one envelope and does one AppendDefinite; there is no batch, so a runtime
+	// cannot put any effect in the same frame as its disposition. The
+	// disposition is a separate, private, bodiless frame written AFTER the
+	// synchronously-observable effect.
+	//
+	// Four things it therefore does not prove: that a turn started, that a turn
+	// folded, that no later TurnRejected can follow, and that a queued input
+	// survives a crash. It says the acceptance was recorded, and a caller that
+	// needs any of the four must read the journal for it.
 	DispositionApplied DispositionOutcomeKind = "applied"
 
 	// DispositionNoOp is an explicit successful application with no effect —
@@ -153,6 +166,22 @@ const (
 	// public event: reject-before-dispatch and an applied no-op are different
 	// outcomes and are never merged.
 	DispositionNoOp DispositionOutcomeKind = "no_op"
+
+	// DispositionRefused is the runtime's own durable statement, authored under
+	// the ATTEMPT's own grant, that it did NOT accept this command into its
+	// execution path. It settles the command as rejected.
+	//
+	// It exists for liveness, not for symmetry. A runtime has post-prefix
+	// failure paths it can take under a LIVE lease, and the only other
+	// rejecting kind — DispositionNotApplied — is authored by a STRICTLY LATER
+	// journal grant. Without this arm a command failing that way would sit
+	// applying until the lease turned over, which a healthy Host never does.
+	//
+	// It is not a recovery closure and is never a substitute for one: a
+	// refusal is a live runtime's own answer, while a closure is a successor's
+	// conclusion about a runtime that is gone. Nothing may derive one from the
+	// other.
+	DispositionRefused DispositionOutcomeKind = "refused"
 
 	// DispositionNotApplied is a successor runtime's recovery closure: it
 	// proves, under a strictly later journal grant whose opening fence it
@@ -162,13 +191,18 @@ const (
 )
 
 func (k DispositionOutcomeKind) valid() bool {
-	return k == DispositionApplied || k == DispositionNoOp || k == DispositionNotApplied
+	return k == DispositionApplied || k == DispositionNoOp || k == DispositionRefused || k == DispositionNotApplied
 }
 
-// terminalState is the inbox state a disposition kind settles a command into. A
-// successful no-op is an APPLICATION, so it settles as applied.
+// terminalState is the inbox state a disposition kind settles a command into.
+//
+// The split is acceptance, not success. A successful no-op is an APPLICATION —
+// the runtime accepted the command and it had no effect — so it settles as
+// applied. Both kinds that say the command was NOT accepted settle as rejected,
+// and they are two kinds rather than one because they are authored by different
+// grants: a refusal by the attempt's own, a closure by a strictly later one.
 func (k DispositionOutcomeKind) terminalState() InboxState {
-	if k == DispositionNotApplied {
+	if k == DispositionRefused || k == DispositionNotApplied {
 		return InboxStateRejected
 	}
 	return InboxStateApplied
@@ -180,10 +214,17 @@ func (k DispositionOutcomeKind) terminalState() InboxState {
 // caller and nothing here may be supplied by one.
 //
 // AuthorJournalEpoch is the grant that AUTHORED the disposition, which is the
-// attempt's own grant for an application and a strictly later one for a
-// recovery closure. AuthorFenceSeq names the verified opening fence of that
-// later author grant and is set only for a closure. EventID and EventSeq name
-// the public event carried in the same envelope as an applied disposition.
+// attempt's own grant for an application or a refusal and a strictly later one
+// for a recovery closure. AuthorFenceSeq names the verified opening fence of
+// that later author grant and is set only for a closure.
+//
+// EventID and EventSeq are retained members of the durable shape that are
+// ALWAYS ZERO. They were written for an applied disposition that carried its
+// public event in the same envelope, and no such record can exist: a journal
+// append frames one envelope, so an effect is always a separate record. They
+// are kept rather than removed because they are members of the durable wire DTO
+// and removing one would change stored bytes; nothing derives anything from
+// them, and a non-zero value here is refused.
 type DispositionEvidence struct {
 	AttemptID           DispositionAttemptID
 	Kind                DispositionOutcomeKind
@@ -235,6 +276,12 @@ func WithDispositionEvidence(reader DispositionEvidenceReader) Option {
 		if reader == nil || isNilDynamic(reflect.ValueOf(reader)) {
 			return &InvalidOptionError{Field: "DispositionEvidence"}
 		}
+		// It does not stack with WithJournalDispositionEvidence, in either
+		// order; see there for why the order of two options may not decide
+		// which journal a settlement believes.
+		if cfg.evidence != nil || cfg.journalEvidence {
+			return &InvalidOptionError{Field: "DispositionEvidence"}
+		}
 		cfg.evidence = reader
 		return nil
 	}
@@ -274,6 +321,9 @@ func WithDispositionEvidence(reader DispositionEvidenceReader) Option {
 // before the terminal compare-and-swap, so it is when the store DECIDED and not
 // when the runtime acted — the journal sequences are what order the runtime's
 // side. It is not comparable with a caller's clock and must not be used as one.
+//
+// EventID and EventSeq are members of the durable shape that are always zero;
+// see DispositionEvidence for why they are retained rather than removed.
 //
 // These struct tags are NOT the durable spelling; see dispositionOutcomeWire.
 type DispositionOutcome struct {
@@ -525,12 +575,12 @@ func (s *Store) SettleDispositionCommand(ctx context.Context, req SettleDisposit
 //   - The evidence must be about THIS attempt and the grant that attempt
 //     selected. A disposition naming another attempt identity, or the same one
 //     under a different journal grant, is evidence about something else.
-//   - An application (applied or a successful no-op) is authored BY the
-//     authorized attempt grant, so its author and attempt journal epochs are
-//     equal. An applied disposition names the public event committed in the
-//     same envelope, which is why the event's sequence is the disposition's; a
-//     no-op names no event at all, because a private disposition envelope
-//     fabricates none.
+//   - An application (applied or a successful no-op) and a refusal are authored
+//     BY the authorized attempt grant, so their author and attempt journal
+//     epochs are equal, and none of the three names a public event. A
+//     disposition is a bodiless private frame written after whatever effect it
+//     reports, never alongside it, so an event named here would be a claim the
+//     journal cannot support.
 //   - A recovery closure is authored by a STRICTLY LATER grant and names that
 //     author's verified opening fence, which necessarily precedes the closure
 //     it authored.
@@ -563,20 +613,21 @@ func verifiedDispositionOutcome(attempt DispositionAttempt, e DispositionEvidenc
 			return DispositionOutcome{}, inboxErr(InboxErrorEvidence, "event", nil)
 		}
 	default:
+		// applied, no_op and refused are all authored BY the authorized attempt
+		// grant, so there is one arm for the three and no per-kind exception in
+		// it. A kind-specific clause here would be a second place for the
+		// author rule to drift.
 		if e.AuthorJournalEpoch != e.AttemptJournalEpoch {
 			return DispositionOutcome{}, inboxErr(InboxErrorEvidence, "author_journal_epoch", nil)
 		}
 		if e.AuthorFenceSeq != 0 {
 			return DispositionOutcome{}, inboxErr(InboxErrorEvidence, "author_fence_seq", nil)
 		}
-		if e.Kind == DispositionApplied {
-			if err := e.EventID.Validate(); err != nil {
-				return DispositionOutcome{}, inboxErr(InboxErrorEvidence, "event_id", err)
-			}
-			if e.EventSeq != e.DispositionSeq {
-				return DispositionOutcome{}, inboxErr(InboxErrorEvidence, "event_seq", nil)
-			}
-		} else if e.EventID != "" || e.EventSeq != 0 {
+		// No disposition names an event. The applied-only rule that once stood
+		// here — a valid EventID whose sequence equalled the disposition's —
+		// rested on the effect sharing the disposition's envelope, which a
+		// one-record append makes impossible.
+		if e.EventID != "" || e.EventSeq != 0 {
 			return DispositionOutcome{}, inboxErr(InboxErrorEvidence, "event", nil)
 		}
 	}

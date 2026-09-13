@@ -112,8 +112,21 @@ func appliedEvidence() DispositionEvidence {
 		AttemptJournalEpoch: settlementJournal,
 		AuthorJournalEpoch:  settlementJournal,
 		DispositionSeq:      12,
-		EventID:             "01J0000000000000000000EVNT",
-		EventSeq:            12,
+	}
+}
+
+// refusedEvidence is the runtime's own statement, under the ATTEMPT's grant,
+// that it did not accept the command. It is shaped exactly like an application
+// because it is authored by the same grant and names no event; only the kind
+// separates them, which is why every conjunct of the shared arm is scored
+// against this kind too.
+func refusedEvidence() DispositionEvidence {
+	return DispositionEvidence{
+		AttemptID:           settlementAttempt,
+		Kind:                DispositionRefused,
+		AttemptJournalEpoch: settlementJournal,
+		AuthorJournalEpoch:  settlementJournal,
+		DispositionSeq:      12,
 	}
 }
 
@@ -373,7 +386,10 @@ func TestSettleDispositionAppliedUsesDerivedEvidenceRequest(t *testing.T) {
 		t.Fatalf("state = %q", settled.Record.State)
 	}
 	outcome := settled.Record.Outcome
-	if outcome == nil || outcome.Kind != DispositionApplied || outcome.DispositionSeq != 12 || outcome.EventSeq != 12 || outcome.EventID != "01J0000000000000000000EVNT" {
+	// An applied disposition names NO event. Harness cannot put an effect in
+	// the same frame as a disposition — SessionJournal.Append takes one record
+	// — so the two members stay in the durable DTO and stay zero.
+	if outcome == nil || outcome.Kind != DispositionApplied || outcome.DispositionSeq != 12 || outcome.EventSeq != 0 || outcome.EventID != "" {
 		t.Fatalf("outcome = %+v", outcome)
 	}
 	if outcome.AttemptID != settlementAttempt || outcome.AttemptJournalEpoch != settlementJournal || outcome.AuthorJournalEpoch != settlementJournal {
@@ -398,6 +414,73 @@ func TestSettleDispositionNoOpIsAnApplication(t *testing.T) {
 	}
 	if settled.Record.Outcome.Kind != DispositionNoOp || settled.Record.Outcome.EventID != "" || settled.Record.Outcome.EventSeq != 0 {
 		t.Fatalf("no-op invented an event: %+v", settled.Record.Outcome)
+	}
+}
+
+// A refusal is the runtime's own statement, under the ATTEMPT's OWN grant, that
+// it did not accept the command into its execution path.
+//
+// This arm closes a liveness hole rather than adding a synonym. Harness has
+// documented post-prefix failure paths under a LIVE lease, and `not_applied` is
+// reachable only under a strictly later journal grant; with that arm alone such
+// a command would sit applying until the lease turned over, which a healthy Host
+// never does. So the assertions here are two: the settlement succeeds with NO
+// later grant and NO opening fence, and it lands in rejected rather than
+// applied.
+func TestSettleDispositionRefusedIsRejectedUnderTheAttemptGrant(t *testing.T) {
+	reader := &fakeEvidence{evidence: refusedEvidence()}
+	s, _, claimed := settlementFixture(t, reader)
+	applying, err := s.BeginDispositionAttempt(context.Background(), beginRequest(claimed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	settled, ok, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, settlementResidenc))
+	if err != nil || !ok {
+		t.Fatalf("refused settlement: %+v %v %v", settled, ok, err)
+	}
+	if settled.Record.State != InboxStateRejected {
+		t.Fatalf("state = %q, want rejected: a refusal is not an application", settled.Record.State)
+	}
+	outcome := settled.Record.Outcome
+	if outcome.Kind != DispositionRefused {
+		t.Fatalf("outcome kind = %q", outcome.Kind)
+	}
+	if outcome.AuthorJournalEpoch != settlementJournal || outcome.AuthorFenceSeq != 0 {
+		t.Fatalf("a refusal needed a later grant or a fence: %+v", outcome)
+	}
+	if outcome.EventID != "" || outcome.EventSeq != 0 {
+		t.Fatalf("a refusal named an event: %+v", outcome)
+	}
+	// The durable readback proves the terminal state survived the write rather
+	// than only the returned value carrying it.
+	got, err := s.GetDispositionCommand(context.Background(), GetDispositionCommandRequest{TenantID: applying.Record.Descriptor.TenantID, SessionID: applying.Record.Descriptor.SessionID, CommandID: applying.Record.Descriptor.CommandID})
+	if err != nil || got.Record.State != InboxStateRejected || got.Record.Outcome.Kind != DispositionRefused {
+		t.Fatalf("durable readback: %+v %v", got, err)
+	}
+}
+
+// The two rejecting kinds are rejecting for different reasons and must not be
+// collapsed: a refusal is authored under the attempt's grant and a closure under
+// a strictly later one. Both terminal states are read from terminalState() so
+// the assertion fails if either mapping moves.
+func TestDispositionTerminalStatesSeparateApplicationFromRejection(t *testing.T) {
+	t.Parallel()
+
+	for kind, want := range map[DispositionOutcomeKind]InboxState{
+		DispositionApplied:    InboxStateApplied,
+		DispositionNoOp:       InboxStateApplied,
+		DispositionRefused:    InboxStateRejected,
+		DispositionNotApplied: InboxStateRejected,
+	} {
+		if got := kind.terminalState(); got != want {
+			t.Errorf("%q.terminalState() = %q, want %q", kind, got, want)
+		}
+		if !kind.valid() {
+			t.Errorf("%q is not in the closed vocabulary", kind)
+		}
+	}
+	if DispositionOutcomeKind("rejected").valid() || DispositionOutcomeKind("").valid() {
+		t.Error("the vocabulary admits a value outside the closed set")
 	}
 }
 
@@ -446,11 +529,37 @@ func TestSettleDispositionRejectsUnverifiedEvidence(t *testing.T) {
 			e.AuthorJournalEpoch = settlementJournal + 1
 			return e
 		}()},
-		{"applied with no event", func() DispositionEvidence { e := appliedEvidence(); e.EventID, e.EventSeq = "", 0; return e }()},
-		{"applied naming an event outside its envelope", func() DispositionEvidence { e := appliedEvidence(); e.EventSeq = 13; return e }()},
-		{"no-op with a fabricated event", func() DispositionEvidence {
+		{"applied with a fabricated event id", func() DispositionEvidence {
+			e := appliedEvidence()
+			e.EventID = "01J0000000000000000000EVNT"
+			return e
+		}()},
+		{"applied with a fabricated event seq", func() DispositionEvidence { e := appliedEvidence(); e.EventSeq = 12; return e }()},
+		{"no-op with a fabricated event id", func() DispositionEvidence {
 			e := noOpEvidence()
-			e.EventID, e.EventSeq = "01J0000000000000000000EVNT", 12
+			e.EventID = "01J0000000000000000000EVNT"
+			return e
+		}()},
+		{"no-op with a fabricated event seq", func() DispositionEvidence { e := noOpEvidence(); e.EventSeq = 12; return e }()},
+		{"refused by a later grant", func() DispositionEvidence {
+			e := refusedEvidence()
+			e.AuthorJournalEpoch = settlementJournal + 1
+			return e
+		}()},
+		{"refused carrying an author fence", func() DispositionEvidence { e := refusedEvidence(); e.AuthorFenceSeq = 11; return e }()},
+		{"refused with a fabricated event id", func() DispositionEvidence {
+			e := refusedEvidence()
+			e.EventID = "01J0000000000000000000EVNT"
+			return e
+		}()},
+		{"refused with a fabricated event seq", func() DispositionEvidence { e := refusedEvidence(); e.EventSeq = 12; return e }()},
+		{"refused about another attempt", func() DispositionEvidence { e := refusedEvidence(); e.AttemptID = "attempt/other"; return e }()},
+		{"unsequenced refusal", func() DispositionEvidence { e := refusedEvidence(); e.DispositionSeq = 0; return e }()},
+		{"applied carrying an author fence", func() DispositionEvidence { e := appliedEvidence(); e.AuthorFenceSeq = 11; return e }()},
+		{"no-op carrying an author fence", func() DispositionEvidence { e := noOpEvidence(); e.AuthorFenceSeq = 11; return e }()},
+		{"no-op by a later grant", func() DispositionEvidence {
+			e := noOpEvidence()
+			e.AuthorJournalEpoch = settlementJournal + 1
 			return e
 		}()},
 		{"not applied by the attempt's own grant", func() DispositionEvidence {
@@ -469,7 +578,7 @@ func TestSettleDispositionRejectsUnverifiedEvidence(t *testing.T) {
 			e.AuthorFenceSeq = e.DispositionSeq + 1
 			return e
 		}()},
-		{"unsequenced disposition", func() DispositionEvidence { e := appliedEvidence(); e.DispositionSeq, e.EventSeq = 0, 0; return e }()},
+		{"unsequenced disposition", func() DispositionEvidence { e := appliedEvidence(); e.DispositionSeq = 0; return e }()},
 		{"unknown kind", func() DispositionEvidence { e := appliedEvidence(); e.Kind = "settled"; return e }()},
 		{"empty evidence", DispositionEvidence{}},
 	} {
@@ -1003,14 +1112,22 @@ func TestDispositionRecordStatesRequireTheirMembers(t *testing.T) {
 	}
 	claim := &DispositionClaim{ResidencyEpoch: settlementResidenc, ExpiresAt: settlementExpiry}
 	attempt := &DispositionAttempt{AttemptID: settlementAttempt, JournalEpoch: settlementJournal, ResidencyEpoch: settlementResidenc, StartedAt: settlementNow}
-	outcome := &DispositionOutcome{Kind: DispositionApplied, AttemptID: settlementAttempt, AttemptJournalEpoch: settlementJournal, AuthorJournalEpoch: settlementJournal, DispositionSeq: 12, EventID: "01J0000000000000000000EVNT", EventSeq: 12, SettlingResidencyEpoch: settlementResidenc, SettledAt: settlementNow}
+	outcome := &DispositionOutcome{Kind: DispositionApplied, AttemptID: settlementAttempt, AttemptJournalEpoch: settlementJournal, AuthorJournalEpoch: settlementJournal, DispositionSeq: 12, SettlingResidencyEpoch: settlementResidenc, SettledAt: settlementNow}
 	// The same outcome shaped for a rejection. A row that pairs an APPLIED
 	// outcome with a rejected state is answered by outcome.kind before anything
 	// about the attempt is read, so probing "a rejection with no attempt may not
 	// carry an outcome" needs an outcome whose kind already agrees with the state.
+	// A refusal keeps the attempt's own author grant and names no fence, which
+	// is the shape an application has; only the kind and therefore the terminal
+	// state differ.
+	refusal := func() *DispositionOutcome {
+		settled := *outcome
+		settled.Kind = DispositionRefused
+		return &settled
+	}
 	rejection := func() *DispositionOutcome {
 		settled := *outcome
-		settled.Kind, settled.AuthorJournalEpoch, settled.AuthorFenceSeq, settled.EventID, settled.EventSeq = DispositionNotApplied, settlementJournal+1, 11, "", 0
+		settled.Kind, settled.AuthorJournalEpoch, settled.AuthorFenceSeq = DispositionNotApplied, settlementJournal+1, 11
 		return &settled
 	}
 	// field, where given, is the refusal's Field. It is not decoration: two rows
@@ -1051,6 +1168,44 @@ func TestDispositionRecordStatesRequireTheirMembers(t *testing.T) {
 		{name: "applied carrying a rejection outcome", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplied, claim, attempt, rejection()
 		}, field: "outcome.kind"},
+		// No stored outcome may name a public event, of any kind. The two
+		// members stay in the durable DTO and stay zero, so each is scored on
+		// its own: a validator holding only one of them would admit a record
+		// carrying the other.
+		{name: "applied naming an event id", build: func(r *DispositionInboxRecord) {
+			settled := *outcome
+			settled.EventID = "01J0000000000000000000EVNT"
+			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplied, claim, attempt, &settled
+		}, field: "outcome.event"},
+		{name: "applied naming an event sequence", build: func(r *DispositionInboxRecord) {
+			settled := *outcome
+			settled.EventSeq = settled.DispositionSeq
+			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplied, claim, attempt, &settled
+		}, field: "outcome.event"},
+		// A refusal is the second rejecting kind and is authored by the
+		// attempt's OWN grant, unlike the closure above, so its record shape is
+		// driven separately rather than assumed to follow from it.
+		{name: "refused", build: func(r *DispositionInboxRecord) {
+			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateRejected, claim, attempt, refusal()
+		}, ok: true},
+		{name: "applied carrying a refusal outcome", build: func(r *DispositionInboxRecord) {
+			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateApplied, claim, attempt, refusal()
+		}, field: "outcome.kind"},
+		{name: "refused by a later grant", build: func(r *DispositionInboxRecord) {
+			settled := *refusal()
+			settled.AuthorJournalEpoch = settlementJournal + 1
+			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateRejected, claim, attempt, &settled
+		}, field: "outcome.author_journal_epoch"},
+		{name: "refused naming an event id", build: func(r *DispositionInboxRecord) {
+			settled := *refusal()
+			settled.EventID = "01J0000000000000000000EVNT"
+			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateRejected, claim, attempt, &settled
+		}, field: "outcome.event"},
+		{name: "refused naming an event sequence", build: func(r *DispositionInboxRecord) {
+			settled := *refusal()
+			settled.EventSeq = settled.DispositionSeq
+			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateRejected, claim, attempt, &settled
+		}, field: "outcome.event"},
 		{name: "rejected", build: func(r *DispositionInboxRecord) {
 			r.State, r.Claim, r.Attempt, r.Outcome = InboxStateRejected, claim, attempt, rejection()
 		}, ok: true},
@@ -1174,8 +1329,9 @@ func TestDispositionSettlementWireGolden(t *testing.T) {
 	const attemptWire = `"attempt":{"attempt_id":"attempt/A:B","journal_epoch":9,"residency_epoch":4,"started_at":"2026-08-30T11:40:00Z"}`
 	claim := &DispositionClaim{ResidencyEpoch: settlementResidenc, ExpiresAt: settlementExpiry}
 	attempt := &DispositionAttempt{AttemptID: settlementAttempt, JournalEpoch: settlementJournal, ResidencyEpoch: settlementResidenc, StartedAt: settlementNow}
-	applied := &DispositionOutcome{Kind: DispositionApplied, AttemptID: settlementAttempt, AttemptJournalEpoch: settlementJournal, AuthorJournalEpoch: settlementJournal, DispositionSeq: 12, EventID: "01J0000000000000000000EVNT", EventSeq: 12, SettlingResidencyEpoch: settlementResidenc, SettledAt: settlementNow}
+	applied := &DispositionOutcome{Kind: DispositionApplied, AttemptID: settlementAttempt, AttemptJournalEpoch: settlementJournal, AuthorJournalEpoch: settlementJournal, DispositionSeq: 12, SettlingResidencyEpoch: settlementResidenc, SettledAt: settlementNow}
 	closure := &DispositionOutcome{Kind: DispositionNotApplied, AttemptID: settlementAttempt, AttemptJournalEpoch: settlementJournal, AuthorJournalEpoch: settlementJournal + 1, DispositionSeq: 31, AuthorFenceSeq: 30, SettlingResidencyEpoch: settlementResidenc + 3, SettledAt: settlementNow}
+	refusal := &DispositionOutcome{Kind: DispositionRefused, AttemptID: settlementAttempt, AttemptJournalEpoch: settlementJournal, AuthorJournalEpoch: settlementJournal, DispositionSeq: 12, SettlingResidencyEpoch: settlementResidenc, SettledAt: settlementNow}
 	for _, tc := range []struct {
 		name  string
 		state InboxState
@@ -1198,8 +1354,14 @@ func TestDispositionSettlementWireGolden(t *testing.T) {
 		{
 			"applied", InboxStateApplied,
 			func(r *DispositionInboxRecord) { r.Claim, r.Attempt, r.Outcome = claim, attempt, applied },
-			identity + `applied",` + claimWire + `,` + attemptWire + `,"outcome":{"kind":"applied","attempt_id":"attempt/A:B","attempt_journal_epoch":9,"author_journal_epoch":9,"disposition_seq":12,"author_fence_seq":0,"event_id":"01J0000000000000000000EVNT","event_seq":12,"settling_residency_epoch":4,"settled_at":"2026-08-30T11:40:00Z"}}`,
+			identity + `applied",` + claimWire + `,` + attemptWire + `,"outcome":{"kind":"applied","attempt_id":"attempt/A:B","attempt_journal_epoch":9,"author_journal_epoch":9,"disposition_seq":12,"author_fence_seq":0,"event_id":"","event_seq":0,"settling_residency_epoch":4,"settled_at":"2026-08-30T11:40:00Z"}}`,
 			[]string{`"kind"`, `"attempt_journal_epoch"`, `"author_journal_epoch"`, `"disposition_seq"`, `"author_fence_seq"`, `"event_id"`, `"event_seq"`, `"settling_residency_epoch"`, `"settled_at"`, `"outcome"`},
+		},
+		{
+			"refused", InboxStateRejected,
+			func(r *DispositionInboxRecord) { r.Claim, r.Attempt, r.Outcome = claim, attempt, refusal },
+			identity + `rejected",` + claimWire + `,` + attemptWire + `,"outcome":{"kind":"refused","attempt_id":"attempt/A:B","attempt_journal_epoch":9,"author_journal_epoch":9,"disposition_seq":12,"author_fence_seq":0,"event_id":"","event_seq":0,"settling_residency_epoch":4,"settled_at":"2026-08-30T11:40:00Z"}}`,
+			[]string{`"kind"`, `"event_id"`, `"event_seq"`, `"author_fence_seq"`},
 		},
 		{
 			"rejected", InboxStateRejected,

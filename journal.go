@@ -290,7 +290,14 @@ func (w *JournalWriter) stampWriterOwnedFields(env *Envelope) error {
 		// Ownership records are minted by OpenJournal alone. A caller-authored
 		// fence would advance the tip without any grant behind it.
 		return journalErr(JournalErrorInvalid, "kind", nil)
-	case EnvelopeKindApplicationPrefix:
+	case EnvelopeKindApplicationPrefix, EnvelopeKindCommandDisposition:
+		// Both command-carrying kinds name the grant they were written under,
+		// and in both the grant is the WRITER's rather than the caller's. The
+		// disposition joins the prefix here rather than being left alone
+		// because the settlement evidence reader treats a stored LeaseEpoch as
+		// a claim — harness appends raw frames and is never stamped — and a
+		// caller that does come through this writer must not be the one
+		// exception that can author one.
 		if env.LeaseEpoch != 0 {
 			return journalErr(JournalErrorInvalid, "lease_epoch", nil)
 		}

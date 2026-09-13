@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -152,7 +153,7 @@ func TestEnvelopeRejectsMalformedFrames(t *testing.T) {
 			b[11]--
 			return b
 		}},
-		{"unknown tag", EnvelopeErrorField, func(b []byte) []byte { b[12] = 9; return b }},
+		{"unknown tag", EnvelopeErrorField, func(b []byte) []byte { b[12] = tagDispositionKind + 1; return b }},
 		{"duplicate tag", EnvelopeErrorOrder, func(b []byte) []byte { b[24] = 1; return b }},
 		{"out of order tag", EnvelopeErrorOrder, func(b []byte) []byte { b[12], b[24] = b[24], b[12]; return b }},
 		{"trailing byte", EnvelopeErrorTrailing, func(b []byte) []byte { b = append(b, 0); return b }},
@@ -304,6 +305,10 @@ func TestDecodeRejectsEveryForbiddenKnownTagEvenWhenZero(t *testing.T) {
 		tagLeaseEpoch:       make([]byte, 8),
 		tagRuntimeCommandID: make([]byte, 16),
 		tagCommandKind:      {},
+
+		tagAttemptID:           {},
+		tagAttemptJournalEpoch: make([]byte, 8),
+		tagDispositionKind:     {},
 	}
 	baseFields := map[EnvelopeKind][]testWireField{
 		EnvelopeKindPublicEvent: {
@@ -322,6 +327,15 @@ func TestDecodeRejectsEveryForbiddenKnownTagEvenWhenZero(t *testing.T) {
 			{tagLeaseEpoch, []byte{0, 0, 0, 0, 0, 0, 0, 1}},
 			{tagRuntimeCommandID, bytes.Repeat([]byte{1}, 16)},
 			{tagCommandKind, []byte("input")},
+		},
+		EnvelopeKindCommandDisposition: {
+			{tagIdentity, []byte("command")},
+			{tagLeaseEpoch, []byte{0, 0, 0, 0, 0, 0, 0, 1}},
+			{tagRuntimeCommandID, bytes.Repeat([]byte{1}, 16)},
+			{tagCommandKind, []byte("input")},
+			{tagAttemptID, []byte("attempt")},
+			{tagAttemptJournalEpoch, []byte{0, 0, 0, 0, 0, 0, 0, 1}},
+			{tagDispositionKind, []byte("applied")},
 		},
 	}
 	for _, kind := range knownEnvelopeKinds() {
@@ -627,7 +641,7 @@ func knownEnvelopeKinds() []EnvelopeKind {
 func forbiddenEnvelopeTags(kind EnvelopeKind) []uint8 {
 	allowed := allowedEnvelopeFields(kind)
 	var tags []uint8
-	for tag := tagIdentity; tag <= tagCommandKind; tag++ {
+	for tag := tagIdentity; tag <= tagDispositionKind; tag++ {
 		if allowed&(1<<(tag-1)) == 0 {
 			tags = append(tags, tag)
 		}
@@ -639,13 +653,17 @@ func forbiddenEnvelopeTags(kind EnvelopeKind) []uint8 {
 // govern, together with the wire field it occupies.
 type envelopeMember struct {
 	field envelopeFieldSet
-	// owner is the one kind whose identity this member is, and is zero for
+	// owners are the kinds whose identity this member is, and it is empty for
 	// every member that does not share the identity field. Three members share
 	// tagIdentity, so the field set alone cannot say that a RecordID on a
 	// public event is forbidden — that record carries an identity, just not
 	// this one.
-	owner EnvelopeKind
-	set   func(*Envelope)
+	//
+	// It is a SET rather than one kind because CommandID is the identity of two
+	// kinds: an application prefix and a command disposition correlate on the
+	// same public command identity.
+	owners []EnvelopeKind
+	set    func(*Envelope)
 }
 
 func envelopeMembers() map[string]envelopeMember {
@@ -656,20 +674,23 @@ func envelopeMembers() map[string]envelopeMember {
 		}}
 	}
 	return map[string]envelopeMember{
-		"event_id":  {fieldIdentity, EnvelopeKindPublicEvent, func(e *Envelope) { e.EventID = "leaked-event" }},
-		"record_id": {fieldIdentity, EnvelopeKindRuntimeControl, func(e *Envelope) { e.RecordID = "leaked-runtime-record" }},
-		"command_id": {fieldIdentity, EnvelopeKindApplicationPrefix, func(e *Envelope) {
+		"event_id":  {fieldIdentity, []EnvelopeKind{EnvelopeKindPublicEvent}, func(e *Envelope) { e.EventID = "leaked-event" }},
+		"record_id": {fieldIdentity, []EnvelopeKind{EnvelopeKindRuntimeControl}, func(e *Envelope) { e.RecordID = "leaked-runtime-record" }},
+		"command_id": {fieldIdentity, []EnvelopeKind{EnvelopeKindApplicationPrefix, EnvelopeKindCommandDisposition}, func(e *Envelope) {
 			e.CommandID = "leaked-command"
 		}},
-		"public_inline":     {fieldPublicInline, 0, func(e *Envelope) { e.Public = BodySlot{Inline: []byte(`{"leaked":true}`)} }},
-		"public_reference":  {fieldPublicReference, 0, func(e *Envelope) { e.Public = *reference() }},
-		"runtime_inline":    {fieldRuntimeInline, 0, func(e *Envelope) { e.Runtime = BodySlot{Inline: []byte("leaked")} }},
-		"runtime_reference": {fieldRuntimeReference, 0, func(e *Envelope) { e.Runtime = *reference() }},
-		"lease_epoch":       {fieldLeaseEpoch, 0, func(e *Envelope) { e.LeaseEpoch = 7 }},
-		"runtime_command_id": {fieldRuntimeCommandID, 0, func(e *Envelope) {
+		"public_inline":     {fieldPublicInline, nil, func(e *Envelope) { e.Public = BodySlot{Inline: []byte(`{"leaked":true}`)} }},
+		"public_reference":  {fieldPublicReference, nil, func(e *Envelope) { e.Public = *reference() }},
+		"runtime_inline":    {fieldRuntimeInline, nil, func(e *Envelope) { e.Runtime = BodySlot{Inline: []byte("leaked")} }},
+		"runtime_reference": {fieldRuntimeReference, nil, func(e *Envelope) { e.Runtime = *reference() }},
+		"lease_epoch":       {fieldLeaseEpoch, nil, func(e *Envelope) { e.LeaseEpoch = 7 }},
+		"runtime_command_id": {fieldRuntimeCommandID, nil, func(e *Envelope) {
 			e.RuntimeCommandID = uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff")
 		}},
-		"command_kind": {fieldCommandKind, 0, func(e *Envelope) { e.CommandKind = "leaked" }},
+		"command_kind":          {fieldCommandKind, nil, func(e *Envelope) { e.CommandKind = "leaked" }},
+		"attempt_id":            {fieldAttemptID, nil, func(e *Envelope) { e.AttemptID = "leaked-attempt" }},
+		"attempt_journal_epoch": {fieldAttemptJournalEpoch, nil, func(e *Envelope) { e.AttemptJournalEpoch = 11 }},
+		"disposition_kind":      {fieldDispositionKind, nil, func(e *Envelope) { e.DispositionKind = string(DispositionApplied) }},
 	}
 }
 
@@ -687,6 +708,12 @@ func validEnvelopeOfKind(t *testing.T, kind EnvelopeKind) Envelope {
 	case EnvelopeKindApplicationPrefix:
 		return Envelope{Kind: kind, CommandID: "c", LeaseEpoch: 1, CommandKind: "input",
 			RuntimeCommandID: uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff")}
+	case EnvelopeKindCommandDisposition:
+		return Envelope{Kind: kind, CommandID: "c", LeaseEpoch: 1, CommandKind: "input",
+			RuntimeCommandID:    uuid.MustParse("00112233-4455-6677-8899-aabbccddeeff"),
+			AttemptID:           "a",
+			AttemptJournalEpoch: 1,
+			DispositionKind:     string(DispositionApplied)}
 	default:
 		t.Fatalf("no valid envelope is defined for kind %d", kind)
 		return Envelope{}
@@ -716,17 +743,17 @@ func TestEncodeRefusesEveryDisallowedMemberOfEveryKind(t *testing.T) {
 		covered |= member.field
 	}
 	var every envelopeFieldSet
-	for tag := tagIdentity; tag <= tagCommandKind; tag++ {
+	for tag := tagIdentity; tag <= tagDispositionKind; tag++ {
 		every |= 1 << (tag - 1)
 	}
 	if covered != every {
-		t.Fatalf("the member table covers fields %08b, want every schema field %08b", covered, every)
+		t.Fatalf("the member table covers fields %011b, want every schema field %011b", covered, every)
 	}
 
 	for _, kind := range knownEnvelopeKinds() {
 		allowed := allowedEnvelopeFields(kind)
 		for name, member := range members {
-			if allowed&member.field != 0 && (member.owner == 0 || member.owner == kind) {
+			if allowed&member.field != 0 && (len(member.owners) == 0 || slices.Contains(member.owners, kind)) {
 				continue
 			}
 			t.Run(fmt.Sprintf("kind_%d_%s", kind, name), func(t *testing.T) {

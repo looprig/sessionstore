@@ -53,6 +53,7 @@ type config struct {
 	legacyTenant    sessionwire.TenantID
 	shards          uint32
 	evidence        DispositionEvidenceReader
+	journalEvidence bool
 }
 
 func defaultConfig() config {

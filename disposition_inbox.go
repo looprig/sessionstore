@@ -755,15 +755,12 @@ func validateDispositionOutcome(o DispositionOutcome, attempt *DispositionAttemp
 	} else if o.AuthorJournalEpoch != o.AttemptJournalEpoch || o.AuthorFenceSeq != 0 {
 		return inboxInvalid("outcome.author_journal_epoch", nil)
 	}
-	if o.Kind == DispositionApplied {
-		if err := o.EventID.Validate(); err != nil {
-			return inboxInvalid("outcome.event_id", err)
-		}
-		if o.EventSeq != o.DispositionSeq {
-			return inboxInvalid("outcome.event_seq", nil)
-		}
-		return nil
-	}
+	// No kind names an event. The applied-only exception that stood here was
+	// the record-side mirror of verifiedDispositionOutcome's deleted block, and
+	// it rested on the same falsified premise: that a runtime could commit its
+	// effect in the disposition's own envelope. A journal append frames ONE
+	// envelope, so it cannot. Both members stay in the durable DTO and both
+	// stay zero.
 	if o.EventID != "" || o.EventSeq != 0 {
 		return inboxInvalid("outcome.event", nil)
 	}

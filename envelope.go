@@ -32,6 +32,9 @@ const (
 	EnvelopeKindRuntimeControl    EnvelopeKind = 2
 	EnvelopeKindOpeningFence      EnvelopeKind = 3
 	EnvelopeKindApplicationPrefix EnvelopeKind = 4
+	// EnvelopeKindCommandDisposition is the runtime's own durable, bodiless
+	// statement of what became of ONE authorized dispatch attempt.
+	EnvelopeKindCommandDisposition EnvelopeKind = 5
 )
 
 const (
@@ -43,9 +46,13 @@ const (
 	tagLeaseEpoch       uint8 = 6
 	tagRuntimeCommandID uint8 = 7
 	tagCommandKind      uint8 = 8
+
+	tagAttemptID           uint8 = 9
+	tagAttemptJournalEpoch uint8 = 10
+	tagDispositionKind     uint8 = 11
 )
 
-type envelopeFieldSet uint8
+type envelopeFieldSet uint16
 
 const (
 	fieldIdentity         envelopeFieldSet = 1 << (tagIdentity - 1)
@@ -56,6 +63,10 @@ const (
 	fieldLeaseEpoch       envelopeFieldSet = 1 << (tagLeaseEpoch - 1)
 	fieldRuntimeCommandID envelopeFieldSet = 1 << (tagRuntimeCommandID - 1)
 	fieldCommandKind      envelopeFieldSet = 1 << (tagCommandKind - 1)
+
+	fieldAttemptID           envelopeFieldSet = 1 << (tagAttemptID - 1)
+	fieldAttemptJournalEpoch envelopeFieldSet = 1 << (tagAttemptJournalEpoch - 1)
+	fieldDispositionKind     envelopeFieldSet = 1 << (tagDispositionKind - 1)
 )
 
 const bodyReferenceAlgorithmSHA256 uint8 = 1
@@ -126,6 +137,10 @@ type Envelope struct {
 	CommandID        sessionwire.CommandID
 	RuntimeCommandID uuid.UUID
 	CommandKind      string
+
+	AttemptID           string
+	AttemptJournalEpoch uint64
+	DispositionKind     string
 }
 
 // EncodeEnvelope validates and deterministically encodes an envelope. The
@@ -135,7 +150,7 @@ func EncodeEnvelope(env Envelope) ([]byte, error) {
 		return nil, err
 	}
 
-	fields := make([]encodedField, 0, 4)
+	fields := make([]encodedField, 0, 7)
 	switch env.Kind {
 	case EnvelopeKindPublicEvent:
 		fields = append(fields, encodedField{tagIdentity, []byte(env.EventID)})
@@ -152,6 +167,16 @@ func EncodeEnvelope(env Envelope) ([]byte, error) {
 			encodedField{tagLeaseEpoch, encodeUint64(env.LeaseEpoch)},
 			encodedField{tagRuntimeCommandID, env.RuntimeCommandID[:]},
 			encodedField{tagCommandKind, []byte(env.CommandKind)},
+		)
+	case EnvelopeKindCommandDisposition:
+		fields = append(fields,
+			encodedField{tagIdentity, []byte(env.CommandID)},
+			encodedField{tagLeaseEpoch, encodeUint64(env.LeaseEpoch)},
+			encodedField{tagRuntimeCommandID, env.RuntimeCommandID[:]},
+			encodedField{tagCommandKind, []byte(env.CommandKind)},
+			encodedField{tagAttemptID, []byte(env.AttemptID)},
+			encodedField{tagAttemptJournalEpoch, encodeUint64(env.AttemptJournalEpoch)},
+			encodedField{tagDispositionKind, []byte(env.DispositionKind)},
 		)
 	}
 
@@ -170,8 +195,8 @@ func EncodeEnvelope(env Envelope) ([]byte, error) {
 	copy(frame[:4], envelopeMagic[:])
 	frame[4] = EnvelopeVersion
 	frame[5] = byte(env.Kind)
-	// The closed V1 schema emits at most four fields.
-	binary.BigEndian.PutUint16(frame[6:8], uint16(len(fields))) // #nosec G115 -- len(fields) <= 4 above
+	// The closed V1 schema emits at most seven fields.
+	binary.BigEndian.PutUint16(frame[6:8], uint16(len(fields))) // #nosec G115 -- len(fields) <= 7 above
 	// The frame-size guard above proves fieldsBytes is below one MiB.
 	binary.BigEndian.PutUint32(frame[8:12], uint32(fieldsBytes)) // #nosec G115 -- fieldsBytes < MaxEnvelopeBytes
 	for _, field := range fields {
@@ -242,7 +267,7 @@ func DecodeEnvelope(frame []byte) (Envelope, error) {
 			return Envelope{}, envelopeError(EnvelopeErrorLength, "field", nil)
 		}
 		tag := frame[offset]
-		if tag < tagIdentity || tag > tagCommandKind {
+		if tag < tagIdentity || tag > tagDispositionKind {
 			return Envelope{}, envelopeError(EnvelopeErrorField, "tag", nil)
 		}
 		if tag <= previousTag {
@@ -294,6 +319,9 @@ func allowedEnvelopeFields(kind EnvelopeKind) envelopeFieldSet {
 		return fieldLeaseEpoch
 	case EnvelopeKindApplicationPrefix:
 		return fieldIdentity | fieldLeaseEpoch | fieldRuntimeCommandID | fieldCommandKind
+	case EnvelopeKindCommandDisposition:
+		return fieldIdentity | fieldLeaseEpoch | fieldRuntimeCommandID | fieldCommandKind |
+			fieldAttemptID | fieldAttemptJournalEpoch | fieldDispositionKind
 	default:
 		return 0
 	}
@@ -350,6 +378,23 @@ func validateDecodedFields(kind EnvelopeKind, fields envelopeFieldSet) error {
 				return err
 			}
 		}
+	case EnvelopeKindCommandDisposition:
+		for _, required := range []struct {
+			field envelopeFieldSet
+			tag   uint8
+		}{
+			{fieldIdentity, tagIdentity},
+			{fieldLeaseEpoch, tagLeaseEpoch},
+			{fieldRuntimeCommandID, tagRuntimeCommandID},
+			{fieldCommandKind, tagCommandKind},
+			{fieldAttemptID, tagAttemptID},
+			{fieldAttemptJournalEpoch, tagAttemptJournalEpoch},
+			{fieldDispositionKind, tagDispositionKind},
+		} {
+			if err := require(required.field, required.tag); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
@@ -365,7 +410,7 @@ func decodeField(env *Envelope, tag uint8, value []byte) error {
 			env.EventID = sessionwire.EventID(string(value))
 		case EnvelopeKindRuntimeControl:
 			env.RecordID = string(value)
-		case EnvelopeKindApplicationPrefix:
+		case EnvelopeKindApplicationPrefix, EnvelopeKindCommandDisposition:
 			env.CommandID = sessionwire.CommandID(string(value))
 		default:
 			env.RecordID = string(value)
@@ -407,6 +452,24 @@ func decodeField(env *Envelope, tag uint8, value []byte) error {
 			return envelopeError(EnvelopeErrorInvalid, "command_kind", nil)
 		}
 		env.CommandKind = string(value)
+	case tagAttemptID:
+		if len(value) > sessionwire.MaxIDBytes {
+			return envelopeError(EnvelopeErrorInvalid, "attempt_id", nil)
+		}
+		env.AttemptID = string(value)
+	case tagAttemptJournalEpoch:
+		if len(value) != 8 {
+			return envelopeError(EnvelopeErrorLength, "attempt_journal_epoch", nil)
+		}
+		env.AttemptJournalEpoch = binary.BigEndian.Uint64(value)
+	case tagDispositionKind:
+		// Bounded like command_kind before the value is retained; the closed
+		// SET is then enforced by validateEnvelope, which is the one place the
+		// vocabulary is stated.
+		if len(value) > 64 {
+			return envelopeError(EnvelopeErrorInvalid, "disposition_kind", nil)
+		}
+		env.DispositionKind = string(value)
 	}
 	return nil
 }
@@ -436,7 +499,7 @@ func validateEnvelope(env Envelope) error {
 		if err := validatePublicBody(env.EventID, env.Public.Inline); err != nil {
 			return err
 		}
-		if env.RecordID != "" || env.CommandID != "" || !env.RuntimeCommandID.IsZero() || env.LeaseEpoch != 0 || env.CommandKind != "" {
+		if env.RecordID != "" || env.CommandID != "" || !env.RuntimeCommandID.IsZero() || env.LeaseEpoch != 0 || env.CommandKind != "" || env.AttemptID != "" || env.AttemptJournalEpoch != 0 || env.DispositionKind != "" {
 			return envelopeError(EnvelopeErrorField, "record_shape", nil)
 		}
 	case EnvelopeKindRuntimeControl:
@@ -449,38 +512,78 @@ func validateEnvelope(env Envelope) error {
 		if !env.Runtime.present() {
 			return envelopeError(EnvelopeErrorMissing, "runtime_body", nil)
 		}
-		if env.Public.present() || env.EventID != "" || env.CommandID != "" || !env.RuntimeCommandID.IsZero() || env.LeaseEpoch != 0 || env.CommandKind != "" {
+		if env.Public.present() || env.EventID != "" || env.CommandID != "" || !env.RuntimeCommandID.IsZero() || env.LeaseEpoch != 0 || env.CommandKind != "" || env.AttemptID != "" || env.AttemptJournalEpoch != 0 || env.DispositionKind != "" {
 			return envelopeError(EnvelopeErrorField, "record_shape", nil)
 		}
 	case EnvelopeKindOpeningFence:
 		if env.LeaseEpoch == 0 {
 			return envelopeError(EnvelopeErrorInvalid, "lease_epoch", nil)
 		}
-		if env.EventID != "" || env.RecordID != "" || env.Public.present() || env.Runtime.present() || env.CommandID != "" || !env.RuntimeCommandID.IsZero() || env.CommandKind != "" {
+		if env.EventID != "" || env.RecordID != "" || env.Public.present() || env.Runtime.present() || env.CommandID != "" || !env.RuntimeCommandID.IsZero() || env.CommandKind != "" || env.AttemptID != "" || env.AttemptJournalEpoch != 0 || env.DispositionKind != "" {
 			return envelopeError(EnvelopeErrorField, "record_shape", nil)
 		}
 	case EnvelopeKindApplicationPrefix:
-		if env.CommandID == "" {
-			return envelopeError(EnvelopeErrorMissing, "identity", nil)
+		if err := validateCommandCorrelation(env); err != nil {
+			return err
 		}
-		if err := env.CommandID.Validate(); err != nil {
-			return envelopeError(EnvelopeErrorInvalid, "identity", err)
+		if env.EventID != "" || env.RecordID != "" || env.Public.present() || env.Runtime.present() || env.AttemptID != "" || env.AttemptJournalEpoch != 0 || env.DispositionKind != "" {
+			return envelopeError(EnvelopeErrorField, "record_shape", nil)
 		}
-		if env.RuntimeCommandID.IsZero() {
-			return envelopeError(EnvelopeErrorInvalid, "runtime_command_id", nil)
+	case EnvelopeKindCommandDisposition:
+		if err := validateCommandCorrelation(env); err != nil {
+			return err
 		}
-		if env.LeaseEpoch == 0 {
-			return envelopeError(EnvelopeErrorInvalid, "lease_epoch", nil)
+		if env.AttemptID == "" {
+			return envelopeError(EnvelopeErrorMissing, "attempt_id", nil)
 		}
-		if env.CommandKind == "" {
-			return envelopeError(EnvelopeErrorMissing, "command_kind", nil)
+		if len(env.AttemptID) > sessionwire.MaxIDBytes || !utf8.ValidString(env.AttemptID) {
+			return envelopeError(EnvelopeErrorInvalid, "attempt_id", nil)
 		}
-		if len(env.CommandKind) > 64 || !utf8.ValidString(env.CommandKind) {
-			return envelopeError(EnvelopeErrorInvalid, "command_kind", nil)
+		if env.AttemptJournalEpoch == 0 {
+			return envelopeError(EnvelopeErrorInvalid, "attempt_journal_epoch", nil)
+		}
+		if env.DispositionKind == "" {
+			return envelopeError(EnvelopeErrorMissing, "disposition_kind", nil)
+		}
+		// The vocabulary is DispositionOutcomeKind's own closed set and is not
+		// restated here. A kind the settlement verifier does not know is a kind
+		// no record may carry, so the two cannot drift apart.
+		if !DispositionOutcomeKind(env.DispositionKind).valid() {
+			return envelopeError(EnvelopeErrorInvalid, "disposition_kind", nil)
 		}
 		if env.EventID != "" || env.RecordID != "" || env.Public.present() || env.Runtime.present() {
 			return envelopeError(EnvelopeErrorField, "record_shape", nil)
 		}
+	}
+	return nil
+}
+
+// validateCommandCorrelation is the correlation quartet both command-carrying
+// kinds require: the public command identity, the durable runtime mapping, the
+// authoring grant, and the command kind.
+//
+// It is one function rather than two copies because an application prefix and a
+// command disposition must correlate on EXACTLY the same identities — a reader
+// pairs a disposition with the record a prefix was admitted against — and a
+// second copy would be free to weaken one side of that pairing silently.
+func validateCommandCorrelation(env Envelope) error {
+	if env.CommandID == "" {
+		return envelopeError(EnvelopeErrorMissing, "identity", nil)
+	}
+	if err := env.CommandID.Validate(); err != nil {
+		return envelopeError(EnvelopeErrorInvalid, "identity", err)
+	}
+	if env.RuntimeCommandID.IsZero() {
+		return envelopeError(EnvelopeErrorInvalid, "runtime_command_id", nil)
+	}
+	if env.LeaseEpoch == 0 {
+		return envelopeError(EnvelopeErrorInvalid, "lease_epoch", nil)
+	}
+	if env.CommandKind == "" {
+		return envelopeError(EnvelopeErrorMissing, "command_kind", nil)
+	}
+	if len(env.CommandKind) > 64 || !utf8.ValidString(env.CommandKind) {
+		return envelopeError(EnvelopeErrorInvalid, "command_kind", nil)
 	}
 	return nil
 }
@@ -525,7 +628,8 @@ func (s BodySlot) present() bool { return s.Inline != nil || s.Reference != nil 
 
 func knownEnvelopeKind(kind EnvelopeKind) bool {
 	switch kind {
-	case EnvelopeKindPublicEvent, EnvelopeKindRuntimeControl, EnvelopeKindOpeningFence, EnvelopeKindApplicationPrefix:
+	case EnvelopeKindPublicEvent, EnvelopeKindRuntimeControl, EnvelopeKindOpeningFence, EnvelopeKindApplicationPrefix,
+		EnvelopeKindCommandDisposition:
 		return true
 	default:
 		return false
@@ -598,6 +702,12 @@ func fieldName(tag uint8) string {
 		return "runtime_command_id"
 	case tagCommandKind:
 		return "command_kind"
+	case tagAttemptID:
+		return "attempt_id"
+	case tagAttemptJournalEpoch:
+		return "attempt_journal_epoch"
+	case tagDispositionKind:
+		return "disposition_kind"
 	default:
 		return "field"
 	}

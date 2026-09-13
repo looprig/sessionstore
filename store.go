@@ -94,7 +94,7 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 	}
 
 	ownedCtx, cancel := context.WithCancel(ctx)
-	return &Store{
+	store := &Store{
 		backend:           backend,
 		limits:            cfg.limits,
 		clock:             cfg.clock,
@@ -110,7 +110,14 @@ func Open(ctx context.Context, backend *storage.Composite, opts ...Option) (*Sto
 		overflowThreshold: DefaultJournalOverflowThresholdBytes,
 		maxPageBytes:      DefaultJournalPageBytes,
 		closeDone:         make(chan struct{}),
-	}, nil
+	}
+	// The store can be its own evidence reader, which no Option could express:
+	// the reader is the value being constructed, so the binding has to happen
+	// after construction rather than in the option that asks for it.
+	if cfg.journalEvidence {
+		store.evidence = store
+	}
+	return store, nil
 }
 
 // pageLimit normalizes one caller-supplied page limit and reports whether it

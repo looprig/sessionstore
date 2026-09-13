@@ -526,6 +526,15 @@ func TestAppendRejectsWriterOwnedFields(t *testing.T) {
 			},
 			field: "lease_epoch",
 		},
+		{
+			name: "command disposition epoch is writer owned",
+			env: Envelope{
+				Kind: EnvelopeKindCommandDisposition, CommandID: "command-1", LeaseEpoch: 9,
+				RuntimeCommandID: uuid.UUID{1}, CommandKind: "user_input",
+				AttemptID: "attempt-1", AttemptJournalEpoch: 3, DispositionKind: "applied",
+			},
+			field: "lease_epoch",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -554,6 +563,24 @@ func TestAppendRejectsWriterOwnedFields(t *testing.T) {
 	records := readLedger(t, backend, journalName(t, store))
 	if len(records) != 2 || records[1].LeaseEpoch != writer.Epoch() {
 		t.Fatalf("prefix epoch = %+v, want the writer's own epoch %d", records, writer.Epoch())
+	}
+
+	// A disposition written through THIS writer is stamped with the writer's
+	// own grant too. Harness does not use this path — it appends raw frames —
+	// but a caller that does must not be able to author an epoch, because the
+	// evidence reader treats a stored LeaseEpoch as a writer's claim precisely
+	// because nothing on the raw path stamps it.
+	seq, err = writer.Append(context.Background(), Envelope{
+		Kind: EnvelopeKindCommandDisposition, CommandID: "command-1",
+		RuntimeCommandID: uuid.UUID{1}, CommandKind: "user_input",
+		AttemptID: "attempt-1", AttemptJournalEpoch: 3, DispositionKind: "applied",
+	})
+	if err != nil || seq != 3 {
+		t.Fatalf("Append = %d %v, want 3", seq, err)
+	}
+	records = readLedger(t, backend, journalName(t, store))
+	if len(records) != 3 || records[2].LeaseEpoch != writer.Epoch() {
+		t.Fatalf("disposition epoch = %+v, want the writer's own epoch %d", records, writer.Epoch())
 	}
 }
 
