@@ -16,8 +16,10 @@ import (
 // consumer. It is a narrow, trusted reader and nothing more: it resolves the
 // session named in the store-derived request, walks that session's journal to
 // its captured tip, and reports the ONE durable disposition record that names
-// the attempt. It applies no policy, and every conclusion drawn from what it
-// returns is drawn by verifiedDispositionOutcome.
+// the attempt. It applies no SETTLEMENT policy — it decides nothing about the
+// command — though it does refuse four things outright, listed on
+// ReadDispositionEvidence below; every conclusion drawn from what it returns is
+// drawn by verifiedDispositionOutcome.
 
 // WithJournalDispositionEvidence makes the Store its own settlement evidence
 // reader, over each session's bound journal.

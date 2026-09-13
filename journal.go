@@ -298,6 +298,17 @@ func (w *JournalWriter) stampWriterOwnedFields(env *Envelope) error {
 		// a claim — harness appends raw frames and is never stamped — and a
 		// caller that does come through this writer must not be the one
 		// exception that can author one.
+		//
+		// Stamping here does NOT make a stored LeaseEpoch trustworthy. It is
+		// store-authored only for the records that come through this writer,
+		// and harness's do not: it calls EncodeEnvelope and appends the bytes
+		// itself, so this function never runs for them.
+		// (*Store).ReadDispositionEvidence's cross-check of a record's
+		// LeaseEpoch against the nearest preceding opening fence therefore
+		// REMAINS MANDATORY and must not be deleted as redundant with this
+		// stamp. It is a single deletable `if`, and deleting it would let a
+		// record written under one grant settle as a recovery closure authored
+		// by a later one.
 		if env.LeaseEpoch != 0 {
 			return journalErr(JournalErrorInvalid, "lease_epoch", nil)
 		}

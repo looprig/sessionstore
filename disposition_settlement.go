@@ -152,8 +152,13 @@ const (
 	// SessionJournal.Append takes exactly one record, encodes one body, frames
 	// one envelope and does one AppendDefinite; there is no batch, so a runtime
 	// cannot put any effect in the same frame as its disposition. The
-	// disposition is a separate, private, bodiless frame written AFTER the
-	// synchronously-observable effect.
+	// disposition is a separate, private, bodiless frame, and a CONFORMING
+	// runtime writes it after the synchronously-observable effect.
+	//
+	// That ordering is an obligation on the writer, not a property this package
+	// establishes: the bodiless shape is enforced by validateEnvelope, but
+	// nothing here observes when the effect was written, so a caller must not
+	// read this as a checked guarantee.
 	//
 	// Four things it therefore does not prove: that a turn started, that a turn
 	// folded, that no later TurnRejected can follow, and that a queued input

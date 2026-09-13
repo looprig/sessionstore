@@ -149,7 +149,14 @@ func TestJournalDispositionEvidenceReadsARefusal(t *testing.T) {
 
 // A recovery closure is authored by a strictly later grant, and the fence the
 // evidence names is that author's own opening fence — the nearest one PRECEDING
-// the closure, not the first or the last in the journal.
+// the closure rather than the FIRST in the journal.
+//
+// This case probes only that half. The other half — nearest preceding rather
+// than LAST — cannot be seen here, because nothing is written after the
+// disposition, and a walk that resolved the grant from the final fence state
+// would agree with this fixture at every point.
+// TestJournalDispositionEvidenceIgnoresFencesAfterTheDisposition is what
+// separates them.
 func TestJournalDispositionEvidenceClosureNamesItsOwnFence(t *testing.T) {
 	s, applying := journalEvidenceFixture(t)
 	appendRawFrame(t, s, openingFence(uint64(settlementJournal)))
@@ -241,6 +248,43 @@ func TestJournalDispositionEvidenceRefusesMoreThanOneRecord(t *testing.T) {
 			}
 		})
 	}
+
+	// Both rows above put the two records on ONE page, so neither can see a
+	// walk that stops as soon as it has a match. The refusal is advertised in
+	// the reader's own doc comment, and an early exit is exactly the shape a
+	// later "obvious" optimisation takes — it would quietly convert "more than
+	// one is refused" into "the first one wins" with the whole suite green.
+	t.Run("separated by a page boundary", func(t *testing.T) {
+		s, applying := journalEvidenceFixture(t, WithLimits(Limits{MaxPageSize: 2}))
+		appendRawFrame(t, s, openingFence(uint64(settlementJournal)))
+		first := appendRawFrame(t, s, dispositionFrameFor(applying, DispositionApplied, uint64(settlementJournal)))
+		appendRawFrame(t, s, publicEvent("event-a", `{"n":1}`))
+		appendRawFrame(t, s, publicEvent("event-b", `{"n":2}`))
+		second := appendRawFrame(t, s, dispositionFrameFor(applying, DispositionApplied, uint64(settlementJournal)))
+
+		// Non-vacuity, asserted against the reader's OWN pagination rather than
+		// arithmetic on the page size: the second record must not be reachable
+		// on the first page, or this row is the single-page case again.
+		d := applying.Record.Descriptor
+		page, err := s.ReadRuntimeJournal(context.Background(), ReadRuntimeJournalRequest{TenantID: d.TenantID, SessionID: d.SessionID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if page.NextCursor == "" {
+			t.Fatal("vacuous: the whole journal fits in one page")
+		}
+		for _, record := range page.Records {
+			if record.Seq == second {
+				t.Fatalf("vacuous: both dispositions (%d, %d) are on the first page", first, second)
+			}
+		}
+
+		_, err = readEvidence(t, s, applying)
+		inboxError := assertInboxCode(t, err, InboxErrorEvidence)
+		if inboxError.Field != "disposition" {
+			t.Fatalf("Field = %q, want disposition", inboxError.Field)
+		}
+	})
 }
 
 // A record that names this attempt but disagrees about which COMMAND it is
@@ -411,5 +455,125 @@ func TestJournalDispositionEvidenceIsScopedToTheRequestSession(t *testing.T) {
 	appendRawFrame(t, s, dispositionFrameFor(applying, DispositionApplied, uint64(settlementJournal)))
 	if _, err := readEvidence(t, s, applying); err != nil {
 		t.Fatalf("vacuous: the same frames in this session are not evidence either: %v", err)
+	}
+}
+
+// A fence written AFTER the disposition is not the disposition's fence.
+//
+// This is the other half of "nearest preceding", and it is the direction that
+// was unprobed: every other fixture in this file writes the disposition LAST,
+// so a reader that resolved the author grant from the journal's FINAL fence
+// state would have agreed with all of them. It does not agree here.
+//
+// The uncovered direction is also the NORMAL one rather than an edge case. A
+// successor settling a closure has already acquired residency and opened its
+// own journal, which mints a fence; any ordinary traffic after a disposition
+// puts records — lease-turnover fences included — behind it. Resolving from the
+// last fence would refuse an ordinary settlement with lease_epoch, which is the
+// same error a forged epoch earns, so the failure would read as an attack.
+func TestJournalDispositionEvidenceIgnoresFencesAfterTheDisposition(t *testing.T) {
+	t.Run("an application, then a lease turnover", func(t *testing.T) {
+		s, applying := journalEvidenceFixture(t)
+		appendRawFrame(t, s, openingFence(uint64(settlementJournal)))
+		seq := appendRawFrame(t, s, dispositionFrameFor(applying, DispositionApplied, uint64(settlementJournal)))
+		later := appendRawFrame(t, s, openingFence(uint64(settlementJournal)+1))
+		if later <= seq {
+			t.Fatalf("vacuous: the later fence landed at %d, not after the disposition at %d", later, seq)
+		}
+
+		evidence, err := readEvidence(t, s, applying)
+		if err != nil {
+			t.Fatalf("a fence after the disposition refused it: %v", err)
+		}
+		want := DispositionEvidence{
+			AttemptID:           settlementAttempt,
+			Kind:                DispositionApplied,
+			AttemptJournalEpoch: settlementJournal,
+			AuthorJournalEpoch:  settlementJournal,
+			DispositionSeq:      seq,
+		}
+		if evidence != want {
+			t.Fatalf("evidence = %+v, want %+v", evidence, want)
+		}
+		settled, ok, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, settlementResidenc))
+		if err != nil || !ok || settled.Record.State != InboxStateApplied {
+			t.Fatalf("settlement: %+v %v %v", settled, ok, err)
+		}
+	})
+
+	// The closure arm additionally pins the SEQUENCE the evidence names, which
+	// the application arm cannot: an application names no author fence at all,
+	// so a reader reading the wrong fence's sequence would be invisible there.
+	t.Run("a closure, then a further lease turnover", func(t *testing.T) {
+		s, applying := journalEvidenceFixture(t)
+		appendRawFrame(t, s, openingFence(uint64(settlementJournal)))
+		authorFence := appendRawFrame(t, s, openingFence(uint64(settlementJournal)+1))
+		seq := appendRawFrame(t, s, dispositionFrameFor(applying, DispositionNotApplied, uint64(settlementJournal)+1))
+		later := appendRawFrame(t, s, openingFence(uint64(settlementJournal)+2))
+		if later <= seq {
+			t.Fatalf("vacuous: the later fence landed at %d, not after the disposition at %d", later, seq)
+		}
+
+		evidence, err := readEvidence(t, s, applying)
+		if err != nil {
+			t.Fatalf("a fence after the closure refused it: %v", err)
+		}
+		if evidence.AuthorJournalEpoch != settlementJournal+1 {
+			t.Fatalf("author grant = %d, want the closure's own %d", evidence.AuthorJournalEpoch, settlementJournal+1)
+		}
+		if evidence.AuthorFenceSeq != authorFence {
+			t.Fatalf("author fence = %d, want the fence that authored it at %d", evidence.AuthorFenceSeq, authorFence)
+		}
+		settled, ok, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, settlementResidenc+1))
+		if err != nil || !ok || settled.Record.State != InboxStateRejected {
+			t.Fatalf("settlement: %+v %v %v", settled, ok, err)
+		}
+	})
+}
+
+// The attempt grant the evidence carries is the RECORD's claim, never the
+// store's own attempt.
+//
+// The two are equal in every ordinary case, which is exactly why this needs its
+// own fixture: a reader that substituted the store's grant would agree with
+// every other test in this file and would silently disable the verifier's
+// foreign-grant check, since e.AttemptJournalEpoch != attempt.JournalEpoch would
+// have become a comparison of a value with itself. The rule the reader's own doc
+// sells — "a disposition naming the same attempt under a DIFFERENT journal grant
+// is evidence about something else" — would then hold of nothing.
+//
+// The reader does not judge the claim; it reports it and the verifier refuses
+// it. Both halves are asserted, because the reader passing a foreign grant
+// through is only safe if something downstream still refuses it.
+func TestJournalDispositionEvidenceCarriesTheRecordsOwnAttemptGrant(t *testing.T) {
+	foreign := settlementJournal + 5
+
+	s, applying := journalEvidenceFixture(t)
+	appendRawFrame(t, s, openingFence(uint64(settlementJournal)))
+	frame := dispositionFrameFor(applying, DispositionApplied, uint64(settlementJournal))
+	frame.AttemptJournalEpoch = uint64(foreign)
+	seq := appendRawFrame(t, s, frame)
+	if applying.Record.Attempt.JournalEpoch == foreign {
+		t.Fatal("vacuous: the foreign grant is the store's own attempt grant")
+	}
+
+	evidence, err := readEvidence(t, s, applying)
+	if err != nil {
+		t.Fatalf("ReadDispositionEvidence: %v", err)
+	}
+	if evidence.AttemptJournalEpoch != foreign {
+		t.Fatalf("attempt grant = %d, want the record's own claim %d: the reader substituted a grant", evidence.AttemptJournalEpoch, foreign)
+	}
+	if evidence.DispositionSeq != seq || evidence.AuthorJournalEpoch != settlementJournal {
+		t.Fatalf("evidence = %+v", evidence)
+	}
+
+	_, ok, err := s.SettleDispositionCommand(context.Background(), settleRequest(applying, settlementResidenc))
+	if ok {
+		t.Fatal("a disposition authored under a foreign attempt grant settled the command")
+	}
+	inboxError := assertInboxCode(t, err, InboxErrorEvidence)
+	if inboxError.Field != "attempt_journal_epoch" {
+		t.Fatalf("Field = %q, want attempt_journal_epoch", inboxError.Field)
 	}
 }
