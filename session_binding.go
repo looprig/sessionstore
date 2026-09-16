@@ -29,6 +29,19 @@ type SessionBinding struct {
 	ProtocolMode     ProtocolMode `json:"protocol_mode"`
 }
 
+// protocolModeOrLegacy is the ONE reading of a stored binding as a protocol.
+// The all-zero binding is a version-1 legacy record, which has no mode member
+// and means ProtocolModeLegacy; a bound record names its mode. Every writer
+// that must act under a session's EXISTING protocol — rather than propose one at
+// creation — takes the mode from here, so none of them can read the zero value
+// as "no protocol" and mint one of its own.
+func (b SessionBinding) protocolModeOrLegacy() ProtocolMode {
+	if b == (SessionBinding{}) {
+		return ProtocolModeLegacy
+	}
+	return b.ProtocolMode
+}
+
 func (b SessionBinding) validate() error {
 	for _, field := range []struct{ name, value string }{
 		{"binding.storage_binding_id", b.StorageBindingID},

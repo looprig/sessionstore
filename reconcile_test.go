@@ -1341,6 +1341,12 @@ func TestAClaimAndARegistrationCoexistForOneSession(t *testing.T) {
 
 	store, _ := reconcileFixture(t, memstore.New())
 	mustAcquireClaim(t, store, testAcquireRequest(reconcileHolder))
+	// The registration is a route to a session that exists, so the session is
+	// created; the claim needs no such thing, which is itself a difference
+	// between the two records.
+	if _, _, err := store.CreateCatalogEntry(context.Background(), testCreateRequest()); err != nil {
+		t.Fatalf("CreateCatalogEntry: %v", err)
+	}
 	registration := testPutRegistrationRequest(registryEpoch)
 	registration.ObservedAt = reconcileClaimedAt
 	registration.ExpiresAt = reconcileClaimedAt.Add(5 * time.Minute)

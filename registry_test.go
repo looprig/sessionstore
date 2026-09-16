@@ -100,10 +100,19 @@ func TestHostRegistrationRoundTripsThroughStoredBytes(t *testing.T) {
 
 // registryFixture opens a store whose clock starts at the instant the fixture
 // Host makes its observation.
+// registryFixture opens a store whose fixture session EXISTS as a legacy
+// catalog record, because a registration is a route to a session and the
+// registry refuses to describe one nobody has created. A test that needs the
+// session absent opens the store itself, as TestRegistryReadsRefuseAnUnboundSession
+// does; one that needs the disposition shape creates that catalog instead.
 func registryFixture(t *testing.T, backend *storage.Composite) (*Store, *movableClock) {
 	t.Helper()
 	clock := newMovableClock(registryObservedAt)
-	return openStore(t, backend, WithClock(clock)), clock
+	store := openStore(t, backend, WithClock(clock))
+	if _, _, err := store.CreateCatalogEntry(context.Background(), testCreateRequest()); err != nil {
+		t.Fatalf("CreateCatalogEntry: %v", err)
+	}
+	return store, clock
 }
 
 func testPutRegistrationRequest(epoch uint64) PutHostRegistrationRequest {
@@ -483,8 +492,14 @@ func TestReleasedRegistrationAcceptsTheNextHostAndRefusesTheOldOne(t *testing.T)
 func TestRegistryReadsRefuseAnUnboundSession(t *testing.T) {
 	t.Parallel()
 
-	store, _ := registryFixture(t, memstore.New())
+	// A bare store: the session has no durable data at all, which is the one
+	// state registryFixture deliberately does not produce.
+	store := openStore(t, memstore.New(), WithClock(newMovableClock(registryObservedAt)))
 	tests := map[string]func() error{
+		"PutHostRegistration": func() error {
+			_, err := store.PutHostRegistration(context.Background(), testPutRegistrationRequest(registryEpoch))
+			return err
+		},
 		"GetHostRegistration": func() error {
 			_, err := store.GetHostRegistration(context.Background(), GetHostRegistrationRequest{
 				TenantID: catalogTenant, SessionID: catalogSession,
@@ -895,6 +910,7 @@ func TestPutHostRegistrationBoundsTheExpiry(t *testing.T) {
 			recorder := &recordingOrdered{OrderedIndex: base.OrderedIndex}
 			base.OrderedIndex = recorder
 			store, _ := registryFixture(t, base)
+			recorder.reset()
 
 			req := testPutRegistrationRequest(registryEpoch)
 			req.ObservedAt = registryObservedAt.Add(-time.Hour)
@@ -1017,6 +1033,7 @@ func TestRegistryOperationsValidateBeforeAdmission(t *testing.T) {
 			recorder := &recordingOrdered{OrderedIndex: base.OrderedIndex}
 			base.OrderedIndex = recorder
 			store, _ := registryFixture(t, base)
+			recorder.reset()
 			test.assert(t, test.call(store))
 			if calls := recorder.snapshot(); len(calls) != 0 {
 				t.Fatalf("a refused request reached the provider: %+v", calls)
@@ -1338,7 +1355,7 @@ func TestRegistryReadsDoNotTreatAFailureAsAbsence(t *testing.T) {
 		{
 			name: "a record this reader cannot decode",
 			arm: func(hostile *hostileOrdered) {
-				hostile.corruptGets(func([]byte) []byte { return []byte("{") })
+				hostile.corruptGetsIn(registryNamespace, func([]byte) []byte { return []byte("{") })
 			},
 			want: RegistryErrorMalformed,
 		},

@@ -335,20 +335,9 @@ func TestSessionBindingLegacyClearsCannotMutateMixedRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	registration := testHostRegistration()
-	value, registration, err := encodeHostRegistration(registration)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := backend.OrderedIndex.Create(ctx, hostRegistrationID(scope, catalogSession), scope.SessionNamespace, value, storage.Rank{}, hostRegistrationDue(registration)); err != nil {
-		t.Fatal(err)
-	}
-	audit.reset()
-	_, err = store.ClearHostRegistration(ctx, testClearRegistrationRequest(registryNextEpoch))
-	assertCatalogCode(t, err, CatalogErrorConflict)
-	if audit.countOf("update") != 0 {
-		t.Fatal("registration clear mutated before mode refusal")
-	}
+	// The Host registration's clear is not in this matrix: the registry is
+	// protocol-mode neutral, so a tombstone under a disposition session is a
+	// legitimate write rather than a mixed row (see registry_protocol_mode_test.go).
 	for _, ops := range pointerOperationMatrix() {
 		t.Run(ops.Noun, func(t *testing.T) {
 			pointer := testSessionPointer()
@@ -390,10 +379,12 @@ func legacyBindingWriters(t *testing.T) map[string]func(*Store) error {
 			_, _, err := s.AdmitCommand(context.Background(), testAdmitRequest())
 			return err
 		},
-		"registration": func(s *Store) error {
-			_, err := s.PutHostRegistration(context.Background(), testPutRegistrationRequest(1))
-			return err
-		},
+		// The Host registration is deliberately NOT here. It was, from the
+		// binding prerequisite until v0.9.0, as a placeholder while the
+		// disposition APIs did not exist; a route is protocol-mode neutral
+		// and takes the session's mode from the catalog rather than proposing
+		// one, so it can neither enter a disposition session wrongly nor race
+		// a create for the pin. registry_protocol_mode_test.go holds that.
 		"workspace pointer": func(s *Store) error {
 			_, err := s.SetWorkspaceCheckpointPointer(context.Background(), SetSessionPointerRequest{TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Sequence: 1, Target: testObjectReference(ObjectKindWorkspaceCheckpoint, 1)})
 			return err

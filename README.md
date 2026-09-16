@@ -101,9 +101,12 @@ retry behavior. Bound records use version 2, require every binding field, and
 reject unknown fields or modes. `ProtocolModeLegacy` selects the released
 single-store protocol. `ProtocolModeDisposition` selects the independent
 ownership and settlement protocol, whose command lifecycle is described under
-*The disposition command lifecycle* below. Existing Host/gate, journal,
-registration and pointer writers still cannot execute that protocol, and the
-legacy inbox is unreachable to a disposition session.
+*The disposition command lifecycle* below. Existing Host/gate, journal and
+pointer writers still cannot execute that protocol, and the legacy inbox is
+unreachable to a disposition session. The Host registry is protocol-mode
+neutral: `PutHostRegistration` and `ClearHostRegistration` serve a session under
+whichever mode its catalog binds and never bind one themselves (see *The Host
+registry* below).
 
 A separate create-only KV witness reserves **only the protocol**, before any
 session data is written. It never selects storage configuration or the winning
@@ -1055,6 +1058,19 @@ unranked and never due, and it is read and written directly rather than listed.
 `HostLinkRegistryObservation`, which is also the record's validator: Core owns
 what a Host route means, so this package does not restate the endpoint,
 placement and residency rules and cannot drift from the peer that applies them.
+
+A registration is a route to a session that exists, under whichever protocol
+that session was created with. `PutHostRegistration` reads the catalog first
+and re-fences the mode the catalog binds — legacy for a version-1 record,
+disposition for a bound one — through the same create-only protocol witness the
+catalog create used; it never proposes a mode of its own, on create or on
+update, and neither does `ClearHostRegistration`. A session with no durable
+data is refused as the reads refuse it (`KeyspaceBindingNotFound`), and a
+session whose create crashed between its witnesses and its catalog is refused as
+the catalog's `not_found`; neither refusal writes anything. Until v0.9.0 the
+registry bound `legacy` instead, on both paths, which refused every disposition
+session — the only shape `AcquireResidency` grants — and minted a legacy pin
+for any session nobody had created.
 
 The record has two halves with opposite lifetimes. The ROUTE expires, and a
 reader past `ExpiresAt` is refused it: the Host that published it may have died

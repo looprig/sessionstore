@@ -164,15 +164,16 @@ func (k *keysCountingKV) Keys(ctx context.Context, prefix string) ([]string, err
 type hostileOrdered struct {
 	storage.OrderedIndex
 
-	mu           sync.Mutex
-	getErr       error
-	getNamespace string
-	rewrite      func([]byte) []byte
-	ranked       func(storage.RankedPage, error) (storage.RankedPage, error)
-	due          func(storage.DuePage, error) (storage.DuePage, error)
-	createErr    error
-	createRefile func(storage.OrderedRecord) storage.OrderedRecord
-	updateRefile func(storage.OrderedRecord) storage.OrderedRecord
+	mu               sync.Mutex
+	getErr           error
+	getNamespace     string
+	rewrite          func([]byte) []byte
+	rewriteNamespace string
+	ranked           func(storage.RankedPage, error) (storage.RankedPage, error)
+	due              func(storage.DuePage, error) (storage.DuePage, error)
+	createErr        error
+	createRefile     func(storage.OrderedRecord) storage.OrderedRecord
+	updateRefile     func(storage.OrderedRecord) storage.OrderedRecord
 }
 
 // failCreates makes every later Create return err.
@@ -233,10 +234,16 @@ func (o *hostileOrdered) failGetsIn(namespace string, err error) {
 // corruptGets rewrites the stored value every later Get returns, so a read can
 // be held to the identity the record itself claims rather than to the identity
 // the caller happened to ask for.
-func (o *hostileOrdered) corruptGets(rewrite func([]byte) []byte) {
+func (o *hostileOrdered) corruptGets(rewrite func([]byte) []byte) { o.corruptGetsIn("", rewrite) }
+
+// corruptGetsIn is corruptGets for one namespace family, leaving the others
+// readable, for the same reason failGetsIn exists: an operation that reads the
+// catalog before the record under test cannot have that record's decode
+// exercised by a provider that corrupts the catalog first.
+func (o *hostileOrdered) corruptGetsIn(namespace string, rewrite func([]byte) []byte) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.rewrite = rewrite
+	o.rewrite, o.rewriteNamespace = rewrite, namespace
 }
 
 // answerRanked lets a test replace what the provider returns from ListRanked,
@@ -282,7 +289,7 @@ func (o *hostileOrdered) ListRanked(ctx context.Context, namespace, rankingScope
 
 func (o *hostileOrdered) Get(ctx context.Context, id storage.OrderedID) (storage.OrderedRecord, error) {
 	o.mu.Lock()
-	getErr, namespace, rewrite := o.getErr, o.getNamespace, o.rewrite
+	getErr, namespace, rewrite, rewriteNamespace := o.getErr, o.getNamespace, o.rewrite, o.rewriteNamespace
 	o.mu.Unlock()
 	// A namespace matches its own control shards too. A caller names the
 	// namespace FAMILY a record kind occupies — "the gate intents" — and a
@@ -295,6 +302,9 @@ func (o *hostileOrdered) Get(ctx context.Context, id storage.OrderedID) (storage
 	record, err := o.OrderedIndex.Get(ctx, id)
 	if err != nil || rewrite == nil {
 		return record, err
+	}
+	if rewriteNamespace != "" && rewriteNamespace != id.Namespace && !isShardOf(id.Namespace, rewriteNamespace) {
+		return record, nil
 	}
 	record.Value = rewrite(record.Value)
 	return record, nil

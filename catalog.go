@@ -307,11 +307,7 @@ func (s *Store) createCatalogEntry(ctx context.Context, req CreateCatalogEntryRe
 		return CatalogEntry{}, false, err
 	}
 	defer release()
-	mode := req.Binding.ProtocolMode
-	if req.Binding == (SessionBinding{}) {
-		mode = ProtocolModeLegacy
-	}
-	if err := s.bindSessionScopeMode(opCtx, scope, mode); err != nil {
+	if err := s.bindSessionScopeMode(opCtx, scope, req.Binding.protocolModeOrLegacy()); err != nil {
 		return CatalogEntry{}, false, err
 	}
 	stored, created, err := s.backend.OrderedIndex.Create(

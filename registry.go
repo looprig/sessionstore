@@ -506,6 +506,14 @@ type ClearHostRegistrationRequest struct {
 // a lease it actually holds is a question about the lease, which this record
 // cannot answer and must not pretend to.
 //
+// It requires the session to exist, and is protocol-mode NEUTRAL over one that
+// does: a route is published for a legacy session and a disposition session
+// alike, under the mode the catalog already binds, and the registry never
+// proposes a mode itself. A session with no durable data is refused exactly as
+// the reads refuse it (KeyspaceBindingNotFound); a session whose create crashed
+// after its witnesses and before its catalog is refused as the catalog's own
+// not_found. Neither refusal writes anything.
+//
 // It reads through readHostRegistration and never through GetHostRegistration,
 // and that separation is the single most load-bearing line in this file. The
 // public reader reports an expired or released registration as no route at all;
@@ -544,11 +552,23 @@ func (s *Store) PutHostRegistration(ctx context.Context, req PutHostRegistration
 		return HostRegistrationEntry{}, err
 	}
 	defer release()
-	// A registration is durable session data and may be the first a session
-	// has, so publishing one binds the session's collision witnesses exactly as
-	// creating a catalog record or admitting a command does. The binding is
-	// create-only and idempotent.
-	if err := s.bindSessionScope(opCtx, scope); err != nil {
+	// A route describes a session that EXISTS, so the catalog is read first and
+	// the session's protocol is taken from it — never proposed here. Until
+	// v0.9.0 this call bound ProtocolModeLegacy instead, on create through
+	// bindSessionScope and again on every update, which refused every
+	// disposition session (the only shape AcquireResidency grants) and, for a
+	// session nobody had created, minted a legacy pin out of a route publish: a
+	// value that then bounded every later creator of that session and had been
+	// asserted by no one. Re-fencing the CATALOG'S mode is the disposition
+	// settlement path's rule (dispositionEntryAtRevision) applied to a
+	// mode-neutral record: the witness is redundant with the catalog in every
+	// ordinary case and refuses the one case where the two disagree. It also
+	// binds the collision witnesses, idempotently, as the catalog create did.
+	entry, err := s.readCatalogEntry(opCtx, scope, req.TenantID, req.SessionID)
+	if err != nil {
+		return HostRegistrationEntry{}, err
+	}
+	if err := s.bindSessionScopeMode(opCtx, scope, entry.Record.Binding.protocolModeOrLegacy()); err != nil {
 		return HostRegistrationEntry{}, err
 	}
 
@@ -781,6 +801,13 @@ func (s *Store) createHostRegistration(
 
 // updateHostRegistration compare-and-swaps one registration onto the revision
 // its caller read.
+//
+// It binds NO protocol mode, and neither does createHostRegistration: the
+// registration is a route to a session under whichever protocol that session
+// was created with, so the mode is fenced once, at the entry point, from the
+// catalog. The legacy bind that sat here until v0.9.0 was the placeholder the
+// binding prerequisite installed while the disposition APIs did not exist yet,
+// and it outlived them; see PutHostRegistration.
 func (s *Store) updateHostRegistration(
 	ctx context.Context,
 	scope sessionScope,
@@ -788,9 +815,6 @@ func (s *Store) updateHostRegistration(
 	value []byte,
 	expectedRevision uint64,
 ) (HostRegistrationEntry, error) {
-	if err := s.bindProtocolMode(ctx, scope, ProtocolModeLegacy); err != nil {
-		return HostRegistrationEntry{}, err
-	}
 	stored, err := s.backend.OrderedIndex.Update(
 		ctx, hostRegistrationID(scope, record.SessionID), expectedRevision,
 		value, storage.Rank{}, hostRegistrationDue(record))
