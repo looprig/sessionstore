@@ -1,6 +1,6 @@
 module github.com/looprig/sessionstore
 
-go 1.26.6
+go 1.26.8
 
 require (
 	github.com/looprig/core v0.7.0
