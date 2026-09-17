@@ -1272,6 +1272,12 @@ noticed the same due work do something else instead of scaling the same session
 several times over. `ReleaseReconciliationClaim` gives it back early and
 `GetReconciliationClaim` reports it, and only while it is live.
 
+Claims serve both legacy and disposition catalog sessions. Acquisition and
+live release re-fence the catalog's own protocol against its immutable witness;
+neither operation selects a new protocol. The historical legacy first-write
+behavior is retained when no catalog exists: acquiring a claim binds legacy
+witnesses. A disposition witness without a catalog is refused, not converted.
+
 **What makes concurrent reconcilers safe is not this record.** Deterministic
 command IDs, idempotent desired state, and the Host lease already do that with
 no claim in sight; a replica that ignored this record entirely would produce

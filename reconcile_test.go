@@ -515,11 +515,11 @@ func TestAcquireRefusesALiveClaimOfAnotherHolder(t *testing.T) {
 	for _, call := range recorder.snapshot() {
 		sequence = append(sequence, call.op)
 	}
-	// Exactly one read and nothing else. The positive half matters as much as
+	// Exactly two reads (catalog, claim) and nothing else. The positive half matters as much as
 	// the negative one: an assertion that only counted writes would pass just
 	// as well against a recorder that recorded nothing at all.
-	if len(sequence) != 1 || sequence[0] != "get" {
-		t.Fatalf("provider calls = %v, want exactly one read", sequence)
+	if len(sequence) != 2 || sequence[0] != "get" || sequence[1] != "get" {
+		t.Fatalf("provider calls = %v, want exactly catalog and claim reads", sequence)
 	}
 	// Read the stored row only AFTER the sequence has been captured; this
 	// assertion is itself a provider read.

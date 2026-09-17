@@ -408,10 +408,9 @@ func (s *Store) AcquireReconciliationClaim(
 		return ReconciliationClaimEntry{}, err
 	}
 	defer release()
-	// A claim is durable session data and may be the first record a session
-	// has, so taking one binds the session's collision witnesses exactly as
-	// publishing a registration does. The binding is create-only and idempotent.
-	if err := s.bindSessionScope(opCtx, scope); err != nil {
+	// Claims serve both catalog protocols without proposing a mode. Legacy
+	// first-write claims still bind collision witnesses create-only.
+	if err := s.bindReconciliationScope(opCtx, scope, req.TenantID, req.SessionID); err != nil {
 		return ReconciliationClaimEntry{}, err
 	}
 
@@ -551,12 +550,30 @@ func (s *Store) ReleaseReconciliationClaim(
 	if !claimHeldAt(current.Claim, now) {
 		return current, nil
 	}
-	// Releasing a legacy claim is still a protocol-specific mutation. A claim
-	// injected under a disposition session cannot authorize that write.
-	if err := s.bindProtocolMode(opCtx, scope, ProtocolModeLegacy); err != nil {
+	if err := s.bindReconciliationScope(opCtx, scope, req.TenantID, req.SessionID); err != nil {
 		return ReconciliationClaimEntry{}, err
 	}
 	return s.writeReconciliationClaim(opCtx, scope, released, value, current.Revision)
+}
+
+// bindReconciliationScope preserves legacy first-write claims, but for an
+// existing catalog the catalog alone selects the protocol. Re-fencing that
+// mode refuses disagreement with the immutable witness, rather than letting a
+// neutral claim choose either authority. A disposition witness without its
+// catalog cannot pass the legacy fallback.
+func (s *Store) bindReconciliationScope(ctx context.Context, scope sessionScope,
+	tenant sessionwire.TenantID, session sessionwire.SessionID) error {
+	entry, err := s.readCatalogEntry(ctx, scope, tenant, session)
+	if err == nil {
+		return s.bindSessionScopeMode(ctx, scope, entry.Record.Binding.protocolModeOrLegacy())
+	}
+	var catalog *CatalogError
+	var keyspace *KeyspaceError
+	if (errors.As(err, &catalog) && catalog.Code == CatalogErrorNotFound) ||
+		(errors.As(err, &keyspace) && keyspace.Code == KeyspaceBindingNotFound) {
+		return s.bindSessionScope(ctx, scope)
+	}
+	return err
 }
 
 // readReconciliationClaim reads the RAW stored claim under an already-derived
