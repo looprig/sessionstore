@@ -63,7 +63,11 @@ const MaxDesiredWorkloadPayloadBytes = 16 << 10
 //
 // Its zero value means no workload is desired, which is the ordinary case for a
 // pooled session: pooled capacity is reconciled by scaling a Department's Hosts,
-// not by creating anything per session.
+// not by creating anything per session. Under dedicated placement the zero value
+// is how a Factory says the session's dedicated workload should no longer exist:
+// a desired-state write naming none advances the generation like any other, and
+// no separate deletion state exists or is needed. How the workload that an
+// earlier generation created then ended is recorded by RecordPlacementTermination.
 //
 // The two members are present together or absent together, and canonicalization
 // enforces that rather than documenting it. A payload with no version is a

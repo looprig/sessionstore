@@ -31,6 +31,8 @@ func TestWireDTOsMirrorExportedRecords(t *testing.T) {
 		{reflect.TypeOf(DispositionClaim{}), reflect.TypeOf(dispositionClaimWire{})},
 		{reflect.TypeOf(DispositionAttempt{}), reflect.TypeOf(dispositionAttemptWire{})},
 		{reflect.TypeOf(DispositionOutcome{}), reflect.TypeOf(dispositionOutcomeWire{})},
+		{reflect.TypeOf(PlacementTermination{}), reflect.TypeOf(placementTerminationRecordWire{})},
+		{reflect.TypeOf(RetainedCheckpoint{}), reflect.TypeOf(retainedCheckpointWire{})},
 	}
 	if len(pairs) == 0 {
 		t.Fatal("vacuous: no pinned exported/DTO pairs were examined")
@@ -61,6 +63,13 @@ func TestWireConversionsCarryEveryMember(t *testing.T) {
 		fillProbeMembers(t, reflect.ValueOf(&record).Elem(), "DispositionInboxRecord")
 		if got := dispositionInboxToWire(record).record(); !reflect.DeepEqual(got, record) {
 			t.Fatalf("conversion dropped or altered a member\n got: %+v\nwant: %+v", got, record)
+		}
+	})
+	t.Run("PlacementTermination", func(t *testing.T) {
+		var termination PlacementTermination
+		fillProbeMembers(t, reflect.ValueOf(&termination).Elem(), "PlacementTermination")
+		if got := placementTerminationToWire(termination).termination(); !reflect.DeepEqual(got, termination) {
+			t.Fatalf("conversion dropped or altered a member\n got: %+v\nwant: %+v", got, termination)
 		}
 	})
 	t.Run("PublicCreateReservation", func(t *testing.T) {

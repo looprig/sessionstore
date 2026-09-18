@@ -44,7 +44,8 @@ at composition boundaries, never here.
   `ReconcileHostTargets` withdraws lapsed capacity rows, but that is a liveness
   sweep and the row is retained and reused. The only safe reaper is one that
   removes a session's whole scope at once, because the registry and pointer rows
-  ARE that session's fences.
+  ARE that session's fences, and the placement termination row carries the
+  generation high-water that keeps an older generation's outcome unwritable.
 
 ## Code and security
 

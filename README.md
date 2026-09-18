@@ -625,6 +625,62 @@ and no journal position, and a test reads the source of `placement.go` and fails
 if any type there grows one. Observed placement is the registry's tuple, fenced
 by an epoch this projection structurally cannot name.
 
+**"This dedicated workload should no longer exist" is already expressible, and
+needs no new state.** It is a desired-state write that names NO
+`DesiredWorkload` — keeping `dedicated` placement, or moving to `pooled` — which
+advances the generation like any other accepted desire. The zero workload is
+documented as "no workload is desired" and is admissible under either placement,
+so a controller reads `Placement == dedicated` with a zero `Workload` as "delete
+whatever workload an earlier generation created, after draining it". Supersession
+by a newer generation alone does NOT say this — a newer generation with a
+workload still wants a workload — and a third placement mode or a separate desire
+record would be a second statement of desire with no transaction to keep it
+consistent with the first. A stopped session (`State`) needs no workload either.
+
+## Placement terminations: one outcome per generation, never a fence
+
+When a controller ends a dedicated workload, `RecordPlacementTermination`
+commits HOW it ended: `graceful`, or `forced` with a closed reason —
+`drain_timeout`, `platform_deleted` or `workload_terminated` — together with the
+lease epoch observed, the latest workspace checkpoint retained
+(`RetainedCheckpoint`: sequence and reference) and up to
+`MaxRetainedObjectReferences` other object references, and the store's own
+instant. `GetPlacementTermination` reads it back by `(tenant, session,
+generation)`. Nothing in this package reads a termination to decide anything
+else; it is an outcome, not a fence.
+
+**Graceful is admitted only over evidence.** The store reads the Host registry
+itself and admits `graceful` only when it holds a RELEASED tombstone at exactly
+the observed epoch. No registration, a live route or a merely expired one is
+`not_released`: record the ending as `forced`. That is what makes "never report
+graceful release" a store rule rather than a controller convention. A forced
+outcome may name any epoch at or below the registry's committed one — an older
+generation's Host ended after a successor registered is ordinary — and zero
+when no registration was observed, but never one above it.
+
+**Monotonic on generation, create-only per generation.** The row holds the
+highest generation recorded; a lower generation is `superseded` and can never
+be recorded, because the comparison must live in one compare-and-swapped row
+and there is no cross-record transaction to put it anywhere else. The same
+generation with identical caller-authored content is an idempotent replay that
+returns the stored record unchanged — checked BEFORE the registry evidence, so a
+restarted controller reads back what it committed even after a successor has
+overwritten the tombstone — and with any different content is `mismatch`.
+
+**The generation is store-issued.** It becomes a bound on every later writer,
+so a write naming a generation above the catalog's `DesiredGeneration` is
+`unissued`: the catalog alone mints generations, one at a time, so every
+admissible value is one it issued, and a caller cannot name `MaxUint64` to lock
+the session out. The observed epoch and the retained references bound nobody
+and are recorded; the references are validated as canonical object IDs and are
+not proof the objects still exist.
+
+The write is protocol-mode neutral in the v0.10.0 registry's way: it reads the
+catalog first, re-fences the catalog's own mode through the create-only witness,
+and never proposes one, so a session that does not exist is refused exactly as
+the reads refuse it and no refusal writes anything. `TerminationError` is a new,
+separate vocabulary; no existing code set grows.
+
 ## Recent-first pages are one ranked query
 
 `ListSessions` returns a Core `SessionPage` from a single `ListRanked` call. The

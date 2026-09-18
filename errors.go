@@ -973,3 +973,109 @@ func catalogRecordFailure(failure versionedRecordFailure, field string, cause er
 		return catalogErr(CatalogErrorMalformed, field, cause)
 	}
 }
+
+// TerminationErrorCode classifies a placement termination failure.
+//
+// It is its own vocabulary, new in v0.11.0, rather than the catalog's or the
+// registry's, for the reason every record here has its own: a caller must not
+// be able to write one handler for "the desired state was refused", "the route
+// was refused" and "the outcome was refused", because each asks for a
+// different next move. No existing code set grows.
+//
+// The codes that need their reasons stated:
+//
+//   - Unissued — the request named a generation ABOVE the catalog's
+//     DesiredGeneration, which the store has therefore never issued.
+//     Generation carries the catalog's current generation. It is refused
+//     because a stored termination's generation is a monotonic bound on every
+//     later writer, and a bound must be a value the store issued.
+//   - Superseded — a termination of a HIGHER generation is already stored, so
+//     this generation can never be recorded (on a write) or is no longer the
+//     one the row describes (on a read). Generation carries the stored one.
+//   - NotFound — no row at all (Field "record", Generation zero), or on a read
+//     a row of a LOWER generation only (Field "generation", Generation the
+//     stored one): nothing is recorded for the generation asked about yet.
+//   - Mismatch — the same generation is already recorded with different
+//     caller-authored content. Field names the first differing member. It is
+//     not a race and a retry will not help: the outcome of that generation is
+//     decided.
+//   - Epoch — the observed lease epoch disagrees with the Host registry: above
+//     its committed epoch, or, for a graceful outcome, not exactly the epoch of
+//     its released tombstone. Epoch carries the registry's committed epoch
+//     (zero when there is no registration).
+//   - NotReleased — a graceful outcome was asked for and the registry holds no
+//     released tombstone: there is no registration, or its route is live or
+//     merely expired. Record the outcome as forced instead. Epoch carries the
+//     committed epoch, as for Epoch.
+//
+// Conflict means a lost revision compare-and-swap or a lost create race and
+// nothing else — re-read and retry — which is the meaning it has for every
+// other record kind here.
+type TerminationErrorCode string
+
+const (
+	TerminationErrorInvalid     TerminationErrorCode = "invalid"
+	TerminationErrorNotFound    TerminationErrorCode = "not_found"
+	TerminationErrorUnissued    TerminationErrorCode = "unissued"
+	TerminationErrorSuperseded  TerminationErrorCode = "superseded"
+	TerminationErrorMismatch    TerminationErrorCode = "mismatch"
+	TerminationErrorEpoch       TerminationErrorCode = "epoch"
+	TerminationErrorNotReleased TerminationErrorCode = "not_released"
+	TerminationErrorDeleted     TerminationErrorCode = "deleted"
+	TerminationErrorIdentity    TerminationErrorCode = "identity"
+	TerminationErrorConflict    TerminationErrorCode = "conflict"
+	TerminationErrorUnknown     TerminationErrorCode = "unknown"
+	TerminationErrorBackend     TerminationErrorCode = "backend"
+	TerminationErrorMalformed   TerminationErrorCode = "malformed"
+	TerminationErrorVersion     TerminationErrorCode = "version"
+	TerminationErrorTooLarge    TerminationErrorCode = "too_large"
+)
+
+// TerminationError is a typed, redacted placement termination failure. Field
+// names the offending input or stage and never carries a provider name, a key,
+// or a record payload.
+//
+// Generation is populated for Unissued, Superseded, Mismatch and a read's
+// NotFound; Epoch for Epoch and NotReleased; Revision for Conflict. Each is the
+// value that is itself the answer to "what must my next attempt satisfy".
+type TerminationError struct {
+	Code       TerminationErrorCode
+	Field      string
+	Generation uint64
+	Epoch      uint64
+	Revision   uint64
+	Cause      error
+}
+
+func (e *TerminationError) Error() string {
+	message := "sessionstore: termination " + string(e.Code)
+	if e.Field != "" {
+		message += " (" + e.Field + ")"
+	}
+	return message
+}
+
+func (e *TerminationError) Unwrap() error { return e.Cause }
+
+func terminationErr(code TerminationErrorCode, field string, cause error) error {
+	return &TerminationError{Code: code, Field: field, Cause: cause}
+}
+
+// terminationIdentity is the termination's counterpart of the identity
+// constructors above, and it exists for the same reason they do.
+func terminationIdentity(field string, cause error) error {
+	return terminationErr(TerminationErrorIdentity, field, cause)
+}
+
+// terminationRecordFailure maps a shared versioned-record decode failure into
+// the termination vocabulary.
+func terminationRecordFailure(failure versionedRecordFailure, field string, cause error) error {
+	switch failure {
+	case versionedRecordTooLarge:
+		return terminationErr(TerminationErrorTooLarge, field, cause)
+	case versionedRecordVersion:
+		return terminationErr(TerminationErrorVersion, field, cause)
+	default:
+		return terminationErr(TerminationErrorMalformed, field, cause)
+	}
+}
