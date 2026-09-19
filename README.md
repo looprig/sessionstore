@@ -641,45 +641,53 @@ consistent with the first. A stopped session (`State`) needs no workload either.
 
 When a controller ends a dedicated workload, `RecordPlacementTermination`
 commits HOW it ended: `graceful`, or `forced` with a closed reason —
-`drain_timeout`, `platform_deleted` or `workload_terminated` — together with the
-lease epoch observed, the latest workspace checkpoint retained
-(`RetainedCheckpoint`: sequence and reference) and up to
-`MaxRetainedObjectReferences` other object references, and the store's own
-instant. `GetPlacementTermination` reads it back by `(tenant, session,
-generation)`. Nothing in this package reads a termination to decide anything
-else; it is an outcome, not a fence.
+`drain_timeout`, `drain_refused`, `platform_deleted` or `workload_terminated` —
+together with the Host registry epoch the controller observed (zero when none)
+and the store's own instant. `GetPlacementTermination` reads it back by
+`(tenant, session, generation)`. Nothing in this package, Factory or Host reads
+a termination to decide anything; it is an audit record, not a fence.
 
-**Graceful is admitted only over evidence.** The store reads the Host registry
-itself and admits `graceful` only when it holds a RELEASED tombstone at exactly
-the observed epoch. No registration, a live route or a merely expired one is
-`not_released`: record the ending as `forced`. That is what makes "never report
-graceful release" a store rule rather than a controller convention. A forced
-outcome may name any epoch at or below the registry's committed one — an older
-generation's Host ended after a successor registered is ordinary — and zero
-when no registration was observed, but never one above it.
+**The kind is the controller's assertion, and the store proves nothing about
+it.** The only evidence the store could consult is the registry's released
+tombstone, and it fails both ways: any `ClearHostRegistration` caller — a
+controller fencing a Host before deletion, or a Host finishing an unclean
+release — writes the same tombstone, and the registry cannot say which
+generation's Host released; while a successor, or the same Host re-publishing
+at the same epoch, erases it, after which an honest graceful ending would be
+refused. A check that is forgeable one way and manufactures false `forced` rows
+the other is worse than none, so the kind and the observed epoch are recorded as
+given. A controller decides the kind from its own state machine — `graceful`
+only when it observed THIS workload's Host report its drain complete — before
+it writes any fence tombstone of its own.
 
 **Monotonic on generation, create-only per generation.** The row holds the
 highest generation recorded; a lower generation is `superseded` and can never
 be recorded, because the comparison must live in one compare-and-swapped row
-and there is no cross-record transaction to put it anywhere else. The same
-generation with identical caller-authored content is an idempotent replay that
-returns the stored record unchanged — checked BEFORE the registry evidence, so a
-restarted controller reads back what it committed even after a successor has
-overwritten the tombstone — and with any different content is `mismatch`.
+and there is no cross-record transaction to put it anywhere else. Record in
+generation order and treat `superseded` as terminal. The same generation with
+identical caller-authored content (kind, reason, observed epoch) is an
+idempotent replay that returns the stored record unchanged; any difference is
+`mismatch`.
 
 **The generation is store-issued.** It becomes a bound on every later writer,
 so a write naming a generation above the catalog's `DesiredGeneration` is
 `unissued`: the catalog alone mints generations, one at a time, so every
 admissible value is one it issued, and a caller cannot name `MaxUint64` to lock
-the session out. The observed epoch and the retained references bound nobody
-and are recorded; the references are validated as canonical object IDs and are
-not proof the objects still exist.
+the session out. A pooled session's termination is accepted: the store cannot
+know what a past generation desired, and moving to pooled is itself a spelling
+of "the dedicated workload should no longer exist".
 
 The write is protocol-mode neutral in the v0.10.0 registry's way: it reads the
 catalog first, re-fences the catalog's own mode through the create-only witness,
 and never proposes one, so a session that does not exist is refused exactly as
-the reads refuse it and no refusal writes anything. `TerminationError` is a new,
-separate vocabulary; no existing code set grows.
+the reads refuse it. No refusal writes a termination row. The one write a
+refusal can make is inherited from the v0.10.0 registry: when a catalog exists
+but its protocol witness is absent, the re-fence re-binds that witness to the
+catalog's own mode before a later check refuses. `TerminationError` is a new,
+separate vocabulary; no existing code set grows. The record and both enums are
+frozen at `record_version: 1`, and a future version must reach every reader and
+writer before any writer emits it, because the one row is every writer's
+high-water.
 
 ## Recent-first pages are one ranked query
 

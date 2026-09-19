@@ -46,6 +46,11 @@ at composition boundaries, never here.
   removes a session's whole scope at once, because the registry and pointer rows
   ARE that session's fences, and the placement termination row carries the
   generation high-water that keeps an older generation's outcome unwritable.
+- **Termination kinds are not verified.** `RecordPlacementTermination` records
+  the controller's graceful/forced assertion as given. Do not add a registry
+  "evidence" check: a released tombstone is forgeable by any
+  `ClearHostRegistration` caller and erased by a re-registration, so it proves
+  nothing either way.
 
 ## Code and security
 
