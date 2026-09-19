@@ -133,6 +133,11 @@ type CatalogRecord struct {
 	// before v0.12.0 (every Host-owned write refused one). Zero on a disposition
 	// record therefore means "no gate write has happened", never "journal epoch
 	// zero". TestDispositionCatalogLeaseEpochIsWrittenOnlyByGateWrites pins it.
+	//
+	// That premise binds any OFFLINE migration between protocol modes (the only
+	// conversion session_binding.go allows): a legacy record migrated to
+	// disposition MUST have this member zeroed, or it would carry a journal
+	// epoch into the residency mark and fence out every real grant below it.
 	LeaseEpoch            uint64
 	DesiredIdempotencyKey string
 	DesiredGeneration     uint64
@@ -711,7 +716,9 @@ func (s *Store) gateAuthorityFor(
 //     ClaimDispositionCommandRequest).
 //
 // The returned mark is at or above the committed one whenever the fence
-// admits, so storing it is the ratchet: the member only ever rises.
+// admits, so storing it is the ratchet: the member only ever rises. A gate
+// write that changes a gate stores it with the change; one that changes
+// nothing stores it through fenceWithoutChange, on disposition records only.
 func gateEpochFence(current CatalogRecord, auth gateAuthority) (uint64, error) {
 	if current.Binding.ProtocolMode != ProtocolModeDisposition {
 		if auth.granted {

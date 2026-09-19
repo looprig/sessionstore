@@ -12,8 +12,12 @@ type ProtocolMode string
 const (
 	// ProtocolModeLegacy uses the released single-store epoch protocol.
 	ProtocolModeLegacy ProtocolMode = "legacy"
-	// ProtocolModeDisposition reserves the independent ownership/settlement
-	// protocol. Its execution APIs are not implemented by this prerequisite.
+	// ProtocolModeDisposition selects the independent ownership/settlement
+	// protocol: residency grants (AcquireResidency), the disposition command
+	// lifecycle, the mode-neutral Host registry, and gate writes under a
+	// *ResidencyGrant. UpdateCatalogHostState, the journal writer and the
+	// pointer writers do not serve it. Converting a session to or from it is an
+	// offline migration, and one into it must zero CatalogRecord.LeaseEpoch.
 	ProtocolModeDisposition ProtocolMode = "disposition"
 )
 

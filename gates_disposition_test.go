@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"math"
+	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
@@ -442,31 +443,104 @@ func TestDispositionCatalogLeaseEpochIsWrittenOnlyByGateWrites(t *testing.T) {
 	}
 }
 
-// And structurally: the only production statements that ASSIGN a catalog
-// record's LeaseEpoch (as opposed to building one in a decoder) are the Host-state write (refused on disposition) and the
-// two gate writes. A new assignment elsewhere must be justified against the
-// premise above before this list grows.
+// And structurally: every production site that can WRITE a LeaseEpoch member
+// is on a closed allowlist. A new site fails here and has to be read against
+// the premise above before the list grows.
+//
+// The walk is syntactic and name-based, so it states which forms it sees:
+//
+//   - an assignment whose target is x.LeaseEpoch (op "assign");
+//   - x.LeaseEpoch++ / x.LeaseEpoch-- (op "incdec");
+//   - &x.LeaseEpoch, the handle any write through a pointer needs (op "addr");
+//   - a CatalogRecord composite literal with a LeaseEpoch key (op "literal").
+//
+// It walks every declaration in every non-test file of the package, including
+// package-level variable initialisers ("<package>"), so a function literal
+// outside a FuncDecl is seen too. The name match covers every type with a
+// LeaseEpoch member; the envelope and journal sites write Envelope.LeaseEpoch,
+// a journal frame's writer epoch, and are listed so the list stays closed.
 func TestOnlyHostAndGateWritesAssignTheCatalogLeaseEpoch(t *testing.T) {
+	sites := leaseEpochWriteSites(t, productionGoFiles(t))
+	want := []string{
+		"catalog.go:UpdateCatalogHostState:assign",
+		"catalog.go:decodeCatalogRecord:literal",
+		"envelope.go:decodeField:assign",
+		"gates.go:OpenGate:assign",
+		"gates.go:ResolveGate:assign",
+		"gates.go:fenceWithoutChange:assign",
+		"journal.go:stampWriterOwnedFields:assign",
+	}
+	if !reflect.DeepEqual(sites, want) {
+		t.Fatalf("LeaseEpoch write sites = %v, want %v", sites, want)
+	}
+}
+
+// The walk's own controls: each blind spot the v0.12.0 quality gate found is a
+// form the walk now reports.
+func TestLeaseEpochWriteSiteWalkSeesEveryForm(t *testing.T) {
+	src := `package sessionstore
+func inc(r *CatalogRecord)     { r.LeaseEpoch++ }
+func ptr(r *CatalogRecord)     { p := &r.LeaseEpoch; *p = 7 }
+func lit(r *CatalogRecord)     { *r = CatalogRecord{LeaseEpoch: 7} }
+var pkg = func(r *CatalogRecord) { r.LeaseEpoch = 7 }
+func other(r *HostRegistration) { *r = HostRegistration{LeaseEpoch: 7} }
+`
+	dir := t.TempDir()
+	name := filepath.Join(dir, "probe.go")
+	if err := os.WriteFile(name, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := leaseEpochWriteSites(t, []string{name})
+	want := []string{"probe.go:<package>:assign", "probe.go:inc:incdec", "probe.go:lit:literal", "probe.go:ptr:addr"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("walk saw %v, want %v", got, want)
+	}
+}
+
+func leaseEpochWriteSites(t *testing.T, files []string) []string {
+	t.Helper()
+	isLeaseEpoch := func(e ast.Expr) bool {
+		sel, ok := ast.Unparen(e).(*ast.SelectorExpr)
+		return ok && sel.Sel.Name == "LeaseEpoch"
+	}
 	fset := token.NewFileSet()
 	var sites []string
-	for _, name := range productionGoFiles(t) {
+	for _, name := range files {
 		file, err := parser.ParseFile(fset, name, nil, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
+		base := filepath.Base(name)
 		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil {
-				continue
+			owner := "<package>"
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				owner = fn.Name.Name
 			}
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				assign, ok := n.(*ast.AssignStmt)
-				if !ok {
-					return true
-				}
-				for _, lhs := range assign.Lhs {
-					if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "LeaseEpoch" {
-						sites = append(sites, name+":"+fn.Name.Name)
+			ast.Inspect(decl, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.AssignStmt:
+					for _, lhs := range n.Lhs {
+						if isLeaseEpoch(lhs) {
+							sites = append(sites, base+":"+owner+":assign")
+						}
+					}
+				case *ast.IncDecStmt:
+					if isLeaseEpoch(n.X) {
+						sites = append(sites, base+":"+owner+":incdec")
+					}
+				case *ast.UnaryExpr:
+					if n.Op == token.AND && isLeaseEpoch(n.X) {
+						sites = append(sites, base+":"+owner+":addr")
+					}
+				case *ast.CompositeLit:
+					if ident, ok := n.Type.(*ast.Ident); ok && ident.Name == "CatalogRecord" {
+						for _, elt := range n.Elts {
+							if kv, ok := elt.(*ast.KeyValueExpr); ok {
+								if key, ok := kv.Key.(*ast.Ident); ok && key.Name == "LeaseEpoch" {
+									sites = append(sites, base+":"+owner+":literal")
+								}
+							}
+						}
 					}
 				}
 				return true
@@ -474,19 +548,7 @@ func TestOnlyHostAndGateWritesAssignTheCatalogLeaseEpoch(t *testing.T) {
 		}
 	}
 	sort.Strings(sites)
-	// The envelope and journal sites assign Envelope.LeaseEpoch — a journal
-	// frame's writer epoch — and are listed so the allowlist stays closed: a new
-	// site of either type fails here and has to be read.
-	want := []string{
-		"catalog.go:UpdateCatalogHostState",
-		"envelope.go:decodeField",
-		"gates.go:OpenGate",
-		"gates.go:ResolveGate",
-		"journal.go:stampWriterOwnedFields",
-	}
-	if !reflect.DeepEqual(sites, want) {
-		t.Fatalf("LeaseEpoch assignment sites = %v, want %v", sites, want)
-	}
+	return sites
 }
 
 // --- a caller cannot name an epoch ------------------------------------------

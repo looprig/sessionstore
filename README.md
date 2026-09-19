@@ -796,8 +796,16 @@ command (v0.6–v0.8) and registry (v0.10.0) paths had already outgrown.
 `OpenGateRequest` and `ResolveGateRequest` take `Residency`, the
 `*ResidencyGrant` `AcquireResidency` returned for that tenant and session, and
 `LeaseEpoch` must be zero. The grant's residency epoch is fenced against
-`CatalogRecord.LeaseEpoch` and becomes it, so the mark only ratchets upward and a
-stale grant is refused as `CatalogErrorEpoch` naming the committed mark. A bare
+`CatalogRecord.LeaseEpoch`, and **every successful call leaves the mark at
+`max(mark, grant epoch)`**: a write that changes a gate stores it with the
+change, and one that changes nothing — an idempotent `OpenGate` replay, a
+`ResolveGate` of a gate the record does not project — stores it with a
+compare-and-swap of its own when it is higher (a lost swap is the usual
+conflict). So the mark only ratchets upward, a successor's first successful gate
+write — its restore re-publish included — fences its predecessor, and a stale
+grant is refused as `CatalogErrorEpoch` naming the committed mark. A Host is
+superseded exactly when the mark is **above** its own grant's epoch; below it
+means only that this Host has not yet written. A bare
 `LeaseEpoch` on a disposition session is refused as `invalid (residency)` before
 it reaches the mark, and a grant for another session, another tenant or another
 Store — or one already released — as the same. The reason is the rule
@@ -842,6 +850,34 @@ disposition session (`OpenJournal` binds legacy), so `LastJournalSeq`,
 crashes before `OpenGate` leaves a runtime gate with no projection. That fails
 closed — nothing can answer a gate it cannot see — and the Host must
 re-publish the session's open gates when it restores the session.
+
+**A stale resolve can still tombstone a successor's first gate.** A resolve
+fences when it reads, and a resolve of a gate the record does not project then
+retires that gate's deadline intent. A predecessor's `ResolveGate(G)` that reads
+before the successor has made any fencing write can tombstone the intent of the
+successor's in-flight `OpenGate(G)`. If that resolve itself raised the mark,
+the successor's open then conflicts and every retry is refused as
+`catalog deleted (gate_intent)`; if it did not, G ends projected open with no
+deadline index and `ListDueGates` never reports it. Either way **a tombstoned
+intent cannot be re-published**. The same interleaving exists on legacy sessions and predates
+v0.12.0. The raised mark closes it from the successor's first successful gate
+write on, so a successor should make one fencing gate write before opening a
+gate its predecessor may still be resolving; closing it for that first write
+needs the intent to carry the writer's mark (a gate-intent record version) and
+is booked for a later release.
+
+**Rollout order: every `ReadGates` caller first.** A reader older than v0.12.0
+computes a disposition page's tip from the stored `LastJournalSeq`, which is
+zero, so Core's `GatePage.Validate` rejects any open gate and v0.11.0's
+`ReadGates` fails with `catalog sequence (gates)` on a record v0.12.0 wrote. It
+fails closed, but it fails: **every Factory (every `ReadGates` caller) must be
+on sessionstore ≥ v0.12.0 before any Host publishes a disposition gate.**
+`GetCatalogEntry` and `Status` read such a record fine at any version.
+
+**Offline migration.** Converting a session between protocol modes is offline
+only. A legacy record migrated to disposition must have
+`CatalogRecord.LeaseEpoch` zeroed, or a journal epoch would become the residency
+mark and fence out every real grant below it.
 
 ### Gate continuation is deferred, and that is a decision rather than an omission
 

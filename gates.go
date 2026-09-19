@@ -172,9 +172,14 @@ const _ = uint(MaxGateIntentBytes - maxGateIntentEncodedBytes)
 //     nil. This is v0.11.0's behaviour, unchanged.
 //   - A DISPOSITION session takes Residency, the *ResidencyGrant
 //     AcquireResidency returned for THIS tenant and session, and LeaseEpoch
-//     must be zero. The grant's residency epoch is fenced against the mark and
-//     becomes it. A caller cannot name that epoch: the mark is a monotonic bound
-//     on every later gate writer, so it must be one the store issued — the rule
+//     must be zero. The grant's residency epoch is fenced against the mark, and
+//     EVERY successful call leaves the mark at max(mark, grant epoch) — a
+//     write that changes a gate stores it with the change, and one that
+//     changes nothing (an idempotent replay here, a resolve of an absent gate)
+//     stores it by a compare-and-swap of its own when it is higher. So a
+//     successor's first successful gate write fences its predecessor. A caller
+//     cannot name that epoch: the mark is a monotonic bound on every later gate
+//     writer, so it must be one the store issued — the rule
 //     ClaimDispositionCommandRequest states. As there, the grant is proof of
 //     provenance and NOT of a live lease.
 //
@@ -198,6 +203,25 @@ const _ = uint(MaxGateIntentBytes - maxGateIntentEncodedBytes)
 // call leaves a runtime gate with no projection. That fails closed — no
 // consumer can answer a gate it cannot see — and the Host must re-publish the
 // session's open gates when it restores the session.
+//
+// # A window the fence does not close (disposition and legacy alike)
+//
+// A resolve decides its fence when it READS the record, and a resolve of a gate
+// the record does not project then retires the gate's deadline intent. A
+// PREDECESSOR's ResolveGate(G) that reads before the successor has made any
+// fencing write can therefore tombstone the intent of the successor's
+// in-flight OpenGate(G). Two outcomes follow, both measured: if that resolve
+// itself raised the mark, the successor's projection CAS conflicts and every
+// retry is refused as catalog deleted (gate_intent), so G cannot be published
+// under that id; if it did not, G is projected open with no deadline index and
+// ListDueGates never reports it. In both, a tombstoned intent cannot be
+// re-published. The raised mark closes the window from the
+// successor's first successful gate write on (a predecessor reading after it
+// is refused before it reaches the intent); it cannot close the window for
+// that first write itself. A successor should make one fencing gate write —
+// re-publish, or a resolve — before opening a gate its predecessor may still
+// be resolving. Closing it outright needs the intent to carry the writer's
+// mark, which is a gate-intent record version and is booked, not done.
 type OpenGateRequest struct {
 	TenantID   sessionwire.TenantID
 	SessionID  sessionwire.SessionID
@@ -440,7 +464,9 @@ func (s *Store) OpenGate(ctx context.Context, req OpenGateRequest) (CatalogEntry
 			if err := s.commitGateIntent(opCtx, scope, gate, intent, value); err != nil {
 				return CatalogEntry{}, err
 			}
-			return current, nil
+			// A replay changes no gate, but on a disposition record it is
+			// still a fencing write: see s.fenceWithoutChange.
+			return s.fenceWithoutChange(opCtx, scope, current, mark)
 		}
 		// Two gates opened by one event cannot be ordered against each other,
 		// and a page that carries both violates the deterministic order its own
@@ -503,7 +529,7 @@ func (s *Store) ResolveGate(ctx context.Context, req ResolveGateRequest) (Catalo
 		return CatalogEntry{}, err
 	}
 
-	entry := current
+	var entry CatalogEntry
 	if remaining, found := withoutGate(current.Record.OpenGates, req.GateID); found {
 		next := current.Record
 		next.LeaseEpoch = mark
@@ -511,6 +537,10 @@ func (s *Store) ResolveGate(ctx context.Context, req ResolveGateRequest) (Catalo
 		if entry, err = s.writeCatalogRecord(opCtx, scope, next, current.Revision); err != nil {
 			return CatalogEntry{}, err
 		}
+	} else if entry, err = s.fenceWithoutChange(opCtx, scope, current, mark); err != nil {
+		// The mark is raised BEFORE the intent is retired, so a resolve that
+		// loses this compare-and-swap has retired nothing.
+		return CatalogEntry{}, err
 	}
 	// Not conditional on the gate having been projected. A resolve interrupted
 	// after the projection was cleared must still be able to retire the intent,
@@ -570,6 +600,32 @@ func (s *Store) ReadGates(ctx context.Context, req ReadGatesRequest) (sessionwir
 		return sessionwire.GatePage{}, catalogErr(CatalogErrorSequence, "gates", err)
 	}
 	return page, nil
+}
+
+// fenceWithoutChange completes a gate write that changes no gate — an
+// idempotent OpenGate replay, or a ResolveGate of a gate the record does not
+// project — and returns the entry the caller reports.
+//
+// On a DISPOSITION record, a mark above the stored one is written by a revision
+// compare-and-swap of the otherwise unchanged record. Without it a successor
+// following the restore flow — re-publish every gate its runtime still holds —
+// would leave the mark at its predecessor's residency, and the predecessor's
+// gate writes would keep succeeding: phantom gates and lost resolves, from a
+// Host that has already been superseded. With it, EVERY successful disposition
+// gate write leaves the mark at the writer's residency, which is what makes
+// "a mark above my grant means I am superseded" a rule a Host can act on. A
+// lost compare-and-swap surfaces as the usual conflict; the caller rereads.
+//
+// At or below the mark nothing is written, so a same-grant replay stays a
+// read. A LEGACY record is never written here, whatever its epoch: its no-op
+// gate writes are exactly v0.11.0's (TestLegacyNoOpGateWritesUnderAHigherEpochStillWriteNothing).
+func (s *Store) fenceWithoutChange(ctx context.Context, scope sessionScope, current CatalogEntry, mark uint64) (CatalogEntry, error) {
+	if current.Record.Binding.ProtocolMode != ProtocolModeDisposition || mark <= current.Record.LeaseEpoch {
+		return current, nil
+	}
+	next := current.Record
+	next.LeaseEpoch = mark
+	return s.writeCatalogRecord(ctx, scope, next, current.Revision)
 }
 
 // gatePageTip is the JournalTip a gate page reports for one record: its stored
