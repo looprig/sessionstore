@@ -5,32 +5,44 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"slices"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/storage"
 )
 
-// A PLACEMENT TERMINATION IS THE DURABLE ANSWER TO "HOW DID THIS SESSION'S
-// DEDICATED WORKLOAD END?"
+// A PLACEMENT TERMINATION IS THE DURABLE AUDIT RECORD OF HOW ONE GENERATION OF
+// A SESSION'S DEDICATED WORKLOAD ENDED, AS THE CONTROLLER THAT ENDED IT SAYS.
 //
-// A placement controller deletes a dedicated session's platform workload only
-// after the Host running in it has drained. When the drain completes, the
-// ending is graceful; when it does not — the drain timed out, the platform
-// deleted the workload on its own, or the workload crashed or reached a
-// terminal state — the ending is FORCED, and the one thing that must never
-// happen is that a forced ending is later reported as a graceful release. This
-// file stores which it was, once per desired generation, together with the
-// object references the controller retained at that moment.
+// A placement controller deletes a dedicated session's platform workload after
+// asking the Host in it to drain. It then records whether that ending was
+// graceful or forced, and if forced, why. This file stores that statement, once
+// per desired generation.
 //
-// WHAT IT IS NOT. It is not a fence on the session: no write anywhere in this
-// package reads it to decide anything, and it names no lease a caller may
-// write under. It is not the desired state either — "this session's dedicated
-// workload should no longer exist" is already expressible on the catalog record
-// (a desired-state write naming no DesiredWorkload), and a second record of
-// desire would need a consistency protocol with the first. It is the durable
-// OUTCOME of acting on that desire, and nothing more.
+// THE KIND IS THE CONTROLLER'S ASSERTION, AND THE STORE PROVES NOTHING ABOUT
+// IT. That is deliberate, and the reason is that nothing the store can read is
+// evidence either way. The only candidate is the Host registry's released
+// tombstone, and it fails in both directions:
+//
+//   - It can be forged. ClearHostRegistration checks only that its epoch is not
+//     below the committed one; it names no author. A controller fencing a Host
+//     before deletion writes exactly that tombstone, and a Host writes it too
+//     after an unclean release (a failed checkpoint, a refused residency release,
+//     an attach rollback). The registry is also per session, not per workload,
+//     so a tombstone cannot say which generation's Host released.
+//   - It falsely refuses. The tombstone disappears the moment a successor — or
+//     the same Host at the same epoch, which the registry admits — publishes a
+//     route again, after which an honest graceful ending could no longer be
+//     recorded, and would be recorded as forced instead.
+//
+// A check that is forgeable one way and manufactures false "forced" rows the
+// other is worse than none. And nothing downstream acts on graceful versus
+// forced: no write in this package, and no Factory or Host path, reads a
+// termination to decide anything. It is an AUDIT record, and AGENTS.md's rule
+// lets a value that is merely recorded be caller-asserted. A controller must
+// therefore decide the kind from its own state machine — graceful only when it
+// observed the Host report the drain complete for THIS workload — BEFORE it
+// writes any fence tombstone of its own.
 //
 // ONE ROW PER SESSION, KEYED LOGICALLY BY (TENANT, SESSION, GENERATION). The
 // row holds the outcome of the highest generation recorded so far. That shape
@@ -42,12 +54,20 @@ import (
 // cross-record transaction here to put it anywhere else — the argument
 // placement.go makes for desired state applies unchanged. A reader asking for
 // an older generation is told it has been superseded and by which generation,
-// and is never handed another generation's outcome in its place.
+// and is never handed another generation's outcome in its place. A controller
+// must therefore record in generation order and treat superseded as terminal.
 //
 // The row's SHAPE follows the Host registry's: filed in the session namespace,
 // unranked, never due, read and written only by name, and NEVER DELETED. It is
 // written under the session's EXISTING protocol mode, read from its catalog, and
 // never proposes one — the v0.10.0 registry rule.
+//
+// A FUTURE RECORD VERSION BLOCKS EVERY v0.11 WRITER FOR THE SESSION. The row is
+// the monotonic high-water, so a reader that cannot decode it can neither answer
+// Get nor admit a Record: both report version. A v2 must therefore be rolled
+// out to every reader and writer before any writer emits it. The two enums are
+// frozen at v1 for the same reason: a new Kind or ForcedReason spelling without
+// a version bump would reach a v1 reader as invalid.
 
 // placementTerminationNamespace is the one OrderedIndex namespace holding
 // per-session placement terminations. It is namespace-distinct from every
@@ -59,20 +79,14 @@ const (
 	// stored termination. A reader fails closed on any other version.
 	PlacementTerminationRecordVersion uint8 = 1
 
-	// MaxRetainedObjectReferences bounds the object references one termination
-	// retains beside its checkpoint. It is a record bound, not a statement about
-	// how many objects a session has: a controller retaining more is naming
-	// data that belongs in an object of its own.
-	MaxRetainedObjectReferences = 16
-
 	// MaxPlacementTerminationRecordBytes bounds an encoded termination.
 	//
-	// Two members are identities bounded by sessionwire.MaxIDBytes whose JSON
-	// escaping can cost six bytes for one, as the registry's bound explains;
-	// every object reference is canonical ASCII of a fixed shape and encodes one
-	// byte per byte. TestLargestAcceptablePlacementTerminationFitsTheBound
-	// builds the worst case and reports what it measures.
-	MaxPlacementTerminationRecordBytes = 8 << 10
+	// The only open-ended members are the two identities, each bounded by
+	// sessionwire.MaxIDBytes, whose JSON escaping can cost six bytes for one as
+	// the registry's bound explains; everything else is a fixed-width number, a
+	// closed enum or an instant. TestLargestAcceptablePlacementTerminationFitsTheBound
+	// builds that worst case and reports what it measures.
+	MaxPlacementTerminationRecordBytes = 4 << 10
 )
 
 // Stated as an unsigned constant for the reason the other records state
@@ -80,25 +94,34 @@ const (
 const _ = uint(storage.MaxOrderedValueBytes - MaxPlacementTerminationRecordBytes)
 
 // PlacementTerminationKind is the closed set of ways a dedicated workload ends.
+// It is the controller's assertion; see the file comment.
 type PlacementTerminationKind string
 
 const (
-	// PlacementTerminationGraceful: the Host released the session's route
-	// before the workload ended. The store admits it only over that evidence.
+	// PlacementTerminationGraceful: the controller observed the workload's
+	// Host report its drain complete before the workload was deleted. The store
+	// does not and cannot verify this; a graceful record says only that the
+	// controller asserted it.
 	PlacementTerminationGraceful PlacementTerminationKind = "graceful"
-	// PlacementTerminationForced: the workload ended without a proven release.
-	// ForcedReason says how.
+	// PlacementTerminationForced: the workload ended without the controller
+	// observing a completed drain. ForcedReason says how.
 	PlacementTerminationForced PlacementTerminationKind = "forced"
 )
 
 // PlacementForcedReason is the closed set of reasons a forced termination
-// carries. A graceful termination carries none.
+// carries. A graceful termination carries none. The set is frozen at record
+// version 1.
 type PlacementForcedReason string
 
 const (
-	// PlacementForcedDrainTimeout: the controller requested a drain and the
-	// drain did not complete within its ceiling, so the workload was deleted.
+	// PlacementForcedDrainTimeout: the controller requested a drain, the Host
+	// accepted it, and the drain did not complete within its ceiling.
 	PlacementForcedDrainTimeout PlacementForcedReason = "drain_timeout"
+	// PlacementForcedDrainRefused: the drain could not be requested at all —
+	// the Host does not advertise the drain method, or answered
+	// runtime_unavailable and went cold — so the workload was deleted without
+	// one.
+	PlacementForcedDrainRefused PlacementForcedReason = "drain_refused"
 	// PlacementForcedPlatformDeleted: the platform deleted the workload on its
 	// own — an eviction, a node loss, an operator — rather than the controller
 	// ending it after a drain.
@@ -110,28 +133,12 @@ const (
 
 func (r PlacementForcedReason) known() bool {
 	switch r {
-	case PlacementForcedDrainTimeout, PlacementForcedPlatformDeleted, PlacementForcedWorkloadTerminated:
+	case PlacementForcedDrainTimeout, PlacementForcedDrainRefused,
+		PlacementForcedPlatformDeleted, PlacementForcedWorkloadTerminated:
 		return true
 	default:
 		return false
 	}
-}
-
-// RetainedCheckpoint names the latest workspace checkpoint a controller
-// retained when the workload ended: the journal position it was captured at
-// and the object that holds it. Its zero value means none was retained.
-//
-// It is RECORDED, not verified. The reference must parse as a workspace
-// checkpoint this store could have minted, but nothing here reads a pointer,
-// reads the object, or proves the bytes still exist — a caller copies it from
-// the pointer it read, and a restore must still verify the stream it gets.
-type RetainedCheckpoint struct {
-	Sequence  uint64
-	Reference sessionwire.ObjectReference
-}
-
-func (c RetainedCheckpoint) isZero() bool {
-	return c.Sequence == 0 && c.Reference.ObjectID == ""
 }
 
 // PlacementTermination is the durable outcome of ending one generation of a
@@ -146,17 +153,22 @@ func (c RetainedCheckpoint) isZero() bool {
 //     store alone mints — one at creation and one more per applied desired-state
 //     write — so every admissible value is one the store has issued. A caller
 //     cannot name MaxUint64 and lock out every real generation.
-//   - LeaseEpoch is RECORDED, and bounds nobody: no write reads it. It is
-//     nonetheless held to the store's own evidence — never above the Host
-//     registry's committed epoch, and for a graceful outcome EXACTLY the epoch
-//     of the registry's released tombstone — so it cannot name an epoch no Host
-//     was ever registered at. Zero means no Host registration was observed,
-//     and is admissible only for a forced outcome.
-//   - Kind and ForcedReason are recorded; graceful is admitted only over the
-//     registry's release evidence.
-//   - Checkpoint and Objects are recorded references and bound nobody.
+//   - LeaseEpoch is the Host registry epoch the controller OBSERVED for the
+//     workload it ended, recorded as given and checked against nothing: no
+//     write reads it, and the registry's own epoch is caller-mintable, so a
+//     check against it would add a rule without adding a guarantee. Zero means
+//     no registration was observed, and is admissible only for a forced
+//     outcome.
+//   - Kind and ForcedReason are the controller's assertion; see the file
+//     comment.
 //   - RecordedAt is the STORE's clock, read when the request is validated,
 //     as SessionPointer.UpdatedAt is. No decision turns on it.
+//
+// A pooled session's termination is accepted, deliberately. The store cannot
+// know which placement a PAST generation desired — moving a session to pooled
+// is itself one of the two spellings of "the dedicated workload should no
+// longer exist" — so refusing on the catalog's current placement would refuse
+// exactly the termination that desire produces.
 type PlacementTermination struct {
 	TenantID  sessionwire.TenantID
 	SessionID sessionwire.SessionID
@@ -169,10 +181,6 @@ type PlacementTermination struct {
 	LeaseEpoch uint64
 
 	RecordedAt time.Time
-
-	Checkpoint RetainedCheckpoint
-	// Objects is in ascending ObjectID order with no duplicates; nil when none.
-	Objects []sessionwire.ObjectReference
 }
 
 // PlacementTerminationEntry is a termination together with its revision.
@@ -189,44 +197,31 @@ type placementTerminationWire struct {
 }
 
 type placementTerminationRecordWire struct {
-	TenantID     sessionwire.TenantID          `json:"tenant_id"`
-	SessionID    sessionwire.SessionID         `json:"session_id"`
-	Generation   uint64                        `json:"generation"`
-	Kind         PlacementTerminationKind      `json:"kind"`
-	ForcedReason PlacementForcedReason         `json:"forced_reason,omitempty"`
-	LeaseEpoch   uint64                        `json:"lease_epoch"`
-	RecordedAt   time.Time                     `json:"recorded_at"`
-	Checkpoint   *retainedCheckpointWire       `json:"checkpoint,omitempty"`
-	Objects      []sessionwire.ObjectReference `json:"objects,omitempty"`
-}
-
-type retainedCheckpointWire struct {
-	Sequence  uint64                      `json:"sequence"`
-	Reference sessionwire.ObjectReference `json:"reference"`
+	TenantID     sessionwire.TenantID     `json:"tenant_id"`
+	SessionID    sessionwire.SessionID    `json:"session_id"`
+	Generation   uint64                   `json:"generation"`
+	Kind         PlacementTerminationKind `json:"kind"`
+	ForcedReason PlacementForcedReason    `json:"forced_reason,omitempty"`
+	LeaseEpoch   uint64                   `json:"lease_epoch"`
+	RecordedAt   time.Time                `json:"recorded_at"`
 }
 
 func placementTerminationToWire(r PlacementTermination) placementTerminationRecordWire {
-	wire := placementTerminationRecordWire{
+	//lint:ignore S1016 written out so each member drop stays a killable mutation
+	return placementTerminationRecordWire{
 		TenantID: r.TenantID, SessionID: r.SessionID, Generation: r.Generation,
 		Kind: r.Kind, ForcedReason: r.ForcedReason, LeaseEpoch: r.LeaseEpoch,
-		RecordedAt: r.RecordedAt, Objects: r.Objects,
+		RecordedAt: r.RecordedAt,
 	}
-	if !r.Checkpoint.isZero() {
-		wire.Checkpoint = &retainedCheckpointWire{Sequence: r.Checkpoint.Sequence, Reference: r.Checkpoint.Reference}
-	}
-	return wire
 }
 
 func (w placementTerminationRecordWire) termination() PlacementTermination {
-	r := PlacementTermination{
+	//lint:ignore S1016 the reverse direction is written out for the same reason
+	return PlacementTermination{
 		TenantID: w.TenantID, SessionID: w.SessionID, Generation: w.Generation,
 		Kind: w.Kind, ForcedReason: w.ForcedReason, LeaseEpoch: w.LeaseEpoch,
-		RecordedAt: w.RecordedAt, Objects: w.Objects,
+		RecordedAt: w.RecordedAt,
 	}
-	if w.Checkpoint != nil {
-		r.Checkpoint = RetainedCheckpoint{Sequence: w.Checkpoint.Sequence, Reference: w.Checkpoint.Reference}
-	}
-	return r
 }
 
 // encodePlacementTermination validates and encodes one termination, returning
@@ -243,6 +238,9 @@ func encodePlacementTermination(record PlacementTermination) ([]byte, PlacementT
 	if err != nil {
 		return nil, PlacementTermination{}, terminationErr(TerminationErrorInvalid, "record", err)
 	}
+	// Unreachable for any record canonicalization accepts: the measured worst
+	// case is far below the bound. It is kept as the same belt every sibling
+	// record carries, so a member added later cannot silently exceed it.
 	if len(encoded) > MaxPlacementTerminationRecordBytes {
 		return nil, PlacementTermination{}, terminationErr(TerminationErrorTooLarge, "record", nil)
 	}
@@ -263,14 +261,13 @@ func decodePlacementTermination(value []byte) (PlacementTermination, error) {
 }
 
 // canonicalPlacementTermination validates a termination and returns its one
-// canonical spelling: a UTC instant, a checkpoint wholly present or wholly
-// absent, and objects in ascending ObjectID order or nil. Encoding and decoding
-// both end here, so a record read back is byte-identical to the one written.
+// canonical spelling, a UTC instant. Encoding and decoding both end here, so a
+// record read back is byte-identical to the one written.
 //
 // Kind and reason have exactly one valid pairing each way: graceful carries no
 // reason and forced carries a known one. A graceful outcome also requires a
-// nonzero epoch, because the only evidence that admits it is a released
-// registration, and a registration always has one.
+// nonzero epoch: it asserts the controller observed a Host complete a drain,
+// and a Host it could observe was registered at some epoch.
 func canonicalPlacementTermination(r PlacementTermination) (PlacementTermination, error) {
 	if err := r.TenantID.Validate(); err != nil {
 		return PlacementTermination{}, terminationErr(TerminationErrorInvalid, "tenant_id", err)
@@ -300,37 +297,6 @@ func canonicalPlacementTermination(r PlacementTermination) (PlacementTermination
 		return PlacementTermination{}, terminationErr(TerminationErrorInvalid, "recorded_at", nil)
 	}
 	r.RecordedAt = r.RecordedAt.UTC()
-	if !r.Checkpoint.isZero() {
-		if r.Checkpoint.Sequence == 0 {
-			return PlacementTermination{}, terminationErr(TerminationErrorInvalid, "checkpoint.sequence", nil)
-		}
-		// One refusal, not two: an unparseable reference has no kind, so a
-		// separate parse gate would be masked by the kind gate with the identical
-		// error and no test could hold it. The parse failure is kept as Cause.
-		if parsed, err := parseObjectReference(r.Checkpoint.Reference); err != nil || parsed.kind != ObjectKindWorkspaceCheckpoint {
-			return PlacementTermination{}, terminationErr(TerminationErrorInvalid, "checkpoint.reference", err)
-		}
-	}
-	if len(r.Objects) > MaxRetainedObjectReferences {
-		return PlacementTermination{}, terminationErr(TerminationErrorInvalid, "objects", nil)
-	}
-	for i, object := range r.Objects {
-		if _, err := parseObjectReference(object); err != nil {
-			return PlacementTermination{}, terminationErr(TerminationErrorInvalid, "objects", err)
-		}
-		// Strictly ascending: one order, and no duplicates, so a set of
-		// references has exactly one stored spelling.
-		if i > 0 && r.Objects[i-1].ObjectID >= object.ObjectID {
-			return PlacementTermination{}, terminationErr(TerminationErrorInvalid, "objects", nil)
-		}
-	}
-	if len(r.Objects) == 0 {
-		r.Objects = nil
-	} else {
-		// A caller that kept its slice must not be able to rewrite what a
-		// validated record means before it is encoded or after it is returned.
-		r.Objects = slices.Clone(r.Objects)
-	}
 	return r, nil
 }
 
@@ -338,8 +304,8 @@ func canonicalPlacementTermination(r PlacementTermination) (PlacementTermination
 // dedicated workload ended.
 //
 // ObservedLeaseEpoch is the Host registry epoch the caller observed for the
-// workload it ended, and zero when it observed no registration. It is checked
-// against the registry, never taken on trust: see PlacementTermination.
+// workload it ended, and zero when it observed no registration. It is recorded
+// as given.
 //
 // There is no timestamp member and no expected revision: the instant is the
 // store's, and the write is closed against the revision this store reads for
@@ -354,10 +320,6 @@ type RecordPlacementTerminationRequest struct {
 	ForcedReason PlacementForcedReason
 
 	ObservedLeaseEpoch uint64
-
-	Checkpoint RetainedCheckpoint
-	// Objects must be in ascending ObjectID order with no duplicates.
-	Objects []sessionwire.ObjectReference
 }
 
 // GetPlacementTerminationRequest names one termination by its key.
@@ -370,31 +332,25 @@ type GetPlacementTerminationRequest struct {
 // RecordPlacementTermination commits the outcome of ending one generation of
 // a session's dedicated workload. created reports whether this call wrote it.
 //
-// The checks run in this order, and each refusal writes nothing:
+// The checks run in this order:
 //
 //  1. The request's own shape (invalid), before any provider work.
-//  2. The session exists (the catalog read) and its catalog-bound protocol
+//  2. The session exists (the catalog read), and its catalog-bound protocol
 //     mode is re-fenced through the same create-only witness the catalog create
 //     used; this call never proposes a mode.
 //  3. The generation is one the catalog has issued (unissued otherwise).
 //  4. The stored row: a higher generation is superseded; the SAME generation is
 //     an idempotent replay when every caller-authored member is identical —
 //     returning the stored record unchanged with created false — and a mismatch
-//     otherwise. The replay is decided BEFORE the evidence below is read, so a
-//     restarted controller reads back what it committed even after a successor
-//     Host has overwritten the tombstone that admitted it.
-//  5. The Host registry's evidence: the observed epoch may not exceed the
-//     registry's committed epoch, and a graceful outcome requires a released
-//     tombstone at exactly the observed epoch (not_released / epoch otherwise).
+//     otherwise.
 //
-// The evidence read and the write are not one transaction — nothing here is —
-// so the release evidence is "as read at the check". A registration moving
-// after it cannot make a forced outcome read as graceful; it can only make a
-// graceful one describe a release a successor has since built on.
+// No refusal writes a termination row. The one write a refusal after step 2 can
+// make is inherited from the v0.10.0 registry: when the catalog exists but its
+// protocol witness is absent, step 2 re-binds that witness to the catalog's own
+// mode before a later step refuses.
 //
-// Any other error type a caller meets comes from the reads in step 2 and 5:
-// *KeyspaceError, *CatalogError and *RegistryError, each with its existing code
-// set.
+// Other error types a caller meets come from step 2: *KeyspaceError and
+// *CatalogError, each with its existing code set.
 func (s *Store) RecordPlacementTermination(ctx context.Context, req RecordPlacementTerminationRequest) (PlacementTerminationEntry, bool, error) {
 	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
 	if err != nil {
@@ -408,8 +364,6 @@ func (s *Store) RecordPlacementTermination(ctx context.Context, req RecordPlacem
 		ForcedReason: req.ForcedReason,
 		LeaseEpoch:   req.ObservedLeaseEpoch,
 		RecordedAt:   s.clock.Now(),
-		Checkpoint:   req.Checkpoint,
-		Objects:      req.Objects,
 	})
 	if err != nil {
 		return PlacementTerminationEntry{}, false, err
@@ -438,29 +392,22 @@ func (s *Store) RecordPlacementTermination(ctx context.Context, req RecordPlacem
 	if err != nil {
 		return PlacementTerminationEntry{}, false, err
 	}
-	if found {
-		stored := current.Termination
-		if stored.Generation > record.Generation {
-			return PlacementTerminationEntry{}, false, &TerminationError{
-				Code: TerminationErrorSuperseded, Field: "generation", Generation: stored.Generation,
-			}
-		}
-		if stored.Generation == record.Generation {
-			if field := terminationContentMismatch(stored, record); field != "" {
-				return PlacementTerminationEntry{}, false, &TerminationError{
-					Code: TerminationErrorMismatch, Field: field, Generation: stored.Generation,
-				}
-			}
-			return current, false, nil
-		}
-	}
-
-	if err := s.terminationEvidence(opCtx, scope, req.TenantID, req.SessionID, record); err != nil {
-		return PlacementTerminationEntry{}, false, err
-	}
-
 	if !found {
 		return s.createPlacementTermination(opCtx, scope, record, value)
+	}
+	stored := current.Termination
+	if stored.Generation > record.Generation {
+		return PlacementTerminationEntry{}, false, &TerminationError{
+			Code: TerminationErrorSuperseded, Field: "generation", Generation: stored.Generation,
+		}
+	}
+	if stored.Generation == record.Generation {
+		if field := terminationContentMismatch(stored, record); field != "" {
+			return PlacementTerminationEntry{}, false, &TerminationError{
+				Code: TerminationErrorMismatch, Field: field, Generation: stored.Generation,
+			}
+		}
+		return current, false, nil
 	}
 	return s.updatePlacementTermination(opCtx, scope, record, value, current.Revision)
 }
@@ -477,52 +424,9 @@ func terminationContentMismatch(stored, requested PlacementTermination) string {
 		return "forced_reason"
 	case stored.LeaseEpoch != requested.LeaseEpoch:
 		return "lease_epoch"
-	case stored.Checkpoint != requested.Checkpoint:
-		return "checkpoint"
-	case !slices.Equal(stored.Objects, requested.Objects):
-		return "objects"
 	default:
 		return ""
 	}
-}
-
-// terminationEvidence holds the observed epoch, and a graceful kind, to the
-// Host registry's committed state.
-//
-// It reads the RAW registration, released and expired ones included, because
-// a released tombstone is exactly the evidence a graceful outcome needs and
-// the public reader reports it as no route at all. It reads; it never writes.
-func (s *Store) terminationEvidence(
-	ctx context.Context,
-	scope sessionScope,
-	tenant sessionwire.TenantID,
-	session sessionwire.SessionID,
-	record PlacementTermination,
-) error {
-	registration, found, err := s.readHostRegistration(ctx, scope, tenant, session)
-	if err != nil {
-		return err
-	}
-	var committed uint64
-	if found {
-		committed = registration.Registration.LeaseEpoch
-	}
-	// Graceful first: its evidence is a STATE of the registration, and a
-	// caller asking for graceful where there has been no release at all is told
-	// that, rather than being told only that its epoch is wrong.
-	if record.Kind == PlacementTerminationGraceful {
-		if !found || !registration.Registration.released() {
-			return &TerminationError{Code: TerminationErrorNotReleased, Field: "route", Epoch: committed}
-		}
-		if committed != record.LeaseEpoch {
-			return &TerminationError{Code: TerminationErrorEpoch, Field: "observed_lease_epoch", Epoch: committed}
-		}
-		return nil
-	}
-	if record.LeaseEpoch > committed {
-		return &TerminationError{Code: TerminationErrorEpoch, Field: "observed_lease_epoch", Epoch: committed}
-	}
-	return nil
 }
 
 // GetPlacementTermination returns the outcome recorded for exactly one

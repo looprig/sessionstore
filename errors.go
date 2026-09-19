@@ -999,14 +999,11 @@ func catalogRecordFailure(failure versionedRecordFailure, field string, cause er
 //     caller-authored content. Field names the first differing member. It is
 //     not a race and a retry will not help: the outcome of that generation is
 //     decided.
-//   - Epoch — the observed lease epoch disagrees with the Host registry: above
-//     its committed epoch, or, for a graceful outcome, not exactly the epoch of
-//     its released tombstone. Epoch carries the registry's committed epoch
-//     (zero when there is no registration).
-//   - NotReleased — a graceful outcome was asked for and the registry holds no
-//     released tombstone: there is no registration, or its route is live or
-//     merely expired. Record the outcome as forced instead. Epoch carries the
-//     committed epoch, as for Epoch.
+//
+// There is deliberately no epoch code: the observed lease epoch is recorded as
+// given and checked against nothing, because the only thing it could be
+// checked against — the Host registry — proves nothing about how a workload
+// ended. See PlacementTermination.
 //
 // Conflict means a lost revision compare-and-swap or a lost create race and
 // nothing else — re-read and retry — which is the meaning it has for every
@@ -1014,21 +1011,19 @@ func catalogRecordFailure(failure versionedRecordFailure, field string, cause er
 type TerminationErrorCode string
 
 const (
-	TerminationErrorInvalid     TerminationErrorCode = "invalid"
-	TerminationErrorNotFound    TerminationErrorCode = "not_found"
-	TerminationErrorUnissued    TerminationErrorCode = "unissued"
-	TerminationErrorSuperseded  TerminationErrorCode = "superseded"
-	TerminationErrorMismatch    TerminationErrorCode = "mismatch"
-	TerminationErrorEpoch       TerminationErrorCode = "epoch"
-	TerminationErrorNotReleased TerminationErrorCode = "not_released"
-	TerminationErrorDeleted     TerminationErrorCode = "deleted"
-	TerminationErrorIdentity    TerminationErrorCode = "identity"
-	TerminationErrorConflict    TerminationErrorCode = "conflict"
-	TerminationErrorUnknown     TerminationErrorCode = "unknown"
-	TerminationErrorBackend     TerminationErrorCode = "backend"
-	TerminationErrorMalformed   TerminationErrorCode = "malformed"
-	TerminationErrorVersion     TerminationErrorCode = "version"
-	TerminationErrorTooLarge    TerminationErrorCode = "too_large"
+	TerminationErrorInvalid    TerminationErrorCode = "invalid"
+	TerminationErrorNotFound   TerminationErrorCode = "not_found"
+	TerminationErrorUnissued   TerminationErrorCode = "unissued"
+	TerminationErrorSuperseded TerminationErrorCode = "superseded"
+	TerminationErrorMismatch   TerminationErrorCode = "mismatch"
+	TerminationErrorDeleted    TerminationErrorCode = "deleted"
+	TerminationErrorIdentity   TerminationErrorCode = "identity"
+	TerminationErrorConflict   TerminationErrorCode = "conflict"
+	TerminationErrorUnknown    TerminationErrorCode = "unknown"
+	TerminationErrorBackend    TerminationErrorCode = "backend"
+	TerminationErrorMalformed  TerminationErrorCode = "malformed"
+	TerminationErrorVersion    TerminationErrorCode = "version"
+	TerminationErrorTooLarge   TerminationErrorCode = "too_large"
 )
 
 // TerminationError is a typed, redacted placement termination failure. Field
@@ -1036,13 +1031,12 @@ const (
 // or a record payload.
 //
 // Generation is populated for Unissued, Superseded, Mismatch and a read's
-// NotFound; Epoch for Epoch and NotReleased; Revision for Conflict. Each is the
-// value that is itself the answer to "what must my next attempt satisfy".
+// NotFound, and Revision for Conflict. Each is the value that is itself the
+// answer to "what must my next attempt satisfy".
 type TerminationError struct {
 	Code       TerminationErrorCode
 	Field      string
 	Generation uint64
-	Epoch      uint64
 	Revision   uint64
 	Cause      error
 }

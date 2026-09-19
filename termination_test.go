@@ -3,9 +3,11 @@ package sessionstore
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"slices"
+	"go/ast"
+	"go/token"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -20,8 +22,7 @@ import (
 
 // terminationRecordedAt is the instant the fixture store's clock reads when a
 // termination is committed. It is deliberately NOT the registry fixture's
-// observation instant, so a record stamped from a caller-visible or registry
-// instant instead of the store's clock would be caught.
+// observation instant, so a record stamped from any other instant is caught.
 var terminationRecordedAt = time.Date(2026, 9, 18, 9, 30, 0, 0, time.UTC)
 
 // terminationFixture opens a store whose fixture session exists as a legacy
@@ -38,6 +39,20 @@ func terminationFixture(t *testing.T) (*Store, *movableClock, *recordingOrdered)
 		t.Fatalf("CreateCatalogEntry: %v", err)
 	}
 	return store, clock, audit
+}
+
+// hostileTerminationFixture is terminationFixture over the package's one
+// non-conforming provider, inert until a test arms it.
+func hostileTerminationFixture(t *testing.T) (*Store, *hostileOrdered) {
+	t.Helper()
+	backend := memstore.New()
+	hostile := &hostileOrdered{OrderedIndex: backend.OrderedIndex}
+	backend.OrderedIndex = hostile
+	store := openStore(t, backend, WithClock(newMovableClock(registryObservedAt)))
+	if _, _, err := store.CreateCatalogEntry(context.Background(), testCreateRequest()); err != nil {
+		t.Fatal(err)
+	}
+	return store, hostile
 }
 
 // advanceDesiredGeneration applies n accepted desired-state writes, so the
@@ -61,10 +76,6 @@ func advanceDesiredGeneration(t *testing.T, store *Store, n int) {
 	}
 }
 
-func testRetainedCheckpoint() RetainedCheckpoint {
-	return RetainedCheckpoint{Sequence: pointerSequence, Reference: testObjectReference(ObjectKindWorkspaceCheckpoint, 1)}
-}
-
 func testForcedRequest(generation, observed uint64) RecordPlacementTerminationRequest {
 	return RecordPlacementTerminationRequest{
 		TenantID:           catalogTenant,
@@ -73,10 +84,6 @@ func testForcedRequest(generation, observed uint64) RecordPlacementTerminationRe
 		Kind:               PlacementTerminationForced,
 		ForcedReason:       PlacementForcedDrainTimeout,
 		ObservedLeaseEpoch: observed,
-		Checkpoint:         testRetainedCheckpoint(),
-		Objects: []sessionwire.ObjectReference{
-			testObjectReference(ObjectKindRuntimeCheckpoint, 2),
-		},
 	}
 }
 
@@ -95,12 +102,6 @@ func testPlacementTermination() PlacementTermination {
 		ForcedReason: PlacementForcedPlatformDeleted,
 		LeaseEpoch:   registryEpoch,
 		RecordedAt:   terminationRecordedAt,
-		Checkpoint:   testRetainedCheckpoint(),
-		// Canonical order is ascending ObjectID, which here is ascending kind.
-		Objects: []sessionwire.ObjectReference{
-			testObjectReference(ObjectKindContinuation, 3),
-			testObjectReference(ObjectKindRuntimeCheckpoint, 2),
-		},
 	}
 }
 
@@ -125,15 +126,6 @@ func mustRecordTermination(t *testing.T, store *Store, req RecordPlacementTermin
 	return entry
 }
 
-func assertSameTermination(t *testing.T, got, want PlacementTermination) {
-	t.Helper()
-	gotJSON, _ := json.Marshal(got)
-	wantJSON, _ := json.Marshal(want)
-	if !bytes.Equal(gotJSON, wantJSON) {
-		t.Fatalf("termination =\n %s\nwant\n %s", gotJSON, wantJSON)
-	}
-}
-
 // storedTermination reads the raw row, reporting absence as found=false.
 func storedTermination(t *testing.T, store *Store) (PlacementTerminationEntry, bool) {
 	t.Helper()
@@ -148,22 +140,27 @@ func storedTermination(t *testing.T, store *Store) (PlacementTerminationEntry, b
 	return entry, found
 }
 
+func getTermination(store *Store, generation uint64) (PlacementTerminationEntry, error) {
+	return store.GetPlacementTermination(context.Background(), GetPlacementTerminationRequest{
+		TenantID: catalogTenant, SessionID: catalogSession, Generation: generation,
+	})
+}
+
 // --- the stored record and its codec -------------------------------------------
 
 func TestPlacementTerminationRoundTripsThroughStoredBytes(t *testing.T) {
 	t.Parallel()
 
 	for name, record := range map[string]PlacementTermination{
-		"forced with everything": testPlacementTermination(),
-		"graceful with nothing retained": func() PlacementTermination {
+		"forced": testPlacementTermination(),
+		"graceful": func() PlacementTermination {
 			r := testPlacementTermination()
 			r.Kind, r.ForcedReason = PlacementTerminationGraceful, ""
-			r.Checkpoint, r.Objects = RetainedCheckpoint{}, nil
 			return r
 		}(),
-		"forced with no Host ever observed": func() PlacementTermination {
+		"forced with no Host observed": func() PlacementTermination {
 			r := testPlacementTermination()
-			r.ForcedReason, r.LeaseEpoch = PlacementForcedWorkloadTerminated, 0
+			r.ForcedReason, r.LeaseEpoch = PlacementForcedDrainRefused, 0
 			return r
 		}(),
 	} {
@@ -173,12 +170,16 @@ func TestPlacementTerminationRoundTripsThroughStoredBytes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("encodePlacementTermination: %v", err)
 			}
-			assertSameTermination(t, canonical, record)
+			if canonical != record {
+				t.Fatalf("canonical = %+v, want %+v", canonical, record)
+			}
 			decoded, err := decodePlacementTermination(encoded)
 			if err != nil {
 				t.Fatalf("decodePlacementTermination: %v", err)
 			}
-			assertSameTermination(t, decoded, record)
+			if decoded != record {
+				t.Fatalf("decoded = %+v, want %+v", decoded, record)
+			}
 			again, _, err := encodePlacementTermination(decoded)
 			if err != nil {
 				t.Fatal(err)
@@ -191,38 +192,125 @@ func TestPlacementTerminationRoundTripsThroughStoredBytes(t *testing.T) {
 }
 
 // TestPlacementTerminationStoredBytesArePinned is the durable wire format,
-// byte for byte. It is spelled by the private DTO; the exported struct has no
-// JSON tags and changing it cannot move these bytes.
+// byte for byte, for each shape a record can take. It is spelled by the private
+// DTO; the exported struct has no JSON tags and changing it cannot move these
+// bytes. The epoch-zero row is what catches an omitempty added to lease_epoch.
 func TestPlacementTerminationStoredBytesArePinned(t *testing.T) {
 	t.Parallel()
 
-	record := testPlacementTermination()
-	record.RecordedAt = time.Date(2026, 9, 18, 9, 30, 0, 0, time.FixedZone("x", 3600))
-	encoded, _, err := encodePlacementTermination(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := `{"record_version":1,"tenant_id":"tenant-a","session_id":"session-a","generation":3,` +
-		`"kind":"forced","forced_reason":"platform_deleted","lease_epoch":5,` +
-		`"recorded_at":"2026-09-18T08:30:00Z",` +
-		`"checkpoint":{"sequence":9,"reference":{"object_id":"` + testObjectReference(ObjectKindWorkspaceCheckpoint, 1).ObjectID + `"}},` +
-		`"objects":[{"object_id":"` + testObjectReference(ObjectKindContinuation, 3).ObjectID + `"},` +
-		`{"object_id":"` + testObjectReference(ObjectKindRuntimeCheckpoint, 2).ObjectID + `"}]}`
-	if string(encoded) != want {
-		t.Fatalf("stored bytes =\n%s\nwant\n%s", encoded, want)
-	}
-
+	forced := testPlacementTermination()
+	forced.RecordedAt = time.Date(2026, 9, 18, 9, 30, 0, 0, time.FixedZone("x", 3600))
 	graceful := testPlacementTermination()
 	graceful.Kind, graceful.ForcedReason = PlacementTerminationGraceful, ""
-	graceful.Checkpoint, graceful.Objects = RetainedCheckpoint{}, nil
-	encoded, _, err = encodePlacementTermination(graceful)
-	if err != nil {
-		t.Fatal(err)
+	unobserved := testPlacementTermination()
+	unobserved.ForcedReason, unobserved.LeaseEpoch = PlacementForcedDrainRefused, 0
+
+	for _, tc := range []struct {
+		name   string
+		record PlacementTermination
+		want   string
+	}{
+		{"forced", forced, `{"record_version":1,"tenant_id":"tenant-a","session_id":"session-a","generation":3,` +
+			`"kind":"forced","forced_reason":"platform_deleted","lease_epoch":5,"recorded_at":"2026-09-18T08:30:00Z"}`},
+		{"graceful", graceful, `{"record_version":1,"tenant_id":"tenant-a","session_id":"session-a","generation":3,` +
+			`"kind":"graceful","lease_epoch":5,"recorded_at":"2026-09-18T09:30:00Z"}`},
+		{"forced, no Host observed", unobserved, `{"record_version":1,"tenant_id":"tenant-a","session_id":"session-a","generation":3,` +
+			`"kind":"forced","forced_reason":"drain_refused","lease_epoch":0,"recorded_at":"2026-09-18T09:30:00Z"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			encoded, _, err := encodePlacementTermination(tc.record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(encoded) != tc.want {
+				t.Fatalf("stored bytes =\n%s\nwant\n%s", encoded, tc.want)
+			}
+		})
 	}
-	want = `{"record_version":1,"tenant_id":"tenant-a","session_id":"session-a","generation":3,` +
-		`"kind":"graceful","lease_epoch":5,"recorded_at":"2026-09-18T09:30:00Z"}`
-	if string(encoded) != want {
-		t.Fatalf("graceful stored bytes =\n%s\nwant\n%s", encoded, want)
+}
+
+// TestPlacementTerminationDurableNamesArePinned pins every durable or
+// consumer-pinned string by VALUE: the namespace a provider files the row
+// under, the two enums' spellings (frozen at record version 1) and every code
+// of the new vocabulary. A symbolic test would move with a renamed constant.
+func TestPlacementTerminationDurableNamesArePinned(t *testing.T) {
+	t.Parallel()
+
+	if placementTerminationNamespace != "sessionstore/terminations" {
+		t.Fatalf("namespace = %q", placementTerminationNamespace)
+	}
+	for got, want := range map[PlacementTerminationKind]string{
+		PlacementTerminationGraceful: "graceful",
+		PlacementTerminationForced:   "forced",
+	} {
+		if string(got) != want {
+			t.Errorf("kind %q, want exactly %q", got, want)
+		}
+	}
+	reasons := map[PlacementForcedReason]string{
+		PlacementForcedDrainTimeout:       "drain_timeout",
+		PlacementForcedDrainRefused:       "drain_refused",
+		PlacementForcedPlatformDeleted:    "platform_deleted",
+		PlacementForcedWorkloadTerminated: "workload_terminated",
+	}
+	for got, want := range reasons {
+		if string(got) != want {
+			t.Errorf("reason %q, want exactly %q", got, want)
+		}
+		if !got.known() {
+			t.Errorf("reason %q is not known", got)
+		}
+	}
+	if len(reasons) != 4 {
+		t.Fatalf("%d distinct reasons, want 4", len(reasons))
+	}
+	codes := map[TerminationErrorCode]string{
+		TerminationErrorInvalid:    "invalid",
+		TerminationErrorNotFound:   "not_found",
+		TerminationErrorUnissued:   "unissued",
+		TerminationErrorSuperseded: "superseded",
+		TerminationErrorMismatch:   "mismatch",
+		TerminationErrorDeleted:    "deleted",
+		TerminationErrorIdentity:   "identity",
+		TerminationErrorConflict:   "conflict",
+		TerminationErrorUnknown:    "unknown",
+		TerminationErrorBackend:    "backend",
+		TerminationErrorMalformed:  "malformed",
+		TerminationErrorVersion:    "version",
+		TerminationErrorTooLarge:   "too_large",
+	}
+	if len(codes) != 13 {
+		t.Fatalf("%d distinct codes, want 13", len(codes))
+	}
+	for got, want := range codes {
+		if string(got) != want {
+			t.Errorf("code %q, want exactly %q", got, want)
+		}
+	}
+	// And the declared set IS this set: a code added to errors.go without a
+	// line here fails, so growing the vocabulary is never silent.
+	declared := declaredStringConstantsOfType(t, "errors.go", "TerminationErrorCode")
+	pinned := make([]string, 0, len(codes))
+	for _, want := range codes {
+		pinned = append(pinned, want)
+	}
+	sort.Strings(pinned)
+	if strings.Join(declared, ",") != strings.Join(pinned, ",") {
+		t.Fatalf("declared codes %v, pinned %v", declared, pinned)
+	}
+}
+
+// TestPlacementTerminationBoundsArePinned: the exported bounds are API and
+// durable-format limits, and the refusal tests use them symbolically — so a
+// moved constant would move the tests with it.
+func TestPlacementTerminationBoundsArePinned(t *testing.T) {
+	t.Parallel()
+	if MaxPlacementTerminationRecordBytes != 4<<10 {
+		t.Fatalf("MaxPlacementTerminationRecordBytes = %d, want exactly %d", MaxPlacementTerminationRecordBytes, 4<<10)
+	}
+	if PlacementTerminationRecordVersion != 1 {
+		t.Fatalf("PlacementTerminationRecordVersion = %d, want exactly 1", PlacementTerminationRecordVersion)
 	}
 }
 
@@ -231,7 +319,6 @@ func TestPlacementTerminationStoredBytesArePinned(t *testing.T) {
 func TestPlacementTerminationCanonicalFormRefuses(t *testing.T) {
 	t.Parallel()
 
-	ref := func(kind ObjectKind, seed byte) sessionwire.ObjectReference { return testObjectReference(kind, seed) }
 	cases := []struct {
 		name   string
 		mutate func(*PlacementTermination)
@@ -249,32 +336,6 @@ func TestPlacementTerminationCanonicalFormRefuses(t *testing.T) {
 			r.Kind, r.ForcedReason, r.LeaseEpoch = PlacementTerminationGraceful, "", 0
 		}, "lease_epoch"},
 		{"unrepresentable instant", func(r *PlacementTermination) { r.RecordedAt = time.Time{} }, "recorded_at"},
-		{"checkpoint without a sequence", func(r *PlacementTermination) { r.Checkpoint.Sequence = 0 }, "checkpoint.sequence"},
-		{"checkpoint sequence without a reference", func(r *PlacementTermination) {
-			r.Checkpoint.Reference = sessionwire.ObjectReference{}
-		}, "checkpoint.reference"},
-		{"checkpoint of another kind", func(r *PlacementTermination) {
-			r.Checkpoint.Reference = ref(ObjectKindRuntimeCheckpoint, 1)
-		}, "checkpoint.reference"},
-		{"checkpoint unparseable", func(r *PlacementTermination) {
-			r.Checkpoint.Reference = sessionwire.ObjectReference{ObjectID: "not-an-object"}
-		}, "checkpoint.reference"},
-		{"object unparseable", func(r *PlacementTermination) {
-			r.Objects = []sessionwire.ObjectReference{{ObjectID: "not-an-object"}}
-		}, "objects"},
-		{"objects out of order", func(r *PlacementTermination) {
-			r.Objects = []sessionwire.ObjectReference{ref(ObjectKindRuntimeCheckpoint, 2), ref(ObjectKindContinuation, 3)}
-		}, "objects"},
-		{"objects duplicated", func(r *PlacementTermination) {
-			r.Objects = []sessionwire.ObjectReference{ref(ObjectKindContinuation, 3), ref(ObjectKindContinuation, 3)}
-		}, "objects"},
-		{"too many objects", func(r *PlacementTermination) {
-			r.Objects = nil
-			for seed := byte(1); seed <= MaxRetainedObjectReferences+1; seed++ {
-				r.Objects = append(r.Objects, ref(ObjectKindArtifact, seed))
-			}
-			sortObjectReferences(r.Objects)
-		}, "objects"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -287,33 +348,6 @@ func TestPlacementTerminationCanonicalFormRefuses(t *testing.T) {
 			}
 		})
 	}
-
-	// The positive controls for the two list boundaries: exactly the maximum,
-	// and an empty (non-nil) list, which canonicalizes to absent.
-	t.Run("control: the maximum number of objects", func(t *testing.T) {
-		t.Parallel()
-		record := testPlacementTermination()
-		record.Objects = nil
-		for seed := byte(1); seed <= MaxRetainedObjectReferences; seed++ {
-			record.Objects = append(record.Objects, ref(ObjectKindArtifact, seed))
-		}
-		sortObjectReferences(record.Objects)
-		if _, _, err := encodePlacementTermination(record); err != nil {
-			t.Fatalf("the maximum was refused: %v", err)
-		}
-	})
-	t.Run("control: an empty list is absent", func(t *testing.T) {
-		t.Parallel()
-		record := testPlacementTermination()
-		record.Objects = []sessionwire.ObjectReference{}
-		_, canonical, err := encodePlacementTermination(record)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if canonical.Objects != nil {
-			t.Fatalf("objects = %#v, want nil", canonical.Objects)
-		}
-	})
 }
 
 // TestPlacementTerminationDecodeFailsClosed holds the decoder to the shared
@@ -334,6 +368,7 @@ func TestPlacementTerminationDecodeFailsClosed(t *testing.T) {
 		{"empty", nil, TerminationErrorMalformed, "record"},
 		{"version", bytes.Replace(encoded, []byte(`"record_version":1`), []byte(`"record_version":2`), 1), TerminationErrorVersion, "record_version"},
 		{"unknown member", bytes.Replace(encoded, []byte(`{"record_version":1,`), []byte(`{"record_version":1,"surprise":1,`), 1), TerminationErrorMalformed, "record"},
+		{"a dropped v0.11 candidate member", bytes.Replace(encoded, []byte(`{"record_version":1,`), []byte(`{"record_version":1,"objects":[],`), 1), TerminationErrorMalformed, "record"},
 		{"too large", append(bytes.Repeat([]byte(" "), MaxPlacementTerminationRecordBytes), encoded...), TerminationErrorTooLarge, "record"},
 		{"invalid content", bytes.Replace(encoded, []byte(`"generation":3`), []byte(`"generation":0`), 1), TerminationErrorInvalid, "generation"},
 	}
@@ -350,8 +385,8 @@ func TestPlacementTerminationDecodeFailsClosed(t *testing.T) {
 
 // TestLargestAcceptablePlacementTerminationFitsTheBound builds the worst case
 // the validators accept — maximal identities made entirely of characters JSON
-// escapes six-fold, every reason at its longest, and the maximum number of
-// retained objects — and requires it to encode under the bound.
+// escapes six-fold, every number at its widest, the longest reason and the
+// widest instant — and requires it to encode under the bound.
 func TestLargestAcceptablePlacementTerminationFitsTheBound(t *testing.T) {
 	t.Parallel()
 
@@ -360,16 +395,13 @@ func TestLargestAcceptablePlacementTerminationFitsTheBound(t *testing.T) {
 	record.SessionID = sessionwire.SessionID(strings.Repeat("\x01", sessionwire.MaxIDBytes))
 	record.Generation = ^uint64(0)
 	record.LeaseEpoch = ^uint64(0)
-	record.Checkpoint.Sequence = ^uint64(0)
 	record.ForcedReason = PlacementForcedWorkloadTerminated
 	record.RecordedAt = time.Date(2026, 12, 31, 23, 59, 59, 999999999, time.UTC)
-	record.Objects = nil
-	for seed := byte(1); seed <= MaxRetainedObjectReferences; seed++ {
-		record.Objects = append(record.Objects, testObjectReference(ObjectKindWorkspaceCheckpoint, seed))
-	}
-	sortObjectReferences(record.Objects)
 	if err := record.TenantID.Validate(); err != nil {
 		t.Fatalf("the worst-case tenant is not one the validators accept: %v", err)
+	}
+	if err := record.SessionID.Validate(); err != nil {
+		t.Fatalf("the worst-case session is not one the validators accept: %v", err)
 	}
 	encoded, _, err := encodePlacementTermination(record)
 	if err != nil {
@@ -378,7 +410,7 @@ func TestLargestAcceptablePlacementTerminationFitsTheBound(t *testing.T) {
 	t.Logf("largest acceptable termination: %d of %d bytes", len(encoded), MaxPlacementTerminationRecordBytes)
 }
 
-// --- the write path: refusals --------------------------------------------------
+// --- the write path ----------------------------------------------------------
 
 // TestRecordPlacementTerminationRefusesAnInvalidRequestBeforeAnyProviderWork
 // holds every request-shape refusal to "nothing was read or written".
@@ -397,12 +429,6 @@ func TestRecordPlacementTerminationRefusesAnInvalidRequestBeforeAnyProviderWork(
 		{"graceful with no epoch", func(r *RecordPlacementTerminationRequest) {
 			r.Kind, r.ForcedReason, r.ObservedLeaseEpoch = PlacementTerminationGraceful, "", 0
 		}, "lease_epoch"},
-		{"checkpoint of another kind", func(r *RecordPlacementTerminationRequest) {
-			r.Checkpoint.Reference = testObjectReference(ObjectKindRuntimeCheckpoint, 1)
-		}, "checkpoint.reference"},
-		{"objects out of order", func(r *RecordPlacementTerminationRequest) {
-			r.Objects = []sessionwire.ObjectReference{testObjectReference(ObjectKindRuntimeCheckpoint, 2), testObjectReference(ObjectKindContinuation, 3)}
-		}, "objects"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -425,8 +451,7 @@ func TestRecordPlacementTerminationRefusesAnInvalidRequestBeforeAnyProviderWork(
 // TestRecordPlacementTerminationRefusesAnUnissuedGeneration is the rule that
 // makes the generation STORE-ISSUED. The generation becomes a monotonic bound
 // on every later writer, so a caller must not be able to name one the catalog
-// has not minted: a caller naming MaxUint64 would otherwise lock every real
-// generation out of this session for good.
+// has not minted.
 func TestRecordPlacementTerminationRefusesAnUnissuedGeneration(t *testing.T) {
 	t.Parallel()
 
@@ -464,11 +489,7 @@ func TestRecordPlacementTerminationIsMonotonicOnGeneration(t *testing.T) {
 	audit.reset()
 	for _, req := range []RecordPlacementTerminationRequest{
 		testForcedRequest(1, 0),
-		func() RecordPlacementTerminationRequest {
-			r := testForcedRequest(1, 0)
-			r.ForcedReason = PlacementForcedPlatformDeleted
-			return r
-		}(),
+		testGracefulRequest(1, registryEpoch),
 	} {
 		_, _, err := store.RecordPlacementTermination(context.Background(), req)
 		got := assertTerminationCode(t, err, TerminationErrorSuperseded)
@@ -480,10 +501,9 @@ func TestRecordPlacementTerminationIsMonotonicOnGeneration(t *testing.T) {
 		t.Fatalf("a lower generation wrote %d times", n)
 	}
 	after, found := storedTermination(t, store)
-	if !found || after.Revision != stored.Revision {
-		t.Fatalf("stored row moved: found %v revision %d, want %d", found, after.Revision, stored.Revision)
+	if !found || after.Revision != stored.Revision || after.Termination != stored.Termination {
+		t.Fatalf("stored row moved: %+v found %v, want %+v", after, found, stored)
 	}
-	assertSameTermination(t, after.Termination, stored.Termination)
 
 	// Control: a HIGHER generation replaces it.
 	next := mustRecordTermination(t, store, testForcedRequest(3, 0))
@@ -494,7 +514,8 @@ func TestRecordPlacementTerminationIsMonotonicOnGeneration(t *testing.T) {
 
 // TestRecordPlacementTerminationIsCreateOnlyPerGeneration: a repeat with
 // identical content is idempotent and writes nothing; a repeat with any
-// different caller-authored member is a mismatch that writes nothing.
+// different caller-authored member — in either direction — is a mismatch that
+// writes nothing.
 func TestRecordPlacementTerminationIsCreateOnlyPerGeneration(t *testing.T) {
 	t.Parallel()
 
@@ -505,22 +526,14 @@ func TestRecordPlacementTerminationIsCreateOnlyPerGeneration(t *testing.T) {
 	}{
 		{"kind", func(r *RecordPlacementTerminationRequest) { r.Kind, r.ForcedReason = PlacementTerminationGraceful, "" }, "kind"},
 		{"forced reason", func(r *RecordPlacementTerminationRequest) { r.ForcedReason = PlacementForcedPlatformDeleted }, "forced_reason"},
-		{"observed epoch", func(r *RecordPlacementTerminationRequest) { r.ObservedLeaseEpoch = registryStaleEpoch }, "lease_epoch"},
-		{"checkpoint", func(r *RecordPlacementTerminationRequest) { r.Checkpoint.Sequence++ }, "checkpoint"},
-		{"checkpoint dropped", func(r *RecordPlacementTerminationRequest) { r.Checkpoint = RetainedCheckpoint{} }, "checkpoint"},
-		{"objects", func(r *RecordPlacementTerminationRequest) { r.Objects = nil }, "objects"},
-		{"another object", func(r *RecordPlacementTerminationRequest) {
-			r.Objects = []sessionwire.ObjectReference{testObjectReference(ObjectKindRuntimeCheckpoint, 9)}
-		}, "objects"},
+		{"lower observed epoch", func(r *RecordPlacementTerminationRequest) { r.ObservedLeaseEpoch = registryStaleEpoch }, "lease_epoch"},
+		{"higher observed epoch", func(r *RecordPlacementTerminationRequest) { r.ObservedLeaseEpoch = registryNextEpoch }, "lease_epoch"},
+		{"no epoch observed", func(r *RecordPlacementTerminationRequest) { r.ObservedLeaseEpoch = 0 }, "lease_epoch"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			store, clock, audit := terminationFixture(t)
-			mustPutRegistration(t, store, testPutRegistrationRequest(registryEpoch))
-			if _, err := store.ClearHostRegistration(context.Background(), testClearRegistrationRequest(registryEpoch)); err != nil {
-				t.Fatal(err)
-			}
 			clock.set(terminationRecordedAt)
 			first := mustRecordTermination(t, store, testForcedRequest(1, registryEpoch))
 
@@ -532,10 +545,9 @@ func TestRecordPlacementTerminationIsCreateOnlyPerGeneration(t *testing.T) {
 			if err != nil || created {
 				t.Fatalf("identical replay = created %v, err %v; want an idempotent success", created, err)
 			}
-			if replay.Revision != first.Revision {
-				t.Fatalf("replay revision = %d, want %d", replay.Revision, first.Revision)
+			if replay != first {
+				t.Fatalf("replay = %+v, want exactly %+v", replay, first)
 			}
-			assertSameTermination(t, replay.Termination, first.Termination)
 			if n := audit.countOf("create") + audit.countOf("update"); n != 0 {
 				t.Fatalf("an identical replay wrote %d times", n)
 			}
@@ -551,187 +563,80 @@ func TestRecordPlacementTerminationIsCreateOnlyPerGeneration(t *testing.T) {
 				t.Fatalf("a mismatched repeat wrote %d times", n)
 			}
 			after, _ := storedTermination(t, store)
-			if after.Revision != first.Revision {
-				t.Fatalf("stored revision = %d, want %d", after.Revision, first.Revision)
+			if after != first {
+				t.Fatalf("stored = %+v, want exactly %+v", after, first)
 			}
 		})
 	}
 }
 
-// TestRecordPlacementTerminationReplayOutlivesItsEvidence: the replay check
-// runs BEFORE the release evidence is consulted, so a controller that restarts
-// after a new owner registered still reads back the graceful outcome it
-// committed rather than being told the release it recorded never happened.
-func TestRecordPlacementTerminationReplayOutlivesItsEvidence(t *testing.T) {
+// TestRecordPlacementTerminationKindIsTheCallersAssertion pins the contract
+// the ruling chose: the store records the kind and the observed epoch as
+// given and consults the Host registry for NEITHER. A graceful outcome is
+// accepted over no registration and over a live route; a forced one over an
+// epoch above anything the registry holds; and a graceful one after a
+// successor has registered — the honest case an evidence gate used to refuse.
+func TestRecordPlacementTerminationKindIsTheCallersAssertion(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		seed func(t *testing.T, store *Store)
+		req  RecordPlacementTerminationRequest
+	}{
+		{"graceful, no registration", func(*testing.T, *Store) {}, testGracefulRequest(1, registryEpoch)},
+		{"graceful, live route at the epoch", func(t *testing.T, s *Store) {
+			mustPutRegistration(t, s, testPutRegistrationRequest(registryEpoch))
+		}, testGracefulRequest(1, registryEpoch)},
+		{"graceful, successor registered above it", func(t *testing.T, s *Store) {
+			mustPutRegistration(t, s, testPutRegistrationRequest(registryEpoch))
+			if _, err := s.ClearHostRegistration(context.Background(), testClearRegistrationRequest(registryEpoch)); err != nil {
+				t.Fatal(err)
+			}
+			mustPutRegistration(t, s, testPutRegistrationRequest(registryNextEpoch))
+		}, testGracefulRequest(1, registryEpoch)},
+		{"forced, epoch above the registry", func(t *testing.T, s *Store) {
+			mustPutRegistration(t, s, testPutRegistrationRequest(registryEpoch))
+		}, testForcedRequest(1, registryNextEpoch)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			store, clock, _ := terminationFixture(t)
+			tc.seed(t, store)
+			clock.set(terminationRecordedAt)
+			entry, created, err := store.RecordPlacementTermination(context.Background(), tc.req)
+			if err != nil || !created {
+				t.Fatalf("created %v, err %v; want the assertion recorded", created, err)
+			}
+			want := PlacementTermination{
+				TenantID: catalogTenant, SessionID: catalogSession, Generation: 1,
+				Kind: tc.req.Kind, ForcedReason: tc.req.ForcedReason,
+				LeaseEpoch: tc.req.ObservedLeaseEpoch, RecordedAt: terminationRecordedAt,
+			}
+			if entry.Termination != want {
+				t.Fatalf("recorded %+v, want exactly %+v", entry.Termination, want)
+			}
+		})
+	}
+}
+
+// TestRecordPlacementTerminationAcceptsAPooledSession pins the F10 ruling: a
+// termination is accepted whatever placement the catalog desires NOW, because
+// the store cannot know what a past generation desired, and moving to pooled
+// is itself a spelling of "the dedicated workload should no longer exist".
+func TestRecordPlacementTerminationAcceptsAPooledSession(t *testing.T) {
 	t.Parallel()
 
 	store, _, _ := terminationFixture(t)
-	mustPutRegistration(t, store, testPutRegistrationRequest(registryEpoch))
-	if _, err := store.ClearHostRegistration(context.Background(), testClearRegistrationRequest(registryEpoch)); err != nil {
+	entry, err := store.GetCatalogEntry(context.Background(), GetCatalogEntryRequest{TenantID: catalogTenant, SessionID: catalogSession})
+	if err != nil {
 		t.Fatal(err)
 	}
-	first := mustRecordTermination(t, store, testGracefulRequest(1, registryEpoch))
-
-	// A successor takes the session: the tombstone is gone.
-	mustPutRegistration(t, store, testPutRegistrationRequest(registryNextEpoch))
-
-	replay, created, err := store.RecordPlacementTermination(context.Background(), testGracefulRequest(1, registryEpoch))
-	if err != nil || created || replay.Revision != first.Revision {
-		t.Fatalf("replay after the evidence moved = %+v created %v err %v", replay, created, err)
+	if entry.Record.DesiredPlacement != sessionwire.HostPlacementPooled {
+		t.Fatalf("fixture placement = %q, want pooled", entry.Record.DesiredPlacement)
 	}
-}
-
-// TestRecordPlacementTerminationGracefulRequiresReleaseEvidence is "never
-// report graceful release" made a store rule: graceful is admitted only when
-// the registry holds a released tombstone AT the observed epoch.
-func TestRecordPlacementTerminationGracefulRequiresReleaseEvidence(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name     string
-		seed     func(t *testing.T, store *Store)
-		observed uint64
-		code     TerminationErrorCode
-		field    string
-		epoch    uint64
-	}{
-		{
-			name:     "no registration at all",
-			seed:     func(*testing.T, *Store) {},
-			observed: registryEpoch,
-			code:     TerminationErrorNotReleased, field: "route", epoch: 0,
-		},
-		{
-			name: "a live route",
-			seed: func(t *testing.T, store *Store) {
-				mustPutRegistration(t, store, testPutRegistrationRequest(registryEpoch))
-			},
-			observed: registryEpoch,
-			code:     TerminationErrorNotReleased, field: "route", epoch: registryEpoch,
-		},
-		{
-			name: "an expired but unreleased route",
-			seed: func(t *testing.T, store *Store) {
-				mustPutRegistration(t, store, testPutRegistrationRequest(registryEpoch))
-				store.clock.(*movableClock).set(registryLapsedAt)
-			},
-			observed: registryEpoch,
-			code:     TerminationErrorNotReleased, field: "route", epoch: registryEpoch,
-		},
-		{
-			name: "released below the observation",
-			seed: func(t *testing.T, store *Store) {
-				mustPutRegistration(t, store, testPutRegistrationRequest(registryStaleEpoch))
-				if _, err := store.ClearHostRegistration(context.Background(), testClearRegistrationRequest(registryStaleEpoch)); err != nil {
-					t.Fatal(err)
-				}
-			},
-			observed: registryEpoch,
-			code:     TerminationErrorEpoch, field: "observed_lease_epoch", epoch: registryStaleEpoch,
-		},
-		{
-			name: "released above the observation",
-			seed: func(t *testing.T, store *Store) {
-				mustPutRegistration(t, store, testPutRegistrationRequest(registryNextEpoch))
-				if _, err := store.ClearHostRegistration(context.Background(), testClearRegistrationRequest(registryNextEpoch)); err != nil {
-					t.Fatal(err)
-				}
-			},
-			observed: registryEpoch,
-			code:     TerminationErrorEpoch, field: "observed_lease_epoch", epoch: registryNextEpoch,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			store, _, audit := terminationFixture(t)
-			tc.seed(t, store)
-			audit.reset()
-			_, _, err := store.RecordPlacementTermination(context.Background(), testGracefulRequest(1, tc.observed))
-			got := assertTerminationCode(t, err, tc.code)
-			if got.Field != tc.field || got.Epoch != tc.epoch {
-				t.Fatalf("refusal = %+v, want field %q carrying epoch %d", got, tc.field, tc.epoch)
-			}
-			if n := audit.countOf("create") + audit.countOf("update"); n != 0 {
-				t.Fatalf("a refused graceful wrote %d times", n)
-			}
-		})
-	}
-
-	t.Run("control: released at the observation", func(t *testing.T) {
-		t.Parallel()
-		store, clock, _ := terminationFixture(t)
-		mustPutRegistration(t, store, testPutRegistrationRequest(registryEpoch))
-		if _, err := store.ClearHostRegistration(context.Background(), testClearRegistrationRequest(registryEpoch)); err != nil {
-			t.Fatal(err)
-		}
-		clock.set(terminationRecordedAt)
-		entry, created, err := store.RecordPlacementTermination(context.Background(), testGracefulRequest(1, registryEpoch))
-		if err != nil || !created {
-			t.Fatalf("graceful over a released tombstone = created %v err %v", created, err)
-		}
-		want := PlacementTermination{
-			TenantID: catalogTenant, SessionID: catalogSession, Generation: 1,
-			Kind: PlacementTerminationGraceful, LeaseEpoch: registryEpoch,
-			RecordedAt: terminationRecordedAt, Checkpoint: testRetainedCheckpoint(),
-			Objects: []sessionwire.ObjectReference{testObjectReference(ObjectKindRuntimeCheckpoint, 2)},
-		}
-		assertSameTermination(t, entry.Termination, want)
-	})
-}
-
-// TestRecordPlacementTerminationForcedEpochIsBoundedByTheRegistry: a forced
-// outcome may record an observation at or below the registry's committed
-// epoch — an older generation's Host terminated after a successor registered
-// is ordinary — and never one above it, which would record an epoch no Host
-// ever registered at.
-func TestRecordPlacementTerminationForcedEpochIsBoundedByTheRegistry(t *testing.T) {
-	t.Parallel()
-
-	cases := []struct {
-		name     string
-		seed     func(t *testing.T, store *Store)
-		observed uint64
-		ok       bool
-		epoch    uint64
-	}{
-		{"no registration, nothing observed", func(*testing.T, *Store) {}, 0, true, 0},
-		{"no registration, an epoch asserted", func(*testing.T, *Store) {}, 1, false, 0},
-		{"live route, observed at it", func(t *testing.T, s *Store) {
-			mustPutRegistration(t, s, testPutRegistrationRequest(registryEpoch))
-		}, registryEpoch, true, 0},
-		{"live route, observed below it", func(t *testing.T, s *Store) {
-			mustPutRegistration(t, s, testPutRegistrationRequest(registryEpoch))
-		}, registryStaleEpoch, true, 0},
-		{"live route, observed above it", func(t *testing.T, s *Store) {
-			mustPutRegistration(t, s, testPutRegistrationRequest(registryEpoch))
-		}, registryEpoch + 1, false, registryEpoch},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			store, _, audit := terminationFixture(t)
-			tc.seed(t, store)
-			audit.reset()
-			entry, _, err := store.RecordPlacementTermination(context.Background(), testForcedRequest(1, tc.observed))
-			if tc.ok {
-				if err != nil {
-					t.Fatalf("forced observation %d refused: %v", tc.observed, err)
-				}
-				if entry.Termination.LeaseEpoch != tc.observed {
-					t.Fatalf("recorded epoch = %d, want exactly %d", entry.Termination.LeaseEpoch, tc.observed)
-				}
-				return
-			}
-			got := assertTerminationCode(t, err, TerminationErrorEpoch)
-			if got.Field != "observed_lease_epoch" || got.Epoch != tc.epoch {
-				t.Fatalf("refusal = %+v, want observed_lease_epoch carrying %d", got, tc.epoch)
-			}
-			if n := audit.countOf("create") + audit.countOf("update"); n != 0 {
-				t.Fatalf("a refused forced outcome wrote %d times", n)
-			}
-		})
-	}
+	mustRecordTermination(t, store, testForcedRequest(1, 0))
 }
 
 // TestRecordPlacementTerminationStampsTheStoreClock: RecordedAt is the
@@ -748,7 +653,30 @@ func TestRecordPlacementTerminationStampsTheStoreClock(t *testing.T) {
 	}
 }
 
-// --- protocol neutrality and existence ----------------------------------------
+// TestPlacementTerminationRowIsFiledNeverDueAndUnranked reads the committed
+// row straight from the provider and pins its filing independently of
+// placementTerminationDue, which the filing check itself reads.
+func TestPlacementTerminationRowIsFiledNeverDueAndUnranked(t *testing.T) {
+	t.Parallel()
+
+	store, _, _ := terminationFixture(t)
+	mustRecordTermination(t, store, testForcedRequest(1, 0))
+	scope, err := store.deriveSessionScope(catalogTenant, catalogSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := store.backend.OrderedIndex.Get(context.Background(), storage.OrderedID{
+		Namespace: "sessionstore/terminations", OrderingScope: scope.SessionNamespace, StableKey: storage.StableKey(catalogSession),
+	})
+	if err != nil {
+		t.Fatalf("the row is not at its pinned identity: %v", err)
+	}
+	if stored.Due != (storage.Due{}) || stored.Rank != (storage.Rank{}) || stored.RankingScope != scope.SessionNamespace {
+		t.Fatalf("filed due %+v rank %+v scope %q; want never due, unranked, session scope", stored.Due, stored.Rank, stored.RankingScope)
+	}
+}
+
+// --- protocol neutrality, existence, lifecycle ---------------------------------
 
 // TestPlacementTerminationIsProtocolModeNeutral holds the write to the
 // catalog-first rule the v0.10.0 registry follows: it serves a session under
@@ -778,9 +706,7 @@ func TestPlacementTerminationIsProtocolModeNeutral(t *testing.T) {
 			}
 			want := encodeWitness(1, scope.sessionWitness, []byte(tc.want))
 			mustRecordTermination(t, store, testForcedRequest(1, 0))
-			if _, err := store.GetPlacementTermination(context.Background(), GetPlacementTerminationRequest{
-				TenantID: catalogTenant, SessionID: catalogSession, Generation: 1,
-			}); err != nil {
+			if _, err := getTermination(store, 1); err != nil {
 				t.Fatalf("GetPlacementTermination: %v", err)
 			}
 			if got, found := protocolWitnessOf(t, store); !found || !bytes.Equal(got, want) {
@@ -790,8 +716,8 @@ func TestPlacementTerminationIsProtocolModeNeutral(t *testing.T) {
 	}
 }
 
-// TestPlacementTerminationRefusesASessionThatDoesNotExist: no refusal writes
-// anything, and in particular none mints a protocol pin.
+// TestPlacementTerminationRefusesASessionThatDoesNotExist: no refusal writes a
+// termination row, and none mints a protocol pin.
 func TestPlacementTerminationRefusesASessionThatDoesNotExist(t *testing.T) {
 	t.Parallel()
 
@@ -850,28 +776,73 @@ func TestPlacementTerminationRefusesASessionThatDoesNotExist(t *testing.T) {
 	})
 }
 
+// TestGetPlacementTerminationVerifiesTheSessionWitness: a read names a derived
+// row, and a derived name is never trusted alone. With the session witness
+// removed, Get is refused by the keyspace even though the row is readable.
+func TestGetPlacementTerminationVerifiesTheSessionWitness(t *testing.T) {
+	t.Parallel()
+
+	store, _, _ := terminationFixture(t)
+	mustRecordTermination(t, store, testForcedRequest(1, 0))
+	scope, err := store.deriveSessionScope(catalogTenant, catalogSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.keys.kv.Delete(context.Background(), scope.sessionWitnessKey); err != nil {
+		t.Fatalf("removing the witness: %v", err)
+	}
+	_, err = getTermination(store, 1)
+	var keyspace *KeyspaceError
+	if !errors.As(err, &keyspace) || keyspace.Code != KeyspaceBindingNotFound {
+		t.Fatalf("err = %v, want keyspace binding_not_found", err)
+	}
+}
+
+// TestPlacementTerminationOperationsRefuseAfterClose: both operations are
+// admitted through the store's lifecycle and refuse once it is closing.
+func TestPlacementTerminationOperationsRefuseAfterClose(t *testing.T) {
+	t.Parallel()
+
+	store, err := Open(context.Background(), memstore.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.CreateCatalogEntry(context.Background(), testCreateRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for name, op := range map[string]func() error{
+		"Record": func() error {
+			_, _, err := store.RecordPlacementTermination(context.Background(), testForcedRequest(1, 0))
+			return err
+		},
+		"Get": func() error { _, err := getTermination(store, 1); return err },
+	} {
+		var closed *StoreClosedError
+		if err := op(); !errors.As(err, &closed) {
+			t.Fatalf("%s after Close = %v, want *StoreClosedError", name, err)
+		}
+	}
+}
+
 // --- the read path ------------------------------------------------------------
 
 // TestGetPlacementTerminationAnswersByKey: found at exactly the stored
 // generation; superseded below it; not_found above it or with no row. The
 // two refusals carry the stored generation (zero meaning no row at all), and
-// neither hands back a record, so a superseded generation is never reported
-// with another generation's kind.
+// neither hands back a record.
 func TestGetPlacementTerminationAnswersByKey(t *testing.T) {
 	t.Parallel()
 
 	store, _, _ := terminationFixture(t)
-	get := func(generation uint64) (PlacementTerminationEntry, error) {
-		return store.GetPlacementTermination(context.Background(), GetPlacementTerminationRequest{
-			TenantID: catalogTenant, SessionID: catalogSession, Generation: generation,
-		})
-	}
 
-	_, err := get(1)
+	_, err := getTermination(store, 1)
 	if got := assertTerminationCode(t, err, TerminationErrorNotFound); got.Generation != 0 || got.Field != "record" {
 		t.Fatalf("empty refusal = %+v, want record carrying generation 0", got)
 	}
-	_, err = get(0)
+	_, err = getTermination(store, 0)
 	if got := assertTerminationCode(t, err, TerminationErrorInvalid); got.Field != "generation" {
 		t.Fatalf("zero generation refusal = %+v", got)
 	}
@@ -879,28 +850,48 @@ func TestGetPlacementTerminationAnswersByKey(t *testing.T) {
 	advanceDesiredGeneration(t, store, 2)
 	recorded := mustRecordTermination(t, store, testForcedRequest(2, 0))
 
-	entry, err := get(2)
+	entry, err := getTermination(store, 2)
 	if err != nil {
 		t.Fatalf("get(2): %v", err)
 	}
-	if entry.Revision != recorded.Revision {
-		t.Fatalf("revision = %d, want %d", entry.Revision, recorded.Revision)
+	if entry != recorded {
+		t.Fatalf("get(2) = %+v, want exactly %+v", entry, recorded)
 	}
-	assertSameTermination(t, entry.Termination, recorded.Termination)
 
-	entry, err = get(1)
+	entry, err = getTermination(store, 1)
 	if got := assertTerminationCode(t, err, TerminationErrorSuperseded); got.Generation != 2 || got.Field != "generation" {
 		t.Fatalf("lower refusal = %+v, want generation carrying 2", got)
 	}
-	if entry.Termination.Kind != "" || entry.Revision != 0 {
+	if entry != (PlacementTerminationEntry{}) {
 		t.Fatalf("a superseded read handed back %+v", entry)
 	}
-	entry, err = get(3)
+	entry, err = getTermination(store, 3)
 	if got := assertTerminationCode(t, err, TerminationErrorNotFound); got.Generation != 2 || got.Field != "generation" {
 		t.Fatalf("higher refusal = %+v, want generation carrying 2", got)
 	}
-	if entry.Termination.Kind != "" || entry.Revision != 0 {
+	if entry != (PlacementTerminationEntry{}) {
 		t.Fatalf("a not-found read handed back %+v", entry)
+	}
+}
+
+// TestPlacementTerminationCorruptRowFailsClosed: a row this reader cannot
+// decode is a high-water it cannot evaluate. Get reports the decode failure
+// rather than "nothing recorded", and Record refuses rather than creating
+// straight over it.
+func TestPlacementTerminationCorruptRowFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	store, hostile := hostileTerminationFixture(t)
+	mustRecordTermination(t, store, testForcedRequest(1, 0))
+	hostile.corruptGetsIn(placementTerminationNamespace, func([]byte) []byte { return []byte("{") })
+
+	_, err := getTermination(store, 1)
+	if got := assertTerminationCode(t, err, TerminationErrorMalformed); got.Field != "record" {
+		t.Fatalf("Get over a corrupt row = %+v, want malformed record", got)
+	}
+	_, _, err = store.RecordPlacementTermination(context.Background(), testForcedRequest(1, 0))
+	if got := assertTerminationCode(t, err, TerminationErrorMalformed); got.Field != "record" {
+		t.Fatalf("Record over a corrupt row = %+v, want malformed record", got)
 	}
 }
 
@@ -928,8 +919,6 @@ func TestRecordPlacementTerminationReportsALostRace(t *testing.T) {
 		var once sync.Once
 		audit.beforeCreate = func() {
 			once.Do(func() {
-				// The racer's row lands between this call's read and its
-				// create, written beneath the instrumented index.
 				if _, _, err := audit.OrderedIndex.Create(context.Background(), placementTerminationID(scope, catalogSession),
 					scope.SessionNamespace, value, storage.Rank{}, placementTerminationDue(racer)); err != nil {
 					t.Error(err)
@@ -1016,7 +1005,11 @@ func TestPlacementTerminationFilingIsHeldToTheRecord(t *testing.T) {
 	}{
 		{"provider tombstone", func(r storage.OrderedRecord) storage.OrderedRecord { r.Deleted = true; return r }, TerminationErrorDeleted, "record"},
 		{"stable key", func(r storage.OrderedRecord) storage.OrderedRecord { r.ID.StableKey = "session-b"; return r }, TerminationErrorIdentity, "session_id"},
-		{"ordering scope", func(r storage.OrderedRecord) storage.OrderedRecord { r.ID.OrderingScope += "x"; return r }, TerminationErrorIdentity, ""},
+		{"ordering scope", func(r storage.OrderedRecord) storage.OrderedRecord { r.ID.OrderingScope += "x"; return r }, TerminationErrorIdentity, "ordering_scope"},
+		{"due", func(r storage.OrderedRecord) storage.OrderedRecord {
+			r.Due = storage.Due{State: storage.DueAt, UnixMillis: 1}
+			return r
+		}, TerminationErrorIdentity, "due"},
 		{"rank", func(r storage.OrderedRecord) storage.OrderedRecord {
 			r.Rank = storage.Rank{Ranked: true, Value: 1}
 			return r
@@ -1025,13 +1018,16 @@ func TestPlacementTerminationFilingIsHeldToTheRecord(t *testing.T) {
 			r.Value = bytes.Replace(r.Value, []byte(`"session_id":"session-a"`), []byte(`"session_id":"session-b"`), 1)
 			return r
 		}, TerminationErrorIdentity, "record"},
+		{"another tenant's bytes", func(r storage.OrderedRecord) storage.OrderedRecord {
+			r.Value = bytes.Replace(r.Value, []byte(`"tenant_id":"tenant-a"`), []byte(`"tenant_id":"tenant-b"`), 1)
+			return r
+		}, TerminationErrorIdentity, "record"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			_, err := placementTerminationEntryFor(tc.mutate(stored), scope, catalogTenant, catalogSession)
-			got := assertTerminationCode(t, err, tc.code)
-			if tc.field != "" && got.Field != tc.field {
+			if got := assertTerminationCode(t, err, tc.code); got.Field != tc.field {
 				t.Fatalf("field = %q, want %q", got.Field, tc.field)
 			}
 		})
@@ -1039,27 +1035,50 @@ func TestPlacementTerminationFilingIsHeldToTheRecord(t *testing.T) {
 }
 
 // TestPlacementTerminationWriteVerifiesTheProviderReply: a create or update
-// reply carrying bytes other than those written is an identity failure.
+// reply carrying bytes other than those written, or filed elsewhere, is an
+// identity failure on both write paths.
 func TestPlacementTerminationWriteVerifiesTheProviderReply(t *testing.T) {
 	t.Parallel()
 
-	backend := memstore.New()
-	hostile := &hostileOrdered{OrderedIndex: backend.OrderedIndex}
-	backend.OrderedIndex = hostile
-	store := openStore(t, backend, WithClock(newMovableClock(registryObservedAt)))
-	if _, _, err := store.CreateCatalogEntry(context.Background(), testCreateRequest()); err != nil {
-		t.Fatal(err)
-	}
-	hostile.refileCreates(func(r storage.OrderedRecord) storage.OrderedRecord {
-		if r.ID.Namespace != placementTerminationNamespace {
-			return r
+	swapReason := func(r storage.OrderedRecord) storage.OrderedRecord {
+		if r.ID.Namespace == placementTerminationNamespace {
+			r.Value = bytes.Replace(r.Value, []byte(`"drain_timeout"`), []byte(`"platform_deleted"`), 1)
 		}
-		r.Value = bytes.Replace(r.Value, []byte(`"drain_timeout"`), []byte(`"platform_deleted"`), 1)
 		return r
-	})
-	_, _, err := store.RecordPlacementTermination(context.Background(), testForcedRequest(1, 0))
-	if got := assertTerminationCode(t, err, TerminationErrorIdentity); got.Field != "value" {
-		t.Fatalf("field = %q, want value", got.Field)
+	}
+	misfile := func(r storage.OrderedRecord) storage.OrderedRecord {
+		if r.ID.Namespace == placementTerminationNamespace {
+			r.Rank = storage.Rank{Ranked: true, Value: 1}
+		}
+		return r
+	}
+	cases := []struct {
+		name  string
+		arm   func(*hostileOrdered)
+		prime bool
+		field string
+	}{
+		{"create bytes", func(h *hostileOrdered) { h.refileCreates(swapReason) }, false, "value"},
+		{"create filing", func(h *hostileOrdered) { h.refileCreates(misfile) }, false, "rank"},
+		{"update bytes", func(h *hostileOrdered) { h.refileUpdates(swapReason) }, true, "value"},
+		{"update filing", func(h *hostileOrdered) { h.refileUpdates(misfile) }, true, "rank"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			store, hostile := hostileTerminationFixture(t)
+			generation := uint64(1)
+			if tc.prime {
+				advanceDesiredGeneration(t, store, 1)
+				mustRecordTermination(t, store, testForcedRequest(1, 0))
+				generation = 2
+			}
+			tc.arm(hostile)
+			_, _, err := store.RecordPlacementTermination(context.Background(), testForcedRequest(generation, 0))
+			if got := assertTerminationCode(t, err, TerminationErrorIdentity); got.Field != tc.field {
+				t.Fatalf("field = %q, want %q", got.Field, tc.field)
+			}
+		})
 	}
 }
 
@@ -1091,11 +1110,30 @@ func TestPlacementTerminationClassifiesProviderFailures(t *testing.T) {
 	}
 }
 
+// TestPlacementTerminationProviderReadFailureReachesTheCaller drives the
+// backend arm end to end: a failing read is backend, carrying its cause, from
+// both operations.
+func TestPlacementTerminationProviderReadFailureReachesTheCaller(t *testing.T) {
+	t.Parallel()
+
+	store, hostile := hostileTerminationFixture(t)
+	cause := errors.New("provider down")
+	hostile.failGetsIn(placementTerminationNamespace, cause)
+	_, err := getTermination(store, 1)
+	if got := assertTerminationCode(t, err, TerminationErrorBackend); got.Field != "get" || !errors.Is(err, cause) {
+		t.Fatalf("Get = %+v", got)
+	}
+	_, _, err = store.RecordPlacementTermination(context.Background(), testForcedRequest(1, 0))
+	if got := assertTerminationCode(t, err, TerminationErrorBackend); got.Field != "get" || !errors.Is(err, cause) {
+		t.Fatalf("Record = %+v", got)
+	}
+}
+
 // TestTerminationErrorRendersNoPayload keeps the message free of identities.
 func TestTerminationErrorRendersNoPayload(t *testing.T) {
 	t.Parallel()
-	err := &TerminationError{Code: TerminationErrorEpoch, Field: "observed_lease_epoch", Epoch: 5, Cause: errors.New("tenant-a")}
-	if got := err.Error(); got != "sessionstore: termination epoch (observed_lease_epoch)" {
+	err := &TerminationError{Code: TerminationErrorSuperseded, Field: "generation", Generation: 5, Cause: errors.New("tenant-a")}
+	if got := err.Error(); got != "sessionstore: termination superseded (generation)" {
 		t.Fatalf("Error() = %q", got)
 	}
 	if got := (&TerminationError{Code: TerminationErrorBackend}).Error(); got != "sessionstore: termination backend" {
@@ -1103,20 +1141,11 @@ func TestTerminationErrorRendersNoPayload(t *testing.T) {
 	}
 }
 
-// sortObjectReferences puts references in the canonical order a termination
-// stores them in. The record refuses any other order rather than sorting, so
-// two callers cannot disagree about whether a reordered list is the same
-// content.
-func sortObjectReferences(objects []sessionwire.ObjectReference) {
-	slices.SortFunc(objects, func(a, b sessionwire.ObjectReference) int { return strings.Compare(a.ObjectID, b.ObjectID) })
-}
-
 // TestDeletionDesireIsADesiredStateWriteNamingNoWorkload is the evidence for
 // v0.11.0 adding NO deletion-desire state: a Factory already expresses "this
 // dedicated session's workload should no longer exist" with an ordinary
 // desired-state write that names no workload, the generation advances, and the
-// intent a controller projects says exactly that — dedicated, zero workload —
-// with a generation the termination record can then be keyed by.
+// intent a controller projects says exactly that — dedicated, zero workload.
 func TestDeletionDesireIsADesiredStateWriteNamingNoWorkload(t *testing.T) {
 	t.Parallel()
 
@@ -1149,45 +1178,45 @@ func TestDeletionDesireIsADesiredStateWriteNamingNoWorkload(t *testing.T) {
 	if intent.Placement != sessionwire.HostPlacementDedicated || intent.Workload.PayloadVersion != "" || intent.Workload.Payload != nil {
 		t.Fatalf("intent = %+v, want dedicated with no workload", intent)
 	}
-	// The workload that generation superseded ends, and its outcome is recorded
-	// under the generation that created it.
 	entry := mustRecordTermination(t, store, testForcedRequest(wanted.Record.DesiredGeneration, 0))
 	if entry.Termination.Generation != wanted.Record.DesiredGeneration {
 		t.Fatalf("termination generation = %d", entry.Termination.Generation)
 	}
 }
 
-// TestPlacementTerminationBoundsArePinned: the two exported bounds are API and
-// durable-format limits, and the refusal tests use them symbolically — so a
-// moved constant would move the tests with it. This pins the values.
-func TestPlacementTerminationBoundsArePinned(t *testing.T) {
-	t.Parallel()
-	if MaxRetainedObjectReferences != 16 {
-		t.Fatalf("MaxRetainedObjectReferences = %d, want exactly 16", MaxRetainedObjectReferences)
+// declaredStringConstantsOfType returns, sorted, the string values of every
+// constant a production file declares with the named type.
+func declaredStringConstantsOfType(t *testing.T, filename, typeName string) []string {
+	t.Helper()
+	var values []string
+	for _, declaration := range parseProductionFile(t, filename).Decls {
+		generic, ok := declaration.(*ast.GenDecl)
+		if !ok || generic.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range generic.Specs {
+			value, ok := spec.(*ast.ValueSpec)
+			if !ok || len(value.Values) != 1 {
+				continue
+			}
+			ident, ok := value.Type.(*ast.Ident)
+			if !ok || ident.Name != typeName {
+				continue
+			}
+			literal, ok := value.Values[0].(*ast.BasicLit)
+			if !ok || literal.Kind != token.STRING {
+				t.Fatalf("%s constant %s is not a string literal", typeName, value.Names[0].Name)
+			}
+			text, err := strconv.Unquote(literal.Value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			values = append(values, text)
+		}
 	}
-	if MaxPlacementTerminationRecordBytes != 8<<10 {
-		t.Fatalf("MaxPlacementTerminationRecordBytes = %d, want exactly %d", MaxPlacementTerminationRecordBytes, 8<<10)
+	if len(values) == 0 {
+		t.Fatalf("vacuous: %s declares no %s constants", filename, typeName)
 	}
-	if PlacementTerminationRecordVersion != 1 {
-		t.Fatalf("PlacementTerminationRecordVersion = %d, want exactly 1", PlacementTerminationRecordVersion)
-	}
-}
-
-// TestPlacementTerminationCheckpointRefusalKeepsTheParseCause: the single
-// checkpoint-reference refusal carries the parse failure when there is one and
-// no cause when the reference parsed as another kind.
-func TestPlacementTerminationCheckpointRefusalKeepsTheParseCause(t *testing.T) {
-	t.Parallel()
-	record := testPlacementTermination()
-	record.Checkpoint.Reference = sessionwire.ObjectReference{ObjectID: "not-an-object"}
-	_, _, err := encodePlacementTermination(record)
-	var object *ObjectError
-	if got := assertTerminationCode(t, err, TerminationErrorInvalid); got.Field != "checkpoint.reference" || !errors.As(err, &object) {
-		t.Fatalf("unparseable refusal = %+v, want checkpoint.reference caused by *ObjectError", got)
-	}
-	record.Checkpoint.Reference = testObjectReference(ObjectKindRuntimeCheckpoint, 1)
-	_, _, err = encodePlacementTermination(record)
-	if got := assertTerminationCode(t, err, TerminationErrorInvalid); got.Field != "checkpoint.reference" || got.Cause != nil {
-		t.Fatalf("wrong-kind refusal = %+v, want checkpoint.reference with no cause", got)
-	}
+	sort.Strings(values)
+	return values
 }

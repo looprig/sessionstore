@@ -32,7 +32,6 @@ func FuzzPlacementTerminationCodec(f *testing.F) {
 	f.Add(seed(forced))
 	graceful := testPlacementTermination()
 	graceful.Kind, graceful.ForcedReason = PlacementTerminationGraceful, ""
-	graceful.Checkpoint, graceful.Objects = RetainedCheckpoint{}, nil
 	f.Add(seed(graceful))
 
 	var members map[string]json.RawMessage
@@ -45,9 +44,8 @@ func FuzzPlacementTerminationCodec(f *testing.F) {
 		func(m map[string]json.RawMessage) { m["generation"] = json.RawMessage("0") },
 		func(m map[string]json.RawMessage) { m["kind"] = json.RawMessage(`"graceful"`) },
 		func(m map[string]json.RawMessage) { delete(m, "forced_reason") },
-		func(m map[string]json.RawMessage) {
-			m["checkpoint"] = json.RawMessage(`{"sequence":0,"reference":{"object_id":""}}`)
-		},
+		func(m map[string]json.RawMessage) { m["lease_epoch"] = json.RawMessage("0") },
+		func(m map[string]json.RawMessage) { m["forced_reason"] = json.RawMessage(`"drain_refused"`) },
 		func(m map[string]json.RawMessage) { m["objects"] = json.RawMessage(`[]`) },
 		func(m map[string]json.RawMessage) { m["recorded_at"] = json.RawMessage(`"2026-09-18T09:30:00+02:00"`) },
 	} {
@@ -83,7 +81,7 @@ func FuzzPlacementTerminationCodec(f *testing.F) {
 		if !bytes.Equal(encoded, encodedAgain) {
 			t.Fatalf("canonicalization has no fixed point:\n%s\n%s", encoded, encodedAgain)
 		}
-		if terminationContentMismatch(canonical, again) != "" || !canonical.RecordedAt.Equal(again.RecordedAt) {
+		if canonical != again {
 			t.Fatal("a round trip changed the record's content")
 		}
 		if canonical.Generation == 0 {
