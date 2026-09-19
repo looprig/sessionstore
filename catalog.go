@@ -108,11 +108,31 @@ type CatalogRecord struct {
 	Residency        sessionwire.SessionResidency
 	DesiredPlacement sessionwire.HostPlacement
 
+	// LastJournalSeq, LastEventID and Checkpoint summarise the Host's journal
+	// and are written only by UpdateCatalogHostState, which a disposition
+	// record refuses. On a disposition record they are therefore always zero —
+	// the store holds no journal for such a session — and Status reports
+	// JournalTip zero even while WaitingGateID names an open gate. Zero there
+	// is NOT "no progress". ReadGates derives its page tip from the open gates
+	// instead; see ReadGates.
 	LastJournalSeq uint64
 	LastEventID    sessionwire.EventID
 	Checkpoint     CheckpointSummary
 	OpenGates      []sessionwire.GateProjection
 
+	// LeaseEpoch is the Host-owned high-water mark every Host-owned write is
+	// fenced against. WHICH COUNTER IT HOLDS DEPENDS ON THE PROTOCOL MODE:
+	//
+	//   - legacy: the journal-lease epoch the writing Host names;
+	//   - disposition: the RESIDENCY epoch of the *ResidencyGrant the last gate
+	//     write carried (since v0.12.0).
+	//
+	// The two counters are never compared with each other — a residency epoch
+	// is not a journal epoch — and they cannot meet in this member, because the
+	// mode is immutable and no path wrote LeaseEpoch on a disposition record
+	// before v0.12.0 (every Host-owned write refused one). Zero on a disposition
+	// record therefore means "no gate write has happened", never "journal epoch
+	// zero". TestDispositionCatalogLeaseEpochIsWrittenOnlyByGateWrites pins it.
 	LeaseEpoch            uint64
 	DesiredIdempotencyKey string
 	DesiredGeneration     uint64
@@ -604,10 +624,18 @@ func (s *Store) readCatalogEntry(
 	return catalogEntry(stored, tenant, session)
 }
 
-// hostEpochFence admits a Host-owned write against the record's committed
-// high-water epoch. Every path that writes Host-owned fields shares it —
-// UpdateCatalogHostState and both gate writes — so none of them can drift into
-// a different idea of when a Host has been superseded.
+// hostEpochFence admits a LEGACY Host-owned write against the record's
+// committed high-water epoch. Every path that writes Host-owned fields under a
+// caller-named journal-lease epoch shares it — UpdateCatalogHostState and the
+// legacy arm of both gate writes (see gateEpochFence) — so none of them can
+// drift into a different idea of when a Host has been superseded.
+//
+// It still refuses every disposition record, and for UpdateCatalogHostState
+// that refusal is the contract rather than a placeholder: that write carries a
+// journal tip, an event and a checkpoint summary, and the store holds no
+// journal for a disposition session against which any of them could mean
+// anything. The gate writes reach a disposition record only through
+// gateEpochFence's disposition arm, never through this function.
 //
 // It is epochFence in the catalog's vocabulary; the rule, and why an equal
 // epoch is admitted, are stated there.
@@ -615,9 +643,97 @@ func hostEpochFence(current CatalogRecord, epoch uint64) error {
 	if current.Binding.ProtocolMode == ProtocolModeDisposition {
 		return catalogInvalid("binding.protocol_mode", nil)
 	}
-	return epochFence(current.LeaseEpoch, epoch, func(committed uint64) error {
-		return &CatalogError{Code: CatalogErrorEpoch, Field: "lease_epoch", Epoch: committed}
-	})
+	return epochFence(current.LeaseEpoch, epoch, catalogEpochRefusal)
+}
+
+// catalogEpochRefusal names a superseded Host-owned write in the catalog's
+// vocabulary, carrying the committed mark as epochFence requires.
+func catalogEpochRefusal(committed uint64) error {
+	return &CatalogError{Code: CatalogErrorEpoch, Field: "lease_epoch", Epoch: committed}
+}
+
+// gateAuthority is what a gate write presents to the catalog's Host fence: a
+// caller-named journal-lease epoch on the legacy protocol, or a residency epoch
+// read off a store-issued *ResidencyGrant on the disposition protocol. Exactly
+// one of the two is set; gateAuthorityFor is the only constructor.
+type gateAuthority struct {
+	leaseEpoch uint64
+	residency  ResidencyEpoch
+	granted    bool
+}
+
+// gateAuthorityFor validates a gate request's authority before anything is
+// read, in the position the legacy LeaseEpoch check has always held, so a
+// legacy request is refused exactly where and how v0.11.0 refused it.
+//
+// A request carrying a grant must leave LeaseEpoch zero. The rule is stated
+// rather than resolved by precedence, because a precedence would be a second,
+// silent way for a caller-named number to reach the disposition ratchet if
+// the dispatch ever changed.
+func (s *Store) gateAuthorityFor(
+	tenant sessionwire.TenantID,
+	session sessionwire.SessionID,
+	leaseEpoch uint64,
+	grant *ResidencyGrant,
+) (gateAuthority, error) {
+	if grant == nil {
+		if leaseEpoch == 0 {
+			return gateAuthority{}, catalogErr(CatalogErrorInvalid, "lease_epoch", nil)
+		}
+		return gateAuthority{leaseEpoch: leaseEpoch}, nil
+	}
+	if leaseEpoch != 0 {
+		return gateAuthority{}, catalogInvalid("lease_epoch", nil)
+	}
+	residency, ok := grant.issuedFor(s, tenant, session)
+	// Zero is "no mark" to every fence in this package; a provider that issued
+	// it has produced nothing a ratchet can measure, so it is refused here with
+	// the grant rather than written.
+	if !ok || residency == 0 {
+		return gateAuthority{}, catalogInvalid("residency", nil)
+	}
+	return gateAuthority{residency: residency, granted: true}, nil
+}
+
+// gateEpochFence is the Host fence of both gate writes, dispatched by the
+// record's own immutable protocol mode, and it returns the mark the write
+// stores in CatalogRecord.LeaseEpoch.
+//
+//   - LEGACY records (unbound version 1, or bound to ProtocolModeLegacy) keep
+//     the caller-named journal-lease epoch and hostEpochFence, byte for byte.
+//     A grant is refused there as binding.protocol_mode: no grant can exist
+//     for a legacy session, because AcquireResidency refuses to issue one.
+//   - DISPOSITION records take ONLY the residency epoch read off a grant. A
+//     bare epoch is refused as residency, so a caller-named number never
+//     reaches the mark. The mark is a monotonic bound on every later gate
+//     writer that is unbounded above and outlives the gate that raised it —
+//     the case this package's rule says must be store-issued (see
+//     ClaimDispositionCommandRequest).
+//
+// The returned mark is at or above the committed one whenever the fence
+// admits, so storing it is the ratchet: the member only ever rises.
+func gateEpochFence(current CatalogRecord, auth gateAuthority) (uint64, error) {
+	if current.Binding.ProtocolMode != ProtocolModeDisposition {
+		if auth.granted {
+			return 0, catalogInvalid("binding.protocol_mode", nil)
+		}
+		return auth.leaseEpoch, hostEpochFence(current, auth.leaseEpoch)
+	}
+	if !auth.granted {
+		return 0, catalogInvalid("residency", nil)
+	}
+	mark := uint64(auth.residency)
+	return mark, epochFence(current.LeaseEpoch, mark, catalogEpochRefusal)
+}
+
+// holdsJournalTip reports whether the record's LastJournalSeq means anything.
+// On a disposition record it does not: the store keeps no journal for such a
+// session (OpenJournal binds legacy), nothing writes the member, and a check
+// against it would be unanswerable rather than true or false. OpenGate and
+// ReadGates both ask this one question, so the two cannot disagree about which
+// records carry a tip.
+func (r CatalogRecord) holdsJournalTip() bool {
+	return r.Binding.ProtocolMode != ProtocolModeDisposition
 }
 
 // epochFence is the fencing rule every Host-owned write in this package shares,

@@ -300,7 +300,14 @@ func TestSessionBindingRejectsLegacyInboxTransitionsBeforeEvidenceOrMutation(t *
 	}
 }
 
-func TestSessionBindingGateWritesRefuseDispositionMode(t *testing.T) {
+// Until v0.12.0 this test pinned that EVERY gate write on a disposition-bound
+// session was refused as binding.protocol_mode — a placeholder from the binding
+// prerequisite that outlived the disposition APIs it waited for. It now pins
+// the replacement: a disposition session's gates are writable under a
+// *ResidencyGrant, and ONLY under one. A caller-named LeaseEpoch — the only
+// authority v0.11.0 could express — is refused before it reaches the mark, and
+// the Host-state write stays refused as the protocol mode it cannot serve.
+func TestSessionBindingGateWritesOnDispositionModeRequireAGrant(t *testing.T) {
 	store := openTestStore(t)
 	ctx := context.Background()
 	req := testCreateRequest()
@@ -310,14 +317,31 @@ func TestSessionBindingGateWritesRefuseDispositionMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = store.OpenGate(ctx, OpenGateRequest{TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, Gate: testGate("gate-a", 1)})
-	if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != "binding.protocol_mode" {
-		t.Fatalf("gate mode error = %v", err)
+	if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != "residency" {
+		t.Fatalf("bare-epoch open error = %v", err)
 	}
 	_, err = store.ResolveGate(ctx, ResolveGateRequest{TenantID: catalogTenant, SessionID: catalogSession, LeaseEpoch: 1, GateID: "gate-a"})
+	if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != "residency" {
+		t.Fatalf("bare-epoch resolve error = %v", err)
+	}
+	_, err = store.UpdateCatalogHostState(ctx, testHostStateRequest(1))
 	if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != "binding.protocol_mode" {
-		t.Fatalf("gate mode error = %v", err)
+		t.Fatalf("host state error = %v", err)
 	}
 	assertCatalogUnchanged(t, store, entry)
+
+	grant := acquireTestResidency(t, store)
+	opened, err := store.OpenGate(ctx, OpenGateRequest{TenantID: catalogTenant, SessionID: catalogSession, Residency: grant, Gate: testGate("gate-a", 1)})
+	if err != nil {
+		t.Fatalf("granted open: %v", err)
+	}
+	if opened.Record.Binding != req.Binding || len(opened.Record.OpenGates) != 1 {
+		t.Fatalf("granted open wrote %+v", opened.Record)
+	}
+	resolved, err := store.ResolveGate(ctx, ResolveGateRequest{TenantID: catalogTenant, SessionID: catalogSession, Residency: grant, GateID: "gate-a"})
+	if err != nil || len(resolved.Record.OpenGates) != 0 {
+		t.Fatalf("granted resolve: %+v %v", resolved.Record.OpenGates, err)
+	}
 }
 
 func TestSessionBindingLegacyClearsCannotMutateMixedRows(t *testing.T) {

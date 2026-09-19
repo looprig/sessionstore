@@ -79,7 +79,8 @@ type ResidencyGrant struct {
 
 // residencyFor answers "is this grant one I issued, for this session, and not
 // handed back?" and yields its epoch. It is how ClaimDispositionCommand obtains
-// a residency epoch, and the ONLY way that edge obtains one.
+// a residency epoch, and the ONLY way that edge obtains one. The disposition
+// gate writes ask the same question through issuedFor.
 //
 // # What it checks, and why each conjunct is necessary rather than tidy
 //
@@ -108,16 +109,28 @@ type ResidencyGrant struct {
 // stale grant names a LOWER epoch, which the fence refuses on its own terms; it
 // cannot name a higher one. See ClaimDispositionCommandRequest.Residency.
 func (g *ResidencyGrant) residencyFor(s *Store, tenant sessionwire.TenantID, session sessionwire.SessionID) (ResidencyEpoch, error) {
-	if g == nil || g.store != s || g.tenant != tenant || g.session != session {
+	epoch, ok := g.issuedFor(s, tenant, session)
+	if !ok {
 		return 0, inboxInvalid("residency", nil)
+	}
+	return epoch, nil
+}
+
+// issuedFor is residencyFor's check with no vocabulary attached, so the inbox
+// and the catalog's gate writes ask the SAME question and each names a refusal
+// in its own error type. Everything residencyFor's doc says about what it does
+// and does not establish is a statement about this function.
+func (g *ResidencyGrant) issuedFor(s *Store, tenant sessionwire.TenantID, session sessionwire.SessionID) (ResidencyEpoch, bool) {
+	if g == nil || g.store != s || g.tenant != tenant || g.session != session {
+		return 0, false
 	}
 	g.mu.Lock()
 	released := g.released
 	g.mu.Unlock()
 	if released {
-		return 0, inboxInvalid("residency", nil)
+		return 0, false
 	}
-	return g.epoch, nil
+	return g.epoch, true
 }
 
 // AcquireResidency validates the actual immutable catalog binding and acquires

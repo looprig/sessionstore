@@ -101,7 +101,9 @@ retry behavior. Bound records use version 2, require every binding field, and
 reject unknown fields or modes. `ProtocolModeLegacy` selects the released
 single-store protocol. `ProtocolModeDisposition` selects the independent
 ownership and settlement protocol, whose command lifecycle is described under
-*The disposition command lifecycle* below. Existing Host/gate, journal and
+*The disposition command lifecycle* below. The gate writes `OpenGate` and
+`ResolveGate` serve a disposition session under a `*ResidencyGrant` (see
+*Disposition gates* below); `UpdateCatalogHostState`, the journal writer and the
 pointer writers still cannot execute that protocol, and the legacy inbox is
 unreachable to a disposition session. The Host registry is protocol-mode
 neutral: `PutHostRegistration` and `ClearHostRegistration` serve a session under
@@ -237,7 +239,8 @@ The returned `ResidencyGrant` exposes `Epoch() ResidencyEpoch`, `Lost()` and
 `Release(ctx)`. Never compare or substitute a residency epoch for a journal
 epoch. `ClaimDispositionCommand` takes the **grant itself** rather than its
 epoch, and `BeginDispositionAttempt` accepts only the epoch of the grant the
-claim was taken under. This module still implements no disposition
+claim was taken under. The disposition gate writes take the grant too
+(`OpenGateRequest.Residency`, `ResolveGateRequest.Residency`). This module still implements no disposition
 journal writer and no evidence reader; legacy `OpenJournal` continues to refuse
 disposition sessions.
 
@@ -780,6 +783,65 @@ deliberately leaves intents alone: it is the Host's re-projection path, not an
 incremental gate edit. A gate projected only that way is readable but has no
 deadline index, and a gate dropped that way leaves a remnant intent the due
 reader discards.
+
+### Disposition gates: a grant for the mark, no tip on the record
+
+Since v0.12.0 a disposition session's gates are writable, so a Host-resident
+session can publish an approval or AskUser gate and Factory can read it with
+`ReadGates`. Until then every gate write on such a session was refused as
+`binding.protocol_mode` — a placeholder from the binding prerequisite that the
+command (v0.6–v0.8) and registry (v0.10.0) paths had already outgrown.
+
+**Authority is a grant, never a number.** On a disposition session
+`OpenGateRequest` and `ResolveGateRequest` take `Residency`, the
+`*ResidencyGrant` `AcquireResidency` returned for that tenant and session, and
+`LeaseEpoch` must be zero. The grant's residency epoch is fenced against
+`CatalogRecord.LeaseEpoch` and becomes it, so the mark only ratchets upward and a
+stale grant is refused as `CatalogErrorEpoch` naming the committed mark. A bare
+`LeaseEpoch` on a disposition session is refused as `invalid (residency)` before
+it reaches the mark, and a grant for another session, another tenant or another
+Store — or one already released — as the same. The reason is the rule
+`ClaimDispositionCommand` states: the mark is a monotonic bound on every later
+gate writer, unbounded above and outliving the gate that raised it, so it must be
+a value the store issued. As there, the grant proves provenance, **not** a live
+lease. On a legacy session nothing changed: `LeaseEpoch` is the authority,
+`Residency` must be nil (a grant is refused as `binding.protocol_mode`), and
+every answer and stored byte matches v0.11.0
+(`TestLegacyGateWritesAreByteIdenticalToV0110`).
+
+**`CatalogRecord.LeaseEpoch` now holds two different counters by mode** — a
+journal-lease epoch on a legacy record, a **residency** epoch on a disposition
+record. They never meet: the mode is immutable, and before v0.12.0 no path
+wrote the member on a disposition record at all, because every Host-owned write
+refused one. That premise is the whole of why the reuse is safe, and
+`TestDispositionCatalogLeaseEpochIsWrittenOnlyByGateWrites` pins it. Zero on a
+disposition record means "no gate write yet", never "journal epoch zero".
+
+**The record holds no journal tip.** The store keeps no journal for a
+disposition session (`OpenJournal` binds legacy), so `LastJournalSeq`,
+`LastEventID` and `Checkpoint` stay zero on a disposition record and
+`UpdateCatalogHostState` stays refused. Two consequences:
+
+- `OpenGate` does **not** check `OpenedJournalSeq` against a tip there: the
+  check would be unanswerable rather than true or false. `OpenedJournalSeq` is
+  a position in the Host's own journal that the store only records — it must be
+  nonzero (Core), must differ from every other open gate's (**two open gates
+  with the same `OpenedJournalSeq` are refused** as `CatalogErrorSequence`), and
+  dies with the gate. It bounds no later caller, which is why a caller may
+  assert it.
+- `ReadGates` reports `JournalTip` as the **highest open gate's
+  `OpenedJournalSeq`**, or zero when none is open. It is a lower bound on the
+  Host's journal tip that the page itself vouches for; it satisfies Core's
+  `GatePage.Validate` by construction and falls when the highest gate resolves.
+  `ListDueGates` reads no tip.
+- `SessionStatus.JournalTip` (from `CatalogRecord.Status`) stays **zero** for a
+  Host session, even while `WaitingGateID` names an open gate. A consumer must
+  not read zero there as "no progress".
+
+**Crash window.** A Host that commits its runtime's gate-opened event and
+crashes before `OpenGate` leaves a runtime gate with no projection. That fails
+closed — nothing can answer a gate it cannot see — and the Host must
+re-publish the session's open gates when it restores the session.
 
 ### Gate continuation is deferred, and that is a decision rather than an omission
 

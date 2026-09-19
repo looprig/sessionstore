@@ -162,19 +162,51 @@ const maxGateIntentEncodedBytes = 4*6*sessionwire.MaxIDBytes + 512
 const _ = uint(MaxGateIntentBytes - maxGateIntentEncodedBytes)
 
 // OpenGateRequest projects one gate as publicly open and records its absolute
-// deadline. LeaseEpoch is the writing Host's grant epoch, compared against the
-// record's committed high-water mark exactly as UpdateCatalogHostState's is:
-// open gates are Host-owned state.
+// deadline. Open gates are Host-owned state, so the write is fenced against the
+// record's committed high-water mark, CatalogRecord.LeaseEpoch. What the caller
+// presents to that fence depends on the session's immutable protocol mode, and
+// exactly one of the two members below is set:
 //
-// Gate.OpenedJournalSeq must name an event at or below the record's durable
-// journal tip. A gate whose opening event is not yet durable is refused rather
-// than stored, because a reader would otherwise be handed a page claiming an
-// event its own tip says does not exist.
+//   - A LEGACY session takes LeaseEpoch, the writing Host's journal-lease
+//     epoch, compared exactly as UpdateCatalogHostState's is. Residency must be
+//     nil. This is v0.11.0's behaviour, unchanged.
+//   - A DISPOSITION session takes Residency, the *ResidencyGrant
+//     AcquireResidency returned for THIS tenant and session, and LeaseEpoch
+//     must be zero. The grant's residency epoch is fenced against the mark and
+//     becomes it. A caller cannot name that epoch: the mark is a monotonic bound
+//     on every later gate writer, so it must be one the store issued — the rule
+//     ClaimDispositionCommandRequest states. As there, the grant is proof of
+//     provenance and NOT of a live lease.
+//
+// On a legacy session Gate.OpenedJournalSeq must name an event at or below the
+// record's durable journal tip. A gate whose opening event is not yet durable
+// is refused rather than stored, because a reader would otherwise be handed a
+// page claiming an event its own tip says does not exist.
+//
+// On a disposition session that check is NOT made. The store holds no journal
+// for such a session, so the record has no tip to compare against, and the
+// check would be unanswerable rather than true or false. OpenedJournalSeq is a
+// position in the Host's own journal that the store only RECORDS: it
+// identifies the gate, must be nonzero (Core's rule), must differ from every
+// other open gate's, and dies with the gate. It bounds no later caller, which
+// is why a caller may assert it where it may not assert the residency mark. The
+// Host must name its journal's durable sequence for the gate's opening event.
+//
+// # Crash window (disposition)
+//
+// A Host that commits its runtime's gate-opened event and crashes before this
+// call leaves a runtime gate with no projection. That fails closed — no
+// consumer can answer a gate it cannot see — and the Host must re-publish the
+// session's open gates when it restores the session.
 type OpenGateRequest struct {
 	TenantID   sessionwire.TenantID
 	SessionID  sessionwire.SessionID
 	LeaseEpoch uint64
 	Gate       sessionwire.GateProjection
+
+	// Residency is the disposition path's authority; see the type's doc. Added
+	// in v0.12.0. Nil selects the legacy path.
+	Residency *ResidencyGrant
 }
 
 // ResolveGateRequest retires one open gate. It records only that the gate is no
@@ -183,11 +215,18 @@ type OpenGateRequest struct {
 //
 // It is idempotent, and it must be: a resolve interrupted between clearing the
 // projection and retiring the intent is completed by repeating it.
+//
+// Its authority is OpenGateRequest's: LeaseEpoch on a legacy session, a
+// *ResidencyGrant in Residency (with LeaseEpoch zero) on a disposition one.
 type ResolveGateRequest struct {
 	TenantID   sessionwire.TenantID
 	SessionID  sessionwire.SessionID
 	LeaseEpoch uint64
 	GateID     sessionwire.GateID
+
+	// Residency is the disposition path's authority; see OpenGateRequest.
+	// Added in v0.12.0. Nil selects the legacy path.
+	Residency *ResidencyGrant
 }
 
 // ReadGatesRequest reads one session's open public gates.
@@ -312,8 +351,9 @@ func (s *Store) OpenGate(ctx context.Context, req OpenGateRequest) (CatalogEntry
 	if err != nil {
 		return CatalogEntry{}, err
 	}
-	if req.LeaseEpoch == 0 {
-		return CatalogEntry{}, catalogErr(CatalogErrorInvalid, "lease_epoch", nil)
+	auth, err := s.gateAuthorityFor(req.TenantID, req.SessionID, req.LeaseEpoch, req.Residency)
+	if err != nil {
+		return CatalogEntry{}, err
 	}
 	// The gate is validated by the same canonicalizer the stored record uses,
 	// on a one-element list, so a gate accepted here is a gate the record can
@@ -362,14 +402,16 @@ func (s *Store) OpenGate(ctx context.Context, req OpenGateRequest) (CatalogEntry
 	if err != nil {
 		return CatalogEntry{}, err
 	}
-	if err := hostEpochFence(current.Record, req.LeaseEpoch); err != nil {
+	mark, err := gateEpochFence(current.Record, auth)
+	if err != nil {
 		return CatalogEntry{}, err
 	}
 	// The gate must name an event the journal has durably committed. This is
 	// the write-side half of "a reader validates its matching durable open
 	// event": a page core would refuse to publish is refused before it is
-	// stored.
-	if gate.OpenedJournalSeq > current.Record.LastJournalSeq {
+	// stored. Only a record that holds a tip can be asked; see OpenGateRequest
+	// for why a disposition record is not.
+	if current.Record.holdsJournalTip() && gate.OpenedJournalSeq > current.Record.LastJournalSeq {
 		return CatalogEntry{}, catalogErr(CatalogErrorSequence, "gate.opened_journal_seq", nil)
 	}
 	for _, open := range current.Record.OpenGates {
@@ -420,7 +462,7 @@ func (s *Store) OpenGate(ctx context.Context, req OpenGateRequest) (CatalogEntry
 		return CatalogEntry{}, err
 	}
 	next := current.Record
-	next.LeaseEpoch = req.LeaseEpoch
+	next.LeaseEpoch = mark
 	next.OpenGates = append(append([]sessionwire.GateProjection(nil), current.Record.OpenGates...), gate)
 	return s.writeCatalogRecord(opCtx, scope, next, current.Revision)
 }
@@ -438,8 +480,9 @@ func (s *Store) ResolveGate(ctx context.Context, req ResolveGateRequest) (Catalo
 	if err != nil {
 		return CatalogEntry{}, err
 	}
-	if req.LeaseEpoch == 0 {
-		return CatalogEntry{}, catalogErr(CatalogErrorInvalid, "lease_epoch", nil)
+	auth, err := s.gateAuthorityFor(req.TenantID, req.SessionID, req.LeaseEpoch, req.Residency)
+	if err != nil {
+		return CatalogEntry{}, err
 	}
 	if err := req.GateID.Validate(); err != nil {
 		return CatalogEntry{}, catalogErr(CatalogErrorInvalid, "gate_id", err)
@@ -455,14 +498,15 @@ func (s *Store) ResolveGate(ctx context.Context, req ResolveGateRequest) (Catalo
 	if err != nil {
 		return CatalogEntry{}, err
 	}
-	if err := hostEpochFence(current.Record, req.LeaseEpoch); err != nil {
+	mark, err := gateEpochFence(current.Record, auth)
+	if err != nil {
 		return CatalogEntry{}, err
 	}
 
 	entry := current
 	if remaining, found := withoutGate(current.Record.OpenGates, req.GateID); found {
 		next := current.Record
-		next.LeaseEpoch = req.LeaseEpoch
+		next.LeaseEpoch = mark
 		next.OpenGates = remaining
 		if entry, err = s.writeCatalogRecord(opCtx, scope, next, current.Revision); err != nil {
 			return CatalogEntry{}, err
@@ -479,6 +523,14 @@ func (s *Store) ResolveGate(ctx context.Context, req ResolveGateRequest) (Catalo
 
 // ReadGates returns one session's open public gates as core's bounded gate
 // page, in the record's canonical (opened_seq, gate_id) order.
+//
+// The page's JournalTip is the record's durable journal tip on a legacy
+// session. On a disposition session, whose record holds no tip, it is the
+// highest OpenedJournalSeq among the open gates, or zero when none is open:
+// a LOWER BOUND on the Host's journal tip that the page itself vouches for,
+// since each gate's opening event is one the Host recorded. It is not the
+// Host's tip, it falls when the highest gate resolves, and it satisfies Core's
+// GatePage.Validate by construction. See gatePageTip.
 //
 // It is one direct record read. The gates are already canonical when the record
 // decodes, so nothing here re-sorts them: the comparator lives in
@@ -500,7 +552,7 @@ func (s *Store) ReadGates(ctx context.Context, req ReadGatesRequest) (sessionwir
 		return sessionwire.GatePage{}, err
 	}
 	page := sessionwire.GatePage{
-		JournalTip:    entry.Record.LastJournalSeq,
+		JournalTip:    gatePageTip(entry.Record),
 		OpenGateCount: uint64(len(entry.Record.OpenGates)),
 		Gates:         append(make([]sessionwire.GateProjection, 0, len(entry.Record.OpenGates)), entry.Record.OpenGates...),
 	}
@@ -518,6 +570,20 @@ func (s *Store) ReadGates(ctx context.Context, req ReadGatesRequest) (sessionwir
 		return sessionwire.GatePage{}, catalogErr(CatalogErrorSequence, "gates", err)
 	}
 	return page, nil
+}
+
+// gatePageTip is the JournalTip a gate page reports for one record: its stored
+// tip where it holds one, and otherwise the highest open gate's opening
+// sequence. ReadGates is its only caller; ListDueGates reads no tip at all.
+func gatePageTip(record CatalogRecord) uint64 {
+	if record.holdsJournalTip() {
+		return record.LastJournalSeq
+	}
+	var tip uint64
+	for _, gate := range record.OpenGates {
+		tip = max(tip, gate.OpenedJournalSeq)
+	}
+	return tip
 }
 
 // ListDueGates returns one bounded page of gates whose absolute deadline has
