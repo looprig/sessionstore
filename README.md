@@ -282,6 +282,15 @@ closed. It names no provider: production code here cannot import one, so the
 capability is what is tested and the named versions above are stated from those
 modules' own sources.
 
+Carbon's filesystem composition is a product-specific exception to the raw
+fsstore rejection: it replaces the composite's `Blobs` field with its
+`boundedBlobs` adapter before calling `sessionstore.Open`. That adapter gives
+the consumer a pipe-backed reader whose `Read` is released by `Close`; a
+blocked underlying filesystem read may leave its pump goroutine and file
+descriptor alive until the provider returns. Carbon accepts that tradeoff for
+its local directory. Passing `fsstore.Backend()` directly to `Open` still
+fails; the adapter is not a capability of fsstore itself.
+
 ## Layout compatibility
 
 An unmarked backend is atomically initialized as the tenant-scoped `tenant-v1`
@@ -296,6 +305,35 @@ the composition root; do not rewrite a live backend's immutable layout marker.
 Provider ownership options take effect only after `Open` has successfully validated
 and bound the backend layout. If `Open` fails, the provider remains caller-owned and
 SessionStore does not close it.
+
+### Local filesystem backup and restore
+
+SessionStore defines logical names, not filesystem paths. With fsstore as the
+provider, one configured root contains `streams/` (journals), `leases/`
+(fenced epoch counters), `kv/` (including `sessionstore/layout` and collision
+witnesses), `blobs/` (immutable object bytes), and `ordered/` (catalog,
+commands, gates and other indexed records). The tenant-scoped names described
+below live inside those provider trees; `tenants/<token>` is a logical
+namespace, not a directory that can be backed up alone. The provider root
+and its access policy are owned by the composition root.
+
+For a filesystem backup, stop every Factory, Host, controller and other writer
+sharing that root, let them close their stores and provider, and capture **the
+entire root as one consistent snapshot**. Restore the whole snapshot to a new
+root while all writers are stopped, then reopen it with the same SessionStore
+layout, legacy-tenant (if any), and control-shard options. Keep the old root
+offline; independent writers against copied lease histories would defeat the
+meaning of their epoch counters. Verify the restored records and object reads
+before directing traffic to the new root. A live per-directory copy can mix
+journal, index, blob, marker and lease revisions and is not a supported
+SessionStore backup protocol. Files copied from fsstore do not constitute a
+migration to a different Storage provider.
+
+There is no SessionStore export/import tool, online layout conversion, or
+automatic repair of a partial filesystem restore. Changing tenant layout or
+control-shard count needs an offline migration into a newly initialized
+backend that moves the corresponding records and validates them; copying only
+the layout marker or changing an `Open` option is insufficient.
 
 ## Logical keys: every name is derived, and no derived name is trusted alone
 
@@ -443,6 +481,10 @@ that is really there, and it is the CALLER that decides to, having been told.
 Skipping silently inside the reader is what would have been unsafe.
 
 ## Objects first, references second
+
+The public `PutObject` and pointer APIs discussed here belong to SessionStore's
+legacy protocol. The object-first rules below do not provide a
+disposition-session object API or Carbon's `SessionObjectStore`.
 
 Every path in this package that stores bytes larger than a record persists and
 VERIFIES the object before writing anything that names it, and never the other
