@@ -311,3 +311,109 @@ func assertDueGate(t *testing.T, store *Store, gate sessionwire.GateID) {
 	}
 	t.Fatalf("gate %s is not due-indexed: gates %v remnants %+v", gate, dueGateIDs(due), due.Remnants)
 }
+
+// --- v0.13.0: a stale resolve against a successor's first gate write --------
+//
+// v0.12.0 booked this window: a predecessor's ResolveGate(G) that read the
+// record before the successor made any fencing write could retire the
+// deadline intent of the successor's in-flight OpenGate(G). The intent now
+// carries the residency that wrote it, so the successor's grant fences the
+// stale resolver at the intent itself; and a resolve retires in place, so an
+// intent the predecessor did retire first is revived by the successor.
+
+// Outcome 1 of the booked window: the predecessor did not raise the mark, so
+// the successor's gate was projected open with no deadline index.
+func TestAStaleResolveCannotRetireASuccessorsFirstGate(t *testing.T) {
+	f := newDispositionRetireFixture(t)
+	// The predecessor holds the mark, so its resolve below writes no catalog.
+	mustOpenDispositionGate(t, f.store, f.older, testGate("gate-x", 2))
+	var inner error
+	// The predecessor has READ the record; before it acts on it, the successor
+	// makes its first gate write — an open of G, all the way to the projection.
+	f.ordered.armGetPause(f.catalogID(t), func() {
+		_, inner = openDispositionGate(f.store, f.newer, testGate("gate-g", 7))
+	})
+	_, stale := resolveDispositionGate(f.store, f.older, "gate-g")
+	if inner != nil {
+		t.Fatalf("the successor's open inside the pause: %v", inner)
+	}
+	assertEpochRefusal(t, stale, f.newer.Epoch())
+	entry := mustGetCatalog(t, f.store)
+	if _, open := withoutGate(entry.Record.OpenGates, "gate-g"); !open {
+		t.Fatalf("the successor's gate is not projected: %+v", entry.Record.OpenGates)
+	}
+	assertDueGate(t, f.store, "gate-g")
+}
+
+// Outcome 2 of the booked window: the predecessor raised the mark, so the
+// successor's projection lost its CAS and every retry was refused as catalog
+// deleted (gate_intent).
+func TestAStaleResolveThatRaisesTheMarkDoesNotStrandTheSuccessorsGate(t *testing.T) {
+	f := newDispositionRetireFixture(t)
+	var inner error
+	// The successor has committed G's intent and read the record; the
+	// predecessor's resolve lands before its projection CAS.
+	catalog := f.catalogID(t)
+	var once sync.Once
+	f.ordered.arm(func(id storage.OrderedID) error {
+		if id == catalog {
+			once.Do(func() {
+				f.ordered.arm(nil)
+				_, inner = resolveDispositionGate(f.store, f.older, "gate-g")
+			})
+		}
+		return nil
+	})
+	_, first := openDispositionGate(f.store, f.newer, testGate("gate-g", 7))
+	assertCatalogCode(t, first, CatalogErrorConflict)
+	assertEpochRefusal(t, inner, f.newer.Epoch())
+	// The successor's retry publishes G, due-indexed.
+	mustOpenDispositionGate(t, f.store, f.newer, testGate("gate-g", 7))
+	assertDueGate(t, f.store, "gate-g")
+	// And the predecessor is now fenced at the record as well.
+	_, err := resolveDispositionGate(f.store, f.older, "gate-g")
+	assertEpochRefusal(t, err, f.newer.Epoch())
+}
+
+// The residual ordering no intent-level fence can refuse: the predecessor
+// retires ITS OWN intent for G before the successor touches it. The successor,
+// restoring a runtime that still holds G, re-publishes it over the retired row.
+func TestASuccessorRepublishesAGateAStaleResolveRetiredFirst(t *testing.T) {
+	f := newDispositionRetireFixture(t)
+	f.crashBeforeProjection(t, f.older, testGate("gate-g", 7))
+	mustResolveDispositionGate(t, f.store, f.older, "gate-g")
+	assertIntentRetired(t, f.store, "gate-g")
+
+	mustOpenDispositionGate(t, f.store, f.newer, testGate("gate-g", 7))
+	assertDueGate(t, f.store, "gate-g")
+	// The predecessor cannot reopen what it resolved.
+	_, err := openDispositionGate(f.store, f.older, testGate("gate-g", 7))
+	assertEpochRefusal(t, err, f.newer.Epoch())
+}
+
+// A resolve retires at its own residency, so the resolver's own replayed open
+// cannot resurrect the gate it resolved — the tombstone's guarantee — while a
+// successor can.
+func TestAResolvedDispositionGateIsNotReopenedByItsResolver(t *testing.T) {
+	f := newDispositionRetireFixture(t)
+	mustOpenDispositionGate(t, f.store, f.older, testGate("gate-g", 7))
+	mustResolveDispositionGate(t, f.store, f.newer, "gate-g")
+	assertIntentRetired(t, f.store, "gate-g")
+	if got := storedGateIntentRecord(t, f.store, "gate-g").Residency; got != f.newer.Epoch() {
+		t.Fatalf("the resolve retired at residency %d, want its own %d", got, f.newer.Epoch())
+	}
+	_, err := openDispositionGate(f.store, f.newer, testGate("gate-g", 7))
+	assertCatalogCode(t, err, CatalogErrorDeleted)
+	// A repeat resolve is still idempotent.
+	mustResolveDispositionGate(t, f.store, f.newer, "gate-g")
+}
+
+// gateIntentGone reports whether a gate's deadline intent no longer indexes
+// its deadline: tombstoned (legacy, or a v0.12.0 resolve) or retired in place
+// (disposition, from v0.13.0). A test asking "was this retired" must ask this,
+// not Deleted, which a retired-in-place row never is.
+func gateIntentGone(t *testing.T, store *Store, gate sessionwire.GateID) bool {
+	t.Helper()
+	stored := gateIntentRecord(t, store, gate)
+	return stored.Deleted || stored.Due.State != storage.DueAt
+}

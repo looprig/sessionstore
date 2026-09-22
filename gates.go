@@ -214,24 +214,28 @@ const _ = uint(MaxGateIntentBytes - maxGateIntentEncodedBytes)
 // consumer can answer a gate it cannot see — and the Host must re-publish the
 // session's open gates when it restores the session.
 //
-// # A window the fence does not close (disposition and legacy alike)
+// # A stale resolve and a successor's first gate write
 //
-// A resolve decides its fence when it READS the record, and a resolve of a gate
-// the record does not project then retires the gate's deadline intent. A
+// A resolve decides its catalog fence when it READS the record, so a
 // PREDECESSOR's ResolveGate(G) that reads before the successor has made any
-// fencing write can therefore tombstone the intent of the successor's
-// in-flight OpenGate(G). Two outcomes follow, both measured: if that resolve
-// itself raised the mark, the successor's projection CAS conflicts and every
-// retry is refused as catalog deleted (gate_intent), so G cannot be published
-// under that id; if it did not, G is projected open with no deadline index and
-// ListDueGates never reports it. In both, a tombstoned intent cannot be
-// re-published. The raised mark closes the window from the
-// successor's first successful gate write on (a predecessor reading after it
-// is refused before it reaches the intent); it cannot close the window for
-// that first write itself. A successor should make one fencing gate write —
-// re-publish, or a resolve — before opening a gate its predecessor may still
-// be resolving. Closing it outright needs the intent to carry the writer's
-// mark, which is a gate-intent record version and is booked, not done.
+// fencing write passes it. Until v0.13.0 it then tombstoned the intent of the
+// successor's in-flight OpenGate(G): the gate was either projected with no
+// deadline index or never publishable again under that id.
+//
+// On a DISPOSITION session that window is closed at the intent. OpenGate writes
+// the intent first, under the successor's residency (version 2, see
+// gateIntent.Residency), and a resolve whose grant is below the intent's
+// residency is refused as superseded rather than allowed to retire it. The one
+// ordering nothing can refuse — the predecessor retiring ITS OWN intent for G
+// before the successor touches it — retires the row in place, and the
+// successor's OpenGate revives it, because a strictly higher residency may.
+//
+// A LEGACY session keeps v0.12.0's behaviour, window included: its intents are
+// version 1 and carry no writer, and a legacy writer's epoch is caller-named, so
+// it could not be a bound on the row. There the raised mark closes the window
+// from the successor's first successful gate write on, and a successor should
+// make one fencing gate write before opening a gate its predecessor may still be
+// resolving.
 type OpenGateRequest struct {
 	TenantID   sessionwire.TenantID
 	SessionID  sessionwire.SessionID
@@ -517,11 +521,17 @@ func (s *Store) OpenGate(ctx context.Context, req OpenGateRequest) (CatalogEntry
 // ResolveGate clears one gate from the open projection and then retires its
 // deadline intent.
 //
-// Retiring is a tombstone rather than an erasure: the intent's bytes remain
-// readable for audit, its identity can never be reused to reopen the same gate,
-// and a tombstone is unranked and not due, so it leaves the due pages by the
-// provider's own contract rather than by a flag this package would have to
-// maintain.
+// On a LEGACY session retiring is a tombstone rather than an erasure: the
+// intent's bytes remain readable for audit, its identity can never be reused to
+// reopen the same gate, and a tombstone is unranked and not due, so it leaves
+// the due pages by the provider's own contract rather than by a flag this
+// package would have to maintain.
+//
+// On a DISPOSITION session the intent is retired IN PLACE at the resolver's
+// residency and fenced by the residency it carries; see
+// retireDispositionGateIntent. It leaves the due pages the same way, and only a
+// strictly higher residency — a successor restoring a runtime that still holds
+// the gate — can reopen it.
 func (s *Store) ResolveGate(ctx context.Context, req ResolveGateRequest) (CatalogEntry, error) {
 	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
 	if err != nil {
@@ -566,7 +576,12 @@ func (s *Store) ResolveGate(ctx context.Context, req ResolveGateRequest) (Catalo
 	// Not conditional on the gate having been projected. A resolve interrupted
 	// after the projection was cleared must still be able to retire the intent,
 	// and that retry arrives with nothing left in the projection to find.
-	if err := s.retireGateIntent(opCtx, scope, req.GateID); err != nil {
+	if current.Record.Binding.ProtocolMode == ProtocolModeDisposition {
+		err = s.retireDispositionGateIntent(opCtx, scope, req.GateID, ResidencyEpoch(mark))
+	} else {
+		err = s.retireGateIntent(opCtx, scope, req.GateID)
+	}
+	if err != nil {
 		return CatalogEntry{}, err
 	}
 	return entry, nil
@@ -1118,6 +1133,73 @@ func (s *Store) retireGateIntent(ctx context.Context, scope sessionScope, gate s
 		return nil
 	}
 	if _, err := s.backend.OrderedIndex.Delete(ctx, id, stored.Revision); err != nil {
+		return classifyCatalogOrderedError(err, "gate_intent")
+	}
+	return nil
+}
+
+// retireDispositionGateIntent is a disposition resolve's intent retirement, and
+// it is FENCED BY THE INTENT'S OWN RESIDENCY as well as by the catalog's mark.
+//
+// The catalog fence is decided when the resolve READS the record, so a
+// predecessor that read before its successor's first gate write passes it; the
+// successor's OpenGate commits its intent first, under its own residency, so
+// an intent above this resolver's grant is exactly that successor's, and the
+// resolver is refused as superseded (catalogEpochRefusal, the committed mark
+// being the intent's) rather than allowed to retire it. The compare-and-swap
+// closes the read-to-write interval: a successor that re-stamps the row between
+// the two moves its revision, and this write conflicts.
+//
+// The row is RETIRED IN PLACE at this resolver's residency, never tombstoned:
+// a resolver that retires its own intent before the successor touches it —
+// the one ordering no fence can refuse, because nothing yet distinguishes it
+// from an owner — leaves a row the successor may revive (see gateIntent.Retired),
+// while the resolver's own replayed open, at the same residency, is refused as a
+// tombstone would refuse it.
+//
+// An absent row, a tombstone, and a row already retired at this residency are
+// already retired, as retireGateIntent treats the first two.
+func (s *Store) retireDispositionGateIntent(
+	ctx context.Context,
+	scope sessionScope,
+	gate sessionwire.GateID,
+	residency ResidencyEpoch,
+) error {
+	id := gateIntentID(scope, gate)
+	stored, err := s.backend.OrderedIndex.Get(ctx, id)
+	if err != nil {
+		classified := classifyCatalogOrderedError(err, "gate_intent")
+		var catalog *CatalogError
+		if errors.As(classified, &catalog) && catalog.Code == CatalogErrorNotFound {
+			return nil
+		}
+		return classified
+	}
+	if stored.Deleted {
+		return nil
+	}
+	intent, err := gateIntentFor(stored)
+	if err != nil {
+		return err
+	}
+	if err := verifyGateIntentFiling(stored, intent, scope); err != nil {
+		return err
+	}
+	if intent.Residency > residency {
+		return catalogEpochRefusal(uint64(intent.Residency))
+	}
+	if intent.Retired && intent.Residency == residency {
+		return nil
+	}
+	intent.Version = GateIntentDispositionRecordVersion
+	intent.Residency = residency
+	intent.Retired = true
+	value, intent, err := encodeGateIntent(intent)
+	if err != nil {
+		return err
+	}
+	if _, err := s.backend.OrderedIndex.Update(
+		ctx, id, stored.Revision, value, storage.Rank{}, gateIntentDue(intent)); err != nil {
 		return classifyCatalogOrderedError(err, "gate_intent")
 	}
 	return nil
