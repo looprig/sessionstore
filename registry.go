@@ -462,6 +462,13 @@ type PutHostRegistrationRequest struct {
 	ExpiresAt  time.Time
 
 	Route HostRoute
+
+	// Residency is the store-issued authority for the registration's fence,
+	// added in v0.13.0: the *ResidencyGrant AcquireResidency returned for THIS
+	// tenant and session. When it is set LeaseEpoch must be zero and the stored
+	// LeaseEpoch is the grant's residency epoch; when it is nil the bare
+	// LeaseEpoch is used, as before. See PutHostRegistration.
+	Residency *ResidencyGrant
 }
 
 // GetHostRegistrationRequest reads one session's current route.
@@ -494,6 +501,23 @@ type ClearHostRegistrationRequest struct {
 // revision compare-and-swap, so a request that observed a stale epoch cannot
 // land after a successor's write.
 //
+// # Authority: a grant, or (deprecated for disposition sessions) a bare epoch
+//
+// From v0.13.0 a Host publishing the route of a DISPOSITION session should set
+// Residency to the *ResidencyGrant AcquireResidency returned, and leave
+// LeaseEpoch zero: the stored mark is then the grant's residency epoch, which is
+// one this store issued. That is this package's rule for a value that becomes a
+// monotonic bound on future callers, unbounded above, outliving the state that
+// carried it (see ClaimDispositionCommandRequest) — and it is the value every
+// released Host already publishes as a bare number. As everywhere, the grant is
+// proof of provenance and NOT of a live lease.
+//
+// The bare LeaseEpoch path is kept, unchanged, because every released Host up
+// to v0.5.0 publishes through it, and it is the only path a LEGACY session has
+// (AcquireResidency issues it no grant). Refusing a bare epoch on a disposition
+// session is a breaking change and is booked for when every Host passes a
+// grant; until then the paragraph below still describes that path.
+//
 // It is also the only operation that MINTS a fence. ClearHostRegistration
 // refuses to build one for a session no Host ever registered, because that
 // would turn an unverified caller-supplied epoch into a high-water mark; a
@@ -525,11 +549,15 @@ func (s *Store) PutHostRegistration(ctx context.Context, req PutHostRegistration
 	if err != nil {
 		return HostRegistrationEntry{}, err
 	}
+	epoch, err := s.registrationEpochFor(req)
+	if err != nil {
+		return HostRegistrationEntry{}, err
+	}
 	route := req.Route
 	record := HostRegistration{
 		TenantID:   req.TenantID,
 		SessionID:  req.SessionID,
-		LeaseEpoch: req.LeaseEpoch,
+		LeaseEpoch: epoch,
 		ObservedAt: req.ObservedAt,
 		ExpiresAt:  req.ExpiresAt,
 		Route:      &route,
@@ -579,10 +607,36 @@ func (s *Store) PutHostRegistration(ctx context.Context, req PutHostRegistration
 	if !found {
 		return s.createHostRegistration(opCtx, scope, record, value)
 	}
-	if err := registrationEpochFence(current.Registration, req.LeaseEpoch); err != nil {
+	if err := registrationEpochFence(current.Registration, record.LeaseEpoch); err != nil {
 		return HostRegistrationEntry{}, err
 	}
 	return s.updateHostRegistration(opCtx, scope, record, value, current.Revision)
+}
+
+// registrationEpochFor is the epoch a route publish is fenced at and stores:
+// the residency epoch read off a store-issued grant when the request carries
+// one, and otherwise the caller-named LeaseEpoch, v0.12.0's path.
+//
+// A grant must leave LeaseEpoch zero. The rule is stated rather than resolved
+// by precedence, for gateAuthorityFor's reason: a precedence would be a second,
+// silent way for a caller-named number to reach the fence. A grant this store
+// did not issue for this tenant and session, a released one, or one carrying
+// epoch zero is refused as residency, before any provider work.
+//
+// There is no protocol-mode check: AcquireResidency issues a grant only for a
+// disposition session, so a grant that passes issuedFor already names one.
+func (s *Store) registrationEpochFor(req PutHostRegistrationRequest) (uint64, error) {
+	if req.Residency == nil {
+		return req.LeaseEpoch, nil
+	}
+	if req.LeaseEpoch != 0 {
+		return 0, registryErr(RegistryErrorInvalid, "lease_epoch", nil)
+	}
+	residency, ok := req.Residency.issuedFor(s, req.TenantID, req.SessionID)
+	if !ok || residency == 0 {
+		return 0, registryErr(RegistryErrorInvalid, "residency", nil)
+	}
+	return uint64(residency), nil
 }
 
 // GetHostRegistration returns one session's route, and returns it only while it
