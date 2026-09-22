@@ -815,10 +815,12 @@ at all. An unreadable row is SKIPPED and counted rather than failing the page �
 failing on one would switch gate expiry off for every tenant in the shard until
 someone repaired the row by hand.
 
-Retiring an intent is a tombstone rather than an erasure: the record stays
-readable for audit, its identity can never be reused to reopen the same gate,
-and a tombstone is not due by the provider's own contract, so it leaves the due
-pages without this package maintaining a flag.
+On a legacy session, retiring an intent is a tombstone rather than an erasure:
+the record stays readable for audit, its identity can never be reused to reopen
+the same gate, and a tombstone is not due by the provider's own contract, so it
+leaves the due pages without this package maintaining a flag. On a disposition
+session (from v0.13.0) an intent is **retired in place** instead — see
+"Disposition gate intents" below.
 
 `UpdateCatalogHostState` still replaces the whole open-gate projection and
 deliberately leaves intents alone: it is the Host's re-projection path, not an
@@ -893,20 +895,53 @@ crashes before `OpenGate` leaves a runtime gate with no projection. That fails
 closed — nothing can answer a gate it cannot see — and the Host must
 re-publish the session's open gates when it restores the session.
 
-**A stale resolve can still tombstone a successor's first gate.** A resolve
-fences when it reads, and a resolve of a gate the record does not project then
-retires that gate's deadline intent. A predecessor's `ResolveGate(G)` that reads
-before the successor has made any fencing write can tombstone the intent of the
-successor's in-flight `OpenGate(G)`. If that resolve itself raised the mark,
-the successor's open then conflicts and every retry is refused as
-`catalog deleted (gate_intent)`; if it did not, G ends projected open with no
-deadline index and `ListDueGates` never reports it. Either way **a tombstoned
-intent cannot be re-published**. The same interleaving exists on legacy sessions and predates
-v0.12.0. The raised mark closes it from the successor's first successful gate
-write on, so a successor should make one fencing gate write before opening a
-gate its predecessor may still be resolving; closing it for that first write
-needs the intent to carry the writer's mark (a gate-intent record version) and
-is booked for a later release.
+**Disposition gate intents (v0.13.0): a writer, and retirement in place.**
+On a disposition session `OpenGate` writes the deadline intent as record
+**version 2** (`GateIntentDispositionRecordVersion`), which adds the residency
+epoch that last wrote it and a `retired` flag. Legacy sessions keep writing
+version 1, byte for byte. Two v0.12.0 defects close with it:
+
+- **`RetireGateDeadlineIntent` works on a disposition session.** v0.12.0
+  reserved the legacy protocol before deleting, so every disposition remnant was
+  refused `catalog conflict (binding.protocol_mode)` forever and stayed in the
+  due view (found by the tests lane, I1.3). The protocol is now read from the
+  session's witness: a legacy (or unwitnessed) session is retired exactly as
+  before; a disposition remnant is rewritten as a **retired, not-due** version-2
+  row, under a compare-and-swap onto the revision the sweep saw, keeping its
+  residency. The age window and the open-gate refusal are unchanged, and a
+  retired row is the repeat case.
+- **A stale resolve cannot retire a successor's first gate.** A resolve fences
+  when it reads the record, so a predecessor's `ResolveGate(G)` that read before
+  its successor's first gate write used to tombstone the intent of the
+  successor's in-flight `OpenGate(G)`: G ended projected with no deadline index,
+  or — when that resolve raised the mark — could never be published again
+  (`catalog deleted (gate_intent)`). A disposition resolve now refuses, as
+  `catalog epoch` naming the intent's residency, any intent written under a
+  higher residency than its grant, and retires in place at its own residency.
+
+**Why in place, not a tombstone.** A tombstone is terminal. A Host that crashes
+between its intent and its projection leaves the gate open in its runtime's
+journal, and its successor restores that runtime and re-publishes the gate; the
+same holds for the one ordering no fence can refuse — a predecessor retiring its
+**own** intent before its successor touches it. So a **strictly higher**
+residency may revive a retired intent (it becomes live and due again, with a
+fresh `RecordedAt`), while the writer that retired it, or any earlier one, is
+refused `catalog deleted (gate_intent)` as a tombstone would refuse it. A
+resolved gate therefore cannot be reopened by its resolver's replay. A
+version-1 intent written by v0.12.0 carries no writer and yields to any grant.
+
+**Legacy sessions keep the v0.12.0 window.** Their intents carry no writer — a
+legacy writer's epoch is caller-named, so it could not bound the row — and a
+successor should make one fencing gate write before opening a gate its
+predecessor may still be resolving.
+
+**Rollout order for version-2 intents: every `ListDueGates` caller first.** A
+reader older than v0.13.0 refuses a version-2 row, so a v0.12.0 Factory's due
+sweep counts a v0.13.0 Host's live disposition intents as `Unreadable` and never
+reports those gates' deadlines, and a v0.12.0 Host re-publishing over a row a
+v0.13.0 sweep retired fails closed on the decode. **Every Factory (every
+`ListDueGates` / `RetireGateDeadlineIntent` caller) must be on sessionstore ≥
+v0.13.0 before any Host on v0.13.0 opens a gate, and Hosts should move together.**
 
 **Rollout order: every `ReadGates` caller first.** A reader older than v0.12.0
 computes a disposition page's tip from the stored `LastJournalSeq`, which is
@@ -1275,6 +1310,19 @@ the catalog's `not_found`; neither refusal writes anything. Until v0.9.0 the
 registry bound `legacy` instead, on both paths, which refused every disposition
 session — the only shape `AcquireResidency` grants — and minted a legacy pin
 for any session nobody had created.
+
+**Authority (v0.13.0).** The stored lease epoch is a monotonic bound on every
+later writer of the row, so on a disposition session it should be store-issued:
+`PutHostRegistrationRequest.Residency` takes the `*ResidencyGrant`
+`AcquireResidency` returned, with `LeaseEpoch` left zero, and the stored epoch is
+the grant's residency epoch. A grant this store did not issue for the session,
+a released one, or one combined with a nonzero `LeaseEpoch` is refused
+`registry invalid` (`residency` / `lease_epoch`) before any write. The bare
+`LeaseEpoch` path is unchanged — every released Host (≤ v0.5.0) uses it and a
+legacy session has no grant — so a caller can still assert an arbitrary first
+epoch through it; refusing it on disposition sessions is a breaking change booked
+for when every Host passes a grant. `ClearHostRegistration` still takes a bare
+epoch: its caller (the controller's drain fence) holds no grant.
 
 The record has two halves with opposite lifetimes. The ROUTE expires, and a
 reader past `ExpiresAt` is refused it: the Host that published it may have died
