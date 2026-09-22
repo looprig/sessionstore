@@ -819,8 +819,8 @@ On a legacy session, retiring an intent is a tombstone rather than an erasure:
 the record stays readable for audit, its identity can never be reused to reopen
 the same gate, and a tombstone is not due by the provider's own contract, so it
 leaves the due pages without this package maintaining a flag. On a disposition
-session (from v0.13.0) an intent is **retired in place** instead — see
-"Disposition gate intents" below.
+session (from v0.13.0) the remnant sweep **parks** an intent instead — see
+"Disposition gate-intent remnants" below. A resolve tombstones on both.
 
 `UpdateCatalogHostState` still replaces the whole open-gate projection and
 deliberately leaves intents alone: it is the Host's re-projection path, not an
@@ -895,53 +895,45 @@ crashes before `OpenGate` leaves a runtime gate with no projection. That fails
 closed — nothing can answer a gate it cannot see — and the Host must
 re-publish the session's open gates when it restores the session.
 
-**Disposition gate intents (v0.13.0): a writer, and retirement in place.**
-On a disposition session `OpenGate` writes the deadline intent as record
-**version 2** (`GateIntentDispositionRecordVersion`), which adds the residency
-epoch that last wrote it and a `retired` flag. Legacy sessions keep writing
-version 1, byte for byte. Two v0.12.0 defects close with it:
+**Disposition gate-intent remnants (v0.13.0): parked, not tombstoned.**
+v0.12.0's `RetireGateDeadlineIntent` reserved the legacy protocol before it
+deleted, so every remnant on a disposition session was refused
+`catalog conflict (binding.protocol_mode)` forever and stayed in the due view
+(found by the tests lane, I1.3). The protocol is now read from the session's
+witness. A legacy (or unwitnessed) session is retired exactly as before. A
+disposition remnant is **parked**: its stored bytes — the unchanged version-1
+intent — are written back as they are, filed **not due**, by a compare-and-swap
+onto the revision the sweep observed. The age window and the open-gate refusal
+are unchanged, and a parked row is the repeat case.
 
-- **`RetireGateDeadlineIntent` works on a disposition session.** v0.12.0
-  reserved the legacy protocol before deleting, so every disposition remnant was
-  refused `catalog conflict (binding.protocol_mode)` forever and stayed in the
-  due view (found by the tests lane, I1.3). The protocol is now read from the
-  session's witness: a legacy (or unwitnessed) session is retired exactly as
-  before; a disposition remnant is rewritten as a **retired, not-due** version-2
-  row, under a compare-and-swap onto the revision the sweep saw, keeping its
-  residency. The age window and the open-gate refusal are unchanged, and a
-  retired row is the repeat case.
-- **A stale resolve cannot retire a successor's first gate.** A resolve fences
-  when it reads the record, so a predecessor's `ResolveGate(G)` that read before
-  its successor's first gate write used to tombstone the intent of the
-  successor's in-flight `OpenGate(G)`: G ended projected with no deadline index,
-  or — when that resolve raised the mark — could never be published again
-  (`catalog deleted (gate_intent)`). A disposition resolve now refuses, as
-  `catalog epoch` naming the intent's residency, any intent written under a
-  higher residency than its grant, and retires in place at its own residency.
+Why parked rather than tombstoned: a tombstone is terminal, and a Host that
+crashes between its intent and its projection leaves the gate open in its
+runtime's journal; the successor restoring that runtime re-publishes it. Any
+later `OpenGate` of the gate re-files a parked row as due (forward-only on
+`RecordedAt`), including a Host that retries after a partition longer than
+`MinGateIntentRemnantAge`. **No record version changed**: every released reader
+decodes a parked row, an old Factory's due sweep never sees it (it is not
+due), a v0.12.0 Host's re-open revives it and a v0.12.0 resolve tombstones it.
+There is no rollout order and no one-way upgrade.
 
-**Why in place, not a tombstone.** A tombstone is terminal. A Host that crashes
-between its intent and its projection leaves the gate open in its runtime's
-journal, and its successor restores that runtime and re-publishes the gate; the
-same holds for the one ordering no fence can refuse — a predecessor retiring its
-**own** intent before its successor touches it. So a **strictly higher**
-residency may revive a retired intent (it becomes live and due again, with a
-fresh `RecordedAt`), while the writer that retired it, or any earlier one, is
-refused `catalog deleted (gate_intent)` as a tombstone would refuse it. A
-resolved gate therefore cannot be reopened by its resolver's replay. A
-version-1 intent written by v0.12.0 carries no writer and yields to any grant.
-
-**Legacy sessions keep the v0.12.0 window.** Their intents carry no writer — a
-legacy writer's epoch is caller-named, so it could not bound the row — and a
-successor should make one fencing gate write before opening a gate its
-predecessor may still be resolving.
-
-**Rollout order for version-2 intents: every `ListDueGates` caller first.** A
-reader older than v0.13.0 refuses a version-2 row, so a v0.12.0 Factory's due
-sweep counts a v0.13.0 Host's live disposition intents as `Unreadable` and never
-reports those gates' deadlines, and a v0.12.0 Host re-publishing over a row a
-v0.13.0 sweep retired fails closed on the decode. **Every Factory (every
-`ListDueGates` / `RetireGateDeadlineIntent` caller) must be on sessionstore ≥
-v0.13.0 before any Host on v0.13.0 opens a gate, and Hosts should move together.**
+**A stale resolve and a successor's first gate write.** A resolve fences when it
+reads, and a resolve of a gate the record does not project then retires that
+gate's deadline intent. A predecessor's `ResolveGate(G)` that reads before the
+successor has made any fencing write can tombstone the intent of the
+successor's in-flight `OpenGate(G)`. If that resolve itself raised the mark,
+the successor's open then conflicts and every retry is refused as
+`catalog deleted (gate_intent)`; if it did not, G ends projected open with no
+deadline index. The raised mark closes the window from the successor's first
+successful gate write on. **For Host it is closed by ordering:** since host
+v0.4.0 the residency lease is not handed out until a `ResolveGate` of the
+reserved gate id `host.residency-fence` has succeeded under the fresh grant (a
+failed fence refuses the attach), and the gate publisher resolves it again
+before its first open, so the mark is raised before any successor `OpenGate`.
+**The limit remains for any other caller** that opens a gate under a new grant
+without a fencing gate write first, and on legacy sessions. Closing it for every
+caller needs the intent to carry the writer's mark — a gate-intent record
+version — which v0.13.0 deliberately did not ship, because it would be a
+one-way upgrade with a rollout order.
 
 **Rollout order: every `ReadGates` caller first.** A reader older than v0.12.0
 computes a disposition page's tip from the stored `LastJournalSeq`, which is
@@ -1317,7 +1309,9 @@ later writer of the row, so on a disposition session it should be store-issued:
 `AcquireResidency` returned, with `LeaseEpoch` left zero, and the stored epoch is
 the grant's residency epoch. A grant this store did not issue for the session,
 a released one, or one combined with a nonzero `LeaseEpoch` is refused
-`registry invalid` (`residency` / `lease_epoch`) before any write. The bare
+`registry invalid` (`residency` / `lease_epoch`) before any write — so a Host on
+this path publishes its final `releasing` observation before it releases the
+grant. The bare
 `LeaseEpoch` path is unchanged — every released Host (≤ v0.5.0) uses it and a
 legacy session has no grant — so a caller can still assert an arbitrary first
 epoch through it; refusing it on disposition sessions is a breaking change booked

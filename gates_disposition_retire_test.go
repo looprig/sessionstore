@@ -1,10 +1,12 @@
 package sessionstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
 	"github.com/looprig/storage"
@@ -19,13 +21,12 @@ import (
 // catalog conflict (binding.protocol_mode) forever and accumulated in the due
 // view (found by the tests lane, I1.3).
 //
-// A disposition remnant is RETIRED IN PLACE rather than tombstoned: the row
-// leaves the due view, and a SUCCESSOR — a strictly higher residency, whose
-// restored runtime is authoritative about which of its gates are open — may
-// re-publish the gate over it. A tombstone would make the gate's id
-// unpublishable for good, which is exactly what a successor restoring a
-// runtime whose predecessor crashed between the intent and the projection
-// would hit.
+// A disposition remnant is PARKED rather than tombstoned: its version-1 bytes
+// are left exactly as they are and only its filing moves to not-due, so it
+// leaves the due view of every reader version, and any later open of the gate
+// — a successor restoring a runtime whose predecessor crashed between the
+// intent and the projection, of any released version — re-files it as due. A
+// tombstone would make the gate's id unpublishable for good.
 
 // faultingOrdered fails the ordered writes a test arms it for.
 type faultingOrdered struct {
@@ -159,24 +160,21 @@ func (f dispositionRetireFixture) remnantAgeElapsed() {
 	f.clock.set(catalogActiveAt.Add(MinGateIntentRemnantAge))
 }
 
-// assertIntentRetired holds a retired row to what retirement promises: not due,
-// so no sweep ever reports it again.
+// assertIntentRetired holds a retired row to what retirement promises: it no
+// longer indexes a deadline — tombstoned, or parked (not due).
 func assertIntentRetired(t *testing.T, store *Store, gate sessionwire.GateID) {
 	t.Helper()
+	if !gateIntentGone(t, store, gate) {
+		t.Fatalf("intent %s is still due-indexed: %+v", gate, gateIntentRecord(t, store, gate))
+	}
+}
+
+// gateIntentGone reports whether a gate's deadline intent no longer indexes its
+// deadline: tombstoned, or parked by a disposition sweep.
+func gateIntentGone(t *testing.T, store *Store, gate sessionwire.GateID) bool {
+	t.Helper()
 	stored := gateIntentRecord(t, store, gate)
-	if stored.Deleted {
-		return
-	}
-	if stored.Due.State == storage.DueAt {
-		t.Fatalf("intent %s is still due-indexed: %+v", gate, stored)
-	}
-	intent, err := gateIntentFor(stored)
-	if err != nil {
-		t.Fatalf("gateIntentFor(%s): %v", gate, err)
-	}
-	if !intent.Retired {
-		t.Fatalf("intent %s is not due but not retired either: %+v", gate, intent)
-	}
+	return stored.Deleted || stored.Due.State != storage.DueAt
 }
 
 func assertDueViewEmpty(t *testing.T, store *Store) {
@@ -187,10 +185,23 @@ func assertDueViewEmpty(t *testing.T, store *Store) {
 	}
 }
 
-// The I1.3 trip-wire's case, in the store: a disposition remnant is retired.
-func TestRetireGateDeadlineIntentRetiresADispositionRemnant(t *testing.T) {
+func assertDueGate(t *testing.T, store *Store, gate sessionwire.GateID) {
+	t.Helper()
+	due := mustListDueGates(t, store, catalogDeadline)
+	for _, entry := range due.Gates {
+		if entry.Gate.GateID == gate {
+			return
+		}
+	}
+	t.Fatalf("gate %s is not due-indexed: gates %v remnants %+v", gate, dueGateIDs(due), due.Remnants)
+}
+
+// The I1.3 trip-wire's case, in the store: a disposition remnant is retired,
+// and retiring it changes no byte of it.
+func TestRetireGateDeadlineIntentParksADispositionRemnant(t *testing.T) {
 	f := newDispositionRetireFixture(t)
 	revision := f.crashBeforeProjection(t, f.older, testGate("gate-crashed", 3))
+	before := gateIntentRecord(t, f.store, "gate-crashed")
 	f.remnantAgeElapsed()
 
 	due := mustListDueGates(t, f.store, catalogDeadline)
@@ -200,39 +211,36 @@ func TestRetireGateDeadlineIntentRetiresADispositionRemnant(t *testing.T) {
 	if err := f.retire("gate-crashed", revision); err != nil {
 		t.Fatalf("RetireGateDeadlineIntent on a disposition remnant: %v", err)
 	}
-	assertIntentRetired(t, f.store, "gate-crashed")
+	after := gateIntentRecord(t, f.store, "gate-crashed")
+	if after.Deleted || after.Due != (storage.Due{}) {
+		t.Fatalf("the remnant was not parked: %+v", after)
+	}
+	// The bytes every released reader decodes, unchanged.
+	if !bytes.Equal(after.Value, before.Value) {
+		t.Fatalf("parking rewrote the intent:\nbefore %s\nafter  %s", before.Value, after.Value)
+	}
+	if _, err := decodeGateIntent(after.Value); err != nil {
+		t.Fatalf("a parked intent no longer decodes: %v", err)
+	}
 	assertDueViewEmpty(t, f.store)
-	// A repeat is ordinary: the reply may have been lost.
+	// A repeat is ordinary: the reply may have been lost. It writes nothing.
 	if err := f.retire("gate-crashed", revision); err != nil {
 		t.Fatalf("repeat retirement: %v", err)
+	}
+	if again := gateIntentRecord(t, f.store, "gate-crashed"); again.Revision != after.Revision {
+		t.Fatalf("a repeat retirement wrote: revision %d -> %d", after.Revision, again.Revision)
 	}
 	// Retirement mints no legacy pin and changes no catalog member.
 	if entry := mustGetCatalog(t, f.store); entry.Record.Binding.ProtocolMode != ProtocolModeDisposition {
 		t.Fatalf("binding = %+v", entry.Record.Binding)
 	}
-	if err := f.store.bindProtocolMode(context.Background(), mustScope(t, f.store), ProtocolModeDisposition); err != nil {
-		t.Fatalf("the session is no longer disposition-pinned: %v", err)
+	if mode, bound, err := f.store.boundProtocolMode(context.Background(), mustScope(t, f.store)); err != nil || !bound || mode != ProtocolModeDisposition {
+		t.Fatalf("protocol witness = %q bound=%v err=%v, want disposition", mode, bound, err)
 	}
-}
-
-// v0.12.0 wrote version-1 intents on disposition sessions. Those remnants are
-// retirable too.
-func TestRetireGateDeadlineIntentRetiresAVersionOneDispositionRemnant(t *testing.T) {
-	f := newDispositionRetireFixture(t)
-	revision := seedRemnantOfACrashBeforeGateOpened(t, f.store, "gate-v1")
-	f.remnantAgeElapsed()
-	if err := f.retire("gate-v1", revision); err != nil {
-		t.Fatalf("RetireGateDeadlineIntent on a v0.12.0 remnant: %v", err)
-	}
-	assertIntentRetired(t, f.store, "gate-v1")
-	// An intent whose writer is unknown yields to any grant.
-	// seedRemnantOfACrashBeforeGateOpened files its intent at sequence 5.
-	mustOpenDispositionGate(t, f.store, f.older, testGate("gate-v1", 5))
-	assertDueGate(t, f.store, "gate-v1")
 }
 
 // The retirement's own refusals hold on a disposition session: an open gate
-// and a young intent are never retired.
+// and a young intent are never parked.
 func TestDispositionRetirementRefusesAnOpenGateAndAYoungIntent(t *testing.T) {
 	f := newDispositionRetireFixture(t)
 	mustOpenDispositionGate(t, f.store, f.older, testGate("gate-open", 3))
@@ -247,32 +255,81 @@ func TestDispositionRetirementRefusesAnOpenGateAndAYoungIntent(t *testing.T) {
 	}
 }
 
-// A successor restoring a runtime whose predecessor crashed between the intent
-// and the projection re-publishes the gate over the retired remnant, and the
-// gate is due-indexed again. The predecessor itself cannot.
-func TestASuccessorRepublishesAGateOverARetiredRemnant(t *testing.T) {
+// Any later open of the gate re-files a parked remnant as due — a successor
+// restoring the runtime, or the same Host retrying after a long partition.
+func TestAnOpenRevivesAParkedRemnant(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		by   func(f dispositionRetireFixture) *ResidencyGrant
+	}{
+		{"the successor", func(f dispositionRetireFixture) *ResidencyGrant { return f.newer }},
+		{"the same residency", func(f dispositionRetireFixture) *ResidencyGrant { return f.older }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newDispositionRetireFixture(t)
+			gate := testGate("gate-restored", 3)
+			revision := f.crashBeforeProjection(t, f.older, gate)
+			f.remnantAgeElapsed()
+			if err := f.retire("gate-restored", revision); err != nil {
+				t.Fatalf("RetireGateDeadlineIntent: %v", err)
+			}
+			entry := mustOpenDispositionGate(t, f.store, tt.by(f), gate)
+			if len(entry.Record.OpenGates) != 1 || entry.Record.OpenGates[0].GateID != "gate-restored" {
+				t.Fatalf("the re-publish is not projected: %+v", entry.Record.OpenGates)
+			}
+			assertDueGate(t, f.store, "gate-restored")
+			if got := storedGateIntentRecord(t, f.store, "gate-restored").RecordedAt; !got.Equal(f.clock.Now()) {
+				t.Fatalf("revival kept the parked attempt's window: recorded at %v", got)
+			}
+		})
+	}
+}
+
+// Re-filing does not depend on the stored instant moving: an open whose clock
+// reading is not later still revives the row, and still does not retract the
+// instant.
+func TestAnOpenRevivesAParkedRemnantWithoutRetractingItsInstant(t *testing.T) {
 	f := newDispositionRetireFixture(t)
-	gate := testGate("gate-restored", 3)
+	gate := testGate("gate-g", 3)
+	f.clock.set(catalogActiveAt.Add(time.Minute))
 	revision := f.crashBeforeProjection(t, f.older, gate)
-	f.remnantAgeElapsed()
-	if err := f.retire("gate-restored", revision); err != nil {
+	f.clock.set(catalogActiveAt.Add(time.Minute + MinGateIntentRemnantAge))
+	if err := f.retire("gate-g", revision); err != nil {
 		t.Fatalf("RetireGateDeadlineIntent: %v", err)
 	}
-
-	_, err := openDispositionGate(f.store, f.older, gate)
-	assertCatalogCode(t, err, CatalogErrorDeleted)
-
-	entry := mustOpenDispositionGate(t, f.store, f.newer, gate)
-	if len(entry.Record.OpenGates) != 1 || entry.Record.OpenGates[0].GateID != "gate-restored" {
-		t.Fatalf("the successor's re-publish is not projected: %+v", entry.Record.OpenGates)
+	parked := gateIntentRecord(t, f.store, "gate-g")
+	f.clock.set(catalogActiveAt) // a reading earlier than the stored one
+	mustOpenDispositionGate(t, f.store, f.newer, gate)
+	assertDueGate(t, f.store, "gate-g")
+	revived := gateIntentRecord(t, f.store, "gate-g")
+	if !bytes.Equal(revived.Value, parked.Value) {
+		t.Fatalf("revival retracted the recorded instant:\nparked  %s\nrevived %s", parked.Value, revived.Value)
 	}
-	assertDueGate(t, f.store, "gate-restored")
-	intent := storedGateIntentRecord(t, f.store, "gate-restored")
-	if intent.Retired || intent.Residency != f.newer.Epoch() {
-		t.Fatalf("revived intent = %+v, want live at residency %d", intent, f.newer.Epoch())
+}
+
+// Review F4: the compare-and-swap onto the revision the sweep OBSERVED is what
+// stops a sweep parking the intent of a gate re-opened after the sweep's age
+// and projection checks.
+func TestADispositionSweepLosesToAnOpenThatLandsAfterItsChecks(t *testing.T) {
+	f := newDispositionRetireFixture(t)
+	gate := testGate("gate-g", 3)
+	revision := f.crashBeforeProjection(t, f.older, gate)
+	f.remnantAgeElapsed()
+	var inner error
+	// The sweep has read the record and found G unprojected; the successor
+	// re-publishes G there, re-stamping the intent and projecting the gate.
+	f.ordered.armGetPause(f.catalogID(t), func() {
+		f.clock.set(catalogActiveAt.Add(MinGateIntentRemnantAge + time.Second))
+		_, inner = openDispositionGate(f.store, f.newer, gate)
+	})
+	err := f.retire("gate-g", revision)
+	if inner != nil {
+		t.Fatalf("the successor's open inside the pause: %v", inner)
 	}
-	if !intent.RecordedAt.Equal(f.clock.Now()) {
-		t.Fatalf("revival kept the retired attempt's window: recorded at %v", intent.RecordedAt)
+	assertCatalogCode(t, err, CatalogErrorConflict)
+	assertDueGate(t, f.store, "gate-g")
+	if entry := mustGetCatalog(t, f.store); len(entry.Record.OpenGates) != 1 {
+		t.Fatalf("gate not projected: %+v", entry.Record.OpenGates)
 	}
 }
 
@@ -284,7 +341,7 @@ func TestDispositionRetirementMidResolveLetsTheResolveComplete(t *testing.T) {
 	f.remnantAgeElapsed()
 	var inner error
 	// The resolve's projection write has landed and it has just read the
-	// intent: the sweep retires it there.
+	// intent: the sweep parks it there.
 	f.ordered.armGetPause(f.intentID(t, "gate-a"), func() {
 		inner = f.retire("gate-a", gateIntentRecord(t, f.store, "gate-a").Revision)
 	})
@@ -301,168 +358,19 @@ func TestDispositionRetirementMidResolveLetsTheResolveComplete(t *testing.T) {
 	assertDueViewEmpty(t, f.store)
 }
 
-func assertDueGate(t *testing.T, store *Store, gate sessionwire.GateID) {
-	t.Helper()
-	due := mustListDueGates(t, store, catalogDeadline)
-	for _, entry := range due.Gates {
-		if entry.Gate.GateID == gate {
-			return
-		}
+// Only a disposition sweep parks. A parked filing met on a legacy session is a
+// filing this package never wrote there, and is refused rather than taken as
+// the repeat case.
+func TestAParkedFilingOnALegacySessionIsRefused(t *testing.T) {
+	store, clock := retireFixture(t)
+	revision := seedRemnantOfACrashBeforeGateOpened(t, store, "gate-x")
+	scope := mustScope(t, store)
+	stored := storedGateIntent(t, store, "gate-x")
+	if _, err := store.backend.OrderedIndex.Update(context.Background(), gateIntentID(scope, "gate-x"),
+		revision, stored.Value, storage.Rank{}, storage.Due{}); err != nil {
+		t.Fatal(err)
 	}
-	t.Fatalf("gate %s is not due-indexed: gates %v remnants %+v", gate, dueGateIDs(due), due.Remnants)
-}
-
-// --- v0.13.0: a stale resolve against a successor's first gate write --------
-//
-// v0.12.0 booked this window: a predecessor's ResolveGate(G) that read the
-// record before the successor made any fencing write could retire the
-// deadline intent of the successor's in-flight OpenGate(G). The intent now
-// carries the residency that wrote it, so the successor's grant fences the
-// stale resolver at the intent itself; and a resolve retires in place, so an
-// intent the predecessor did retire first is revived by the successor.
-
-// Outcome 1 of the booked window: the predecessor did not raise the mark, so
-// the successor's gate was projected open with no deadline index.
-func TestAStaleResolveCannotRetireASuccessorsFirstGate(t *testing.T) {
-	f := newDispositionRetireFixture(t)
-	// The predecessor holds the mark, so its resolve below writes no catalog.
-	mustOpenDispositionGate(t, f.store, f.older, testGate("gate-x", 2))
-	var inner error
-	// The predecessor has READ the record; before it acts on it, the successor
-	// makes its first gate write — an open of G, all the way to the projection.
-	f.ordered.armGetPause(f.catalogID(t), func() {
-		_, inner = openDispositionGate(f.store, f.newer, testGate("gate-g", 7))
-	})
-	_, stale := resolveDispositionGate(f.store, f.older, "gate-g")
-	if inner != nil {
-		t.Fatalf("the successor's open inside the pause: %v", inner)
-	}
-	assertEpochRefusal(t, stale, f.newer.Epoch())
-	entry := mustGetCatalog(t, f.store)
-	if _, open := withoutGate(entry.Record.OpenGates, "gate-g"); !open {
-		t.Fatalf("the successor's gate is not projected: %+v", entry.Record.OpenGates)
-	}
-	assertDueGate(t, f.store, "gate-g")
-}
-
-// Outcome 2 of the booked window: the predecessor raised the mark, so the
-// successor's projection lost its CAS and every retry was refused as catalog
-// deleted (gate_intent).
-func TestAStaleResolveThatRaisesTheMarkDoesNotStrandTheSuccessorsGate(t *testing.T) {
-	f := newDispositionRetireFixture(t)
-	var inner error
-	// The successor has committed G's intent and read the record; the
-	// predecessor's resolve lands before its projection CAS.
-	catalog := f.catalogID(t)
-	var once sync.Once
-	f.ordered.arm(func(id storage.OrderedID) error {
-		if id == catalog {
-			once.Do(func() {
-				f.ordered.arm(nil)
-				_, inner = resolveDispositionGate(f.store, f.older, "gate-g")
-			})
-		}
-		return nil
-	})
-	_, first := openDispositionGate(f.store, f.newer, testGate("gate-g", 7))
-	assertCatalogCode(t, first, CatalogErrorConflict)
-	assertEpochRefusal(t, inner, f.newer.Epoch())
-	// The successor's retry publishes G, due-indexed.
-	mustOpenDispositionGate(t, f.store, f.newer, testGate("gate-g", 7))
-	assertDueGate(t, f.store, "gate-g")
-	// And the predecessor is now fenced at the record as well.
-	_, err := resolveDispositionGate(f.store, f.older, "gate-g")
-	assertEpochRefusal(t, err, f.newer.Epoch())
-}
-
-// The residual ordering no intent-level fence can refuse: the predecessor
-// retires ITS OWN intent for G before the successor touches it. The successor,
-// restoring a runtime that still holds G, re-publishes it over the retired row.
-func TestASuccessorRepublishesAGateAStaleResolveRetiredFirst(t *testing.T) {
-	f := newDispositionRetireFixture(t)
-	f.crashBeforeProjection(t, f.older, testGate("gate-g", 7))
-	mustResolveDispositionGate(t, f.store, f.older, "gate-g")
-	assertIntentRetired(t, f.store, "gate-g")
-
-	mustOpenDispositionGate(t, f.store, f.newer, testGate("gate-g", 7))
-	assertDueGate(t, f.store, "gate-g")
-	// The predecessor cannot reopen what it resolved.
-	_, err := openDispositionGate(f.store, f.older, testGate("gate-g", 7))
-	assertEpochRefusal(t, err, f.newer.Epoch())
-}
-
-// A resolve retires at its own residency, so the resolver's own replayed open
-// cannot resurrect the gate it resolved — the tombstone's guarantee — while a
-// successor can.
-func TestAResolvedDispositionGateIsNotReopenedByItsResolver(t *testing.T) {
-	f := newDispositionRetireFixture(t)
-	mustOpenDispositionGate(t, f.store, f.older, testGate("gate-g", 7))
-	mustResolveDispositionGate(t, f.store, f.newer, "gate-g")
-	assertIntentRetired(t, f.store, "gate-g")
-	if got := storedGateIntentRecord(t, f.store, "gate-g").Residency; got != f.newer.Epoch() {
-		t.Fatalf("the resolve retired at residency %d, want its own %d", got, f.newer.Epoch())
-	}
-	_, err := openDispositionGate(f.store, f.newer, testGate("gate-g", 7))
-	assertCatalogCode(t, err, CatalogErrorDeleted)
-	// A repeat resolve is still idempotent, and writes nothing.
-	before := gateIntentRecord(t, f.store, "gate-g").Revision
-	mustResolveDispositionGate(t, f.store, f.newer, "gate-g")
-	if after := gateIntentRecord(t, f.store, "gate-g").Revision; after != before {
-		t.Fatalf("a repeat resolve rewrote the retired intent: revision %d -> %d", before, after)
-	}
-}
-
-// A successor whose open crashed after its intent and before its projection
-// leaves the catalog mark below it; a predecessor's open of the same gate then
-// passes the catalog fence, and is refused at the intent. It must never lower
-// the intent's residency, which is a bound on every later writer of the row.
-func TestAPredecessorsOpenCannotLowerASuccessorsIntent(t *testing.T) {
-	f := newDispositionRetireFixture(t)
-	f.crashBeforeProjection(t, f.newer, testGate("gate-g", 7))
-	_, err := openDispositionGate(f.store, f.older, testGate("gate-g", 7))
-	assertEpochRefusal(t, err, f.newer.Epoch())
-	if got := storedGateIntentRecord(t, f.store, "gate-g").Residency; got != f.newer.Epoch() {
-		t.Fatalf("the intent's residency is %d, want the successor's %d", got, f.newer.Epoch())
-	}
-	if entry := mustGetCatalog(t, f.store); len(entry.Record.OpenGates) != 0 {
-		t.Fatalf("the refused open projected the gate: %+v", entry.Record.OpenGates)
-	}
-}
-
-// Version 1 has no member for the disposition fields, so an intent naming one
-// is refused rather than silently stored without it.
-func TestAVersionOneIntentCannotCarryDispositionMembers(t *testing.T) {
-	base := gateIntent{
-		TenantID: catalogTenant, SessionID: catalogSession, GateID: "gate-a",
-		OpenedEventID: "event-gate-a", OpenedJournalSeq: 5,
-		Deadline: catalogDeadline, RecordedAt: catalogActiveAt,
-	}
-	for _, version := range []uint8{0, GateIntentRecordVersion} {
-		withResidency, retired := base, base
-		withResidency.Version, retired.Version = version, version
-		withResidency.Residency = 3
-		retired.Retired = true
-		for _, intent := range []gateIntent{withResidency, retired} {
-			if _, _, err := encodeGateIntent(intent); err == nil {
-				t.Fatalf("version %d intent %+v encoded", version, intent)
-			} else if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != "gate_intent.record_version" {
-				t.Fatalf("field = %q", got.Field)
-			}
-		}
-	}
-	unknown := base
-	unknown.Version = 3
-	if _, _, err := encodeGateIntent(unknown); err == nil {
-		t.Fatal("a version-3 intent encoded")
-	}
-}
-
-// gateIntentGone reports whether a gate's deadline intent no longer indexes
-// its deadline: tombstoned (legacy, or a v0.12.0 resolve) or retired in place
-// (disposition, from v0.13.0). A test asking "was this retired" must ask this,
-// not Deleted, which a retired-in-place row never is.
-func gateIntentGone(t *testing.T, store *Store, gate sessionwire.GateID) bool {
-	t.Helper()
-	stored := gateIntentRecord(t, store, gate)
-	return stored.Deleted || stored.Due.State != storage.DueAt
+	clock.set(catalogActiveAt.Add(MinGateIntentRemnantAge))
+	err := store.RetireGateDeadlineIntent(context.Background(), retireRequest("gate-x", revision+1))
+	assertCatalogCode(t, err, CatalogErrorIdentity)
 }

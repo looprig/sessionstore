@@ -1528,11 +1528,7 @@ func TestGateIntentDecodeFailsClosed(t *testing.T) {
 		{"too large", append(append([]byte(nil), valid...), bytes.Repeat([]byte(" "), MaxGateIntentBytes)...), CatalogErrorTooLarge},
 		{"not json", []byte("{"), CatalogErrorMalformed},
 		{"trailing content", append(append([]byte(nil), valid...), '{'), CatalogErrorMalformed},
-		{"unknown version", mutate(func(m map[string]json.RawMessage) { m["record_version"] = json.RawMessage("3") }), CatalogErrorVersion},
-		// Version 1 has no member for the disposition fields, and a version-1
-		// row carrying one is refused rather than read as version 2.
-		{"version 1 with a residency", mutate(func(m map[string]json.RawMessage) { m["residency_epoch"] = json.RawMessage("4") }), CatalogErrorMalformed},
-		{"version 1 retired", mutate(func(m map[string]json.RawMessage) { m["retired"] = json.RawMessage("true") }), CatalogErrorMalformed},
+		{"unknown version", mutate(func(m map[string]json.RawMessage) { m["record_version"] = json.RawMessage("2") }), CatalogErrorVersion},
 		{"undeclared member", mutate(func(m map[string]json.RawMessage) { m["surprise"] = json.RawMessage("1") }), CatalogErrorMalformed},
 		{"empty tenant", mutate(func(m map[string]json.RawMessage) { m["tenant_id"] = json.RawMessage(`""`) }), CatalogErrorInvalid},
 		{"empty session", mutate(func(m map[string]json.RawMessage) { m["session_id"] = json.RawMessage(`""`) }), CatalogErrorInvalid},
@@ -1579,40 +1575,29 @@ func TestGateIntentSizeCeilingCoversEveryMember(t *testing.T) {
 	// The measurement recorded in maxGateIntentEncodedBytes' comment. It is
 	// asserted exactly so that a change to the record forces the comment to be
 	// re-measured rather than being absorbed by headroom until it is not.
-	const measured = 6429
+	const measured = 6374
 
-	// The disposition wire is the widest: it is the version-1 wire embedded,
-	// plus its own members, so measuring it measures both.
-	wire := reflect.New(reflect.TypeOf(gateIntentDispositionWire{})).Elem()
+	wire := reflect.New(reflect.TypeOf(gateIntentWire{})).Elem()
 	// Control bytes are valid in a sessionwire id and encoding/json spells them
 	// as six-character \u00XX escapes, so this is the id that costs the most.
 	widestID := strings.Repeat("\x01", sessionwire.MaxIDBytes)
 	// A non-UTC offset is wider than the Z a canonical intent stores, so the
 	// measurement holds for an instant this package would first canonicalize.
 	widestTime := maxRankableTime.In(time.FixedZone("widest", -(11*3600 + 30*60)))
-	var widen func(value reflect.Value)
-	widen = func(value reflect.Value) {
-		for i := range value.NumField() {
-			field := value.Field(i)
-			switch {
-			case field.Type() == reflect.TypeOf(time.Time{}):
-				field.Set(reflect.ValueOf(widestTime))
-			case value.Type().Field(i).Anonymous && field.Kind() == reflect.Struct:
-				widen(field)
-			case field.Kind() == reflect.String:
-				field.SetString(widestID)
-			case field.Kind() >= reflect.Uint && field.Kind() <= reflect.Uint64:
-				field.SetUint(^uint64(0) >> (64 - field.Type().Bits()))
-			case field.Kind() == reflect.Bool:
-				// "false" is the wider spelling.
-				field.SetBool(false)
-			default:
-				t.Fatalf("%s.%s is a %s, which this builder cannot make the widest value of: extend it, then re-measure the ceiling",
-					value.Type().Name(), value.Type().Field(i).Name, field.Kind())
-			}
+	for i := range wire.NumField() {
+		field := wire.Field(i)
+		switch {
+		case field.Type() == reflect.TypeOf(time.Time{}):
+			field.Set(reflect.ValueOf(widestTime))
+		case field.Kind() == reflect.String:
+			field.SetString(widestID)
+		case field.Kind() >= reflect.Uint && field.Kind() <= reflect.Uint64:
+			field.SetUint(^uint64(0) >> (64 - field.Type().Bits()))
+		default:
+			t.Fatalf("gateIntentWire.%s is a %s, which this builder cannot make the widest value of: extend it, then re-measure the ceiling",
+				wire.Type().Field(i).Name, field.Kind())
 		}
 	}
-	widen(wire)
 	encoded, err := json.Marshal(wire.Interface())
 	if err != nil {
 		t.Fatalf("marshal widest intent: %v", err)

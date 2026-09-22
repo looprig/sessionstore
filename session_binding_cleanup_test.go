@@ -56,7 +56,7 @@ func TestSessionBindingRefusesReconciliationReleaseOnWitnessDisagreement(t *test
 // left every such remnant in the due view for good (tests lane, I1.3). What
 // still holds is the property the refusal was protecting: retirement never
 // runs the LEGACY mutation on a disposition session — it pins no legacy mode
-// and deletes nothing; it retires the row in place.
+// and deletes nothing; it parks the row (unchanged bytes, not due).
 func TestSessionBindingRetiresDispositionGateIntentInPlace(t *testing.T) {
 	clock := newMovableClock(catalogActiveAt)
 	s := openStore(t, memstore.New(), WithClock(clock))

@@ -48,15 +48,6 @@ func FuzzGateIntentCodec(f *testing.F) {
 	extreme.RecordedAt = maxRankableTime
 	f.Add(seed(extreme))
 
-	// The disposition record, live and retired in place.
-	disposition := valid
-	disposition.Version = GateIntentDispositionRecordVersion
-	disposition.Residency = 7
-	f.Add(seed(disposition))
-	disposition.Retired = true
-	disposition.Residency = ResidencyEpoch(^uint64(0))
-	f.Add(seed(disposition))
-
 	// One seed per fail-closed branch, derived from a real encoding, so the
 	// fuzzer explores from inside each rejection path as well as from an
 	// accepted intent.

@@ -571,7 +571,9 @@ func (s *Store) validateShard(shard int, invalid func(string, error) error) (uin
 // shrinking this constant without a real clock is the way to make it unsafe.
 const MinGateIntentRemnantAge = 5 * time.Minute
 
-// RetireGateDeadlineIntentRequest tombstones one gate's deadline intent.
+// RetireGateDeadlineIntentRequest retires one gate's deadline intent: a
+// tombstone on a legacy session, a park on a disposition one (see
+// RetireGateDeadlineIntent).
 //
 // Revision is the revision the caller observed on the row, in a
 // RemnantGateIntent from ListDueGates. The write is a compare-and-swap onto it,
@@ -607,7 +609,7 @@ type RetireGateDeadlineIntentRequest struct {
 //
 //   - The INTENT ROW IS ABSENT: refused, NotFound. Absence is not "already
 //     retired" — this package never erases, so a retired intent has a durable
-//     spelling and it is a tombstone. An absent row means the caller is
+//     spelling: a tombstone, or on a disposition session a parked row. An absent row means the caller is
 //     retiring something this store has never held, and answering success would
 //     tell a sweeper it had handled a row it never touched.
 //   - The INTENT ROW IS A TOMBSTONE: success, and nothing is written. This is
@@ -625,23 +627,28 @@ type RetireGateDeadlineIntentRequest struct {
 //     permitted, subject to the age below. This is the ordinary remnant.
 //   - The GATE IS OPEN: refused as a conflict. Retiring a live gate's deadline
 //     is the one outcome this operation must never produce.
-//   - The INTENT IS RETIRED IN PLACE (a disposition row, below): success, and
-//     nothing is written — the tombstone's repeat case in the other spelling.
+//   - The INTENT IS PARKED (a disposition row, below): success, and nothing is
+//     written. It is the tombstone's repeat case in the disposition spelling.
 //
 // WHAT "RETIRE" WRITES DEPENDS ON THE SESSION'S PROTOCOL, read from its witness:
 //
 //   - LEGACY (or no witness at all): the legacy protocol is reserved and the
 //     row is tombstoned, exactly as v0.12.0 did.
 //   - DISPOSITION (from v0.13.0; v0.12.0 refused it as catalog conflict
-//     (binding.protocol_mode), forever): the row is RETIRED IN PLACE — rewritten
-//     as a not-due version-2 intent under a compare-and-swap onto Revision,
-//     keeping the residency it carries. It leaves the due view as a tombstone
-//     would, but a successor holding a STRICTLY HIGHER residency may re-publish
-//     the gate over it, because a Host that crashed between its intent and its
-//     projection leaves the gate open in its runtime's journal and its successor
-//     restores it. The writer that left the remnant cannot revive it. This call
-//     needs no grant: what makes it safe is the age window and the projection
-//     check, both unchanged, and the revival rule, not an authority.
+//     (binding.protocol_mode), forever): the row is PARKED — its stored bytes
+//     are left exactly as they are and only its filing moves, to not-due, by a
+//     compare-and-swap onto Revision. It leaves the due view as a tombstone
+//     would, so no sweep of any version reports it again. Unlike a tombstone it
+//     is not terminal: a later OpenGate of the same gate re-files it as due
+//     (see commitGateIntent), because a Host that crashed between its intent
+//     and its projection leaves the gate open in its runtime's journal, and the
+//     successor restoring that runtime re-publishes it. The bytes are the
+//     unchanged version-1 intent, so every released reader still decodes the
+//     row: a v0.12.0 Host's re-open revives it and a v0.12.0 resolve
+//     tombstones it, and no reader is ever handed a record it cannot read.
+//     This call needs no grant: what makes it safe is the age window, the
+//     projection check and the compare-and-swap onto the revision the sweep
+//     observed, not an authority.
 //
 // And the age: an intent younger than MinGateIntentRemnantAge is refused with
 // TooSoon, because inside that window "remnant" and "in flight" are the same
@@ -695,12 +702,21 @@ func (s *Store) RetireGateDeadlineIntent(ctx context.Context, req RetireGateDead
 	if intent.TenantID != req.TenantID || intent.SessionID != req.SessionID {
 		return catalogErr(CatalogErrorIdentity, "gate_intent", nil)
 	}
-	if err := verifyGateIntentFiling(stored, intent, scope); err != nil {
+	parked, err := verifyGateIntentFilingOrParked(stored, intent, scope)
+	if err != nil {
 		return err
 	}
-	// A disposition intent retired in place is this store's own record that the
-	// work is done, exactly as a tombstone is: the repeat case.
-	if intent.Retired {
+	// A parked row is this store's own record that the work is done, exactly as
+	// a tombstone is: the repeat case. Only a disposition session parks, so a
+	// parked row anywhere else is a filing this package never wrote.
+	if parked {
+		mode, bound, err := s.boundProtocolMode(opCtx, scope)
+		if err != nil {
+			return err
+		}
+		if !bound || mode != ProtocolModeDisposition {
+			return catalogErr(CatalogErrorIdentity, "due", nil)
+		}
 		return nil
 	}
 	// The age is checked BEFORE the projection is read, so an in-flight open is
@@ -712,8 +728,7 @@ func (s *Store) RetireGateDeadlineIntent(ctx context.Context, req RetireGateDead
 	if err := s.refuseIfGateIsStillOpen(opCtx, scope, req); err != nil {
 		return err
 	}
-	// A DISPOSITION session's remnant is retired in place: see
-	// retireDispositionRemnant. Its protocol is read from the witness, never
+	// A DISPOSITION session's remnant is parked: see parkDispositionRemnant. Its protocol is read from the witness, never
 	// proposed, because a disposition session always has one — the catalog
 	// create pins the mode before anything can write an intent.
 	mode, bound, err := s.boundProtocolMode(opCtx, scope)
@@ -721,7 +736,7 @@ func (s *Store) RetireGateDeadlineIntent(ctx context.Context, req RetireGateDead
 		return err
 	}
 	if bound && mode == ProtocolModeDisposition {
-		return s.retireDispositionRemnant(opCtx, scope, req, intent)
+		return s.parkDispositionRemnant(opCtx, scope, req, stored.Value)
 	}
 	// Retirement mutates legacy gate state even when the catalog is absent.
 	// Reserve/check the legacy protocol without requiring collision witnesses
@@ -735,32 +750,27 @@ func (s *Store) RetireGateDeadlineIntent(ctx context.Context, req RetireGateDead
 	return nil
 }
 
-// retireDispositionRemnant retires a disposition session's remnant intent IN
-// PLACE: the row is rewritten, under a compare-and-swap onto the revision the
-// sweep observed, as a retired version-2 intent that is not due. It keeps the
-// residency the row already carries — a sweep holds no grant and raises nothing
-// — so a successor with a strictly higher residency can still re-publish the
-// gate over it (see gateIntent.Retired), while the writer that left the
-// remnant cannot.
+// parkDispositionRemnant takes a disposition session's remnant intent out of
+// the due view WITHOUT changing a byte of it: the stored value is written back
+// unchanged, filed not-due, by a compare-and-swap onto the revision the sweep
+// observed. That compare-and-swap is the guard against retiring a gate whose
+// open re-stamped the row after the sweep's age and projection checks: the
+// re-stamp moved the revision, so this write conflicts and the gate stays due.
 //
 // A tombstone would be wrong here, not merely stricter. A Host that crashed
 // between the intent and the projection leaves its runtime's gate open in its
 // journal; the successor restoring that runtime re-publishes it, and a
-// tombstoned id could never be published again.
-func (s *Store) retireDispositionRemnant(
+// tombstoned id could never be published again. A parked row is re-filed as due
+// by that re-publish (commitGateIntent), by a Host of any released version,
+// because the bytes are the version-1 intent every version decodes.
+func (s *Store) parkDispositionRemnant(
 	ctx context.Context,
 	scope sessionScope,
 	req RetireGateDeadlineIntentRequest,
-	intent gateIntent,
+	value []byte,
 ) error {
-	intent.Version = GateIntentDispositionRecordVersion
-	intent.Retired = true
-	value, intent, err := encodeGateIntent(intent)
-	if err != nil {
-		return err
-	}
 	if _, err := s.backend.OrderedIndex.Update(
-		ctx, gateIntentID(scope, req.GateID), req.Revision, value, storage.Rank{}, gateIntentDue(intent)); err != nil {
+		ctx, gateIntentID(scope, req.GateID), req.Revision, value, storage.Rank{}, storage.Due{}); err != nil {
 		return classifyCatalogOrderedError(err, "gate_intent")
 	}
 	return nil

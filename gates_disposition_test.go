@@ -126,7 +126,7 @@ func TestDispositionOpenGateSucceedsWithNoJournalTip(t *testing.T) {
 	if stored.Revision != entry.Revision {
 		t.Fatalf("stored revision %d, returned %d", stored.Revision, entry.Revision)
 	}
-	if gateIntentGone(t, f.store, gate.GateID) {
+	if intent := gateIntentRecord(t, f.store, gate.GateID); intent.Deleted {
 		t.Fatal("the deadline intent is a tombstone")
 	}
 }
@@ -276,7 +276,7 @@ func TestDispositionGateWritesRefuseEverythingButThisSessionsGrant(t *testing.T)
 				assertCatalogUnchanged(t, f.store, before)
 				if op == "open" {
 					assertNoGateIntent(t, f.store, "gate-b")
-				} else if gateIntentGone(t, f.store, "gate-a") {
+				} else if intent := gateIntentRecord(t, f.store, "gate-a"); intent.Deleted {
 					t.Fatal("a refused resolve retired the intent")
 				}
 			})

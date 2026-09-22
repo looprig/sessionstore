@@ -101,7 +101,7 @@ func TestSuccessorRepublishFencesThePredecessor(t *testing.T) {
 	assertEpochRefusal(t, err, f.newer.Epoch())
 	assertCatalogUnchanged(t, f.store, before)
 	assertNoGateIntent(t, f.store, "gate-h")
-	if gateIntentGone(t, f.store, "gate-g") {
+	if gateIntentRecord(t, f.store, "gate-g").Deleted {
 		t.Fatal("the refused resolve retired the gate's intent")
 	}
 }
@@ -222,7 +222,7 @@ func TestAbsentResolveMarkWriteLosesARaceBeforeRetiring(t *testing.T) {
 	f.pauseFirstCatalogUpdate(func() { mustOpenDispositionGate(t, f.store, f.older, testGate("gate-c", 5)) })
 	_, remnant := openDispositionGate(f.store, f.older, testGate("gate-b", 4))
 	assertCatalogCode(t, remnant, CatalogErrorConflict)
-	if gateIntentGone(t, f.store, "gate-b") {
+	if gateIntentRecord(t, f.store, "gate-b").Deleted {
 		t.Fatal("vacuous: gate-b has no live remnant intent")
 	}
 	var inner error
@@ -234,7 +234,7 @@ func TestAbsentResolveMarkWriteLosesARaceBeforeRetiring(t *testing.T) {
 		t.Fatalf("the predecessor's open inside the pause: %v", inner)
 	}
 	assertCatalogCode(t, outer, CatalogErrorConflict)
-	if gateIntentGone(t, f.store, "gate-b") {
+	if gateIntentRecord(t, f.store, "gate-b").Deleted {
 		t.Fatal("the resolve that lost its mark CAS retired the intent anyway")
 	}
 	// The retry now finds gate-b projected and resolves it under the new mark.
@@ -242,7 +242,7 @@ func TestAbsentResolveMarkWriteLosesARaceBeforeRetiring(t *testing.T) {
 	if resolved.Record.LeaseEpoch != uint64(f.newer.Epoch()) || len(resolved.Record.OpenGates) != 2 { // gate-a and gate-c remain
 		t.Fatalf("retry: mark %d gates %+v", resolved.Record.LeaseEpoch, resolved.Record.OpenGates)
 	}
-	if !gateIntentGone(t, f.store, "gate-b") {
+	if !gateIntentRecord(t, f.store, "gate-b").Deleted {
 		t.Fatal("the retried resolve did not retire the intent")
 	}
 }
@@ -259,7 +259,7 @@ func TestAfterAFencingWriteAStaleResolveCannotRetireASuccessorsIntent(t *testing
 	f.pauseFirstCatalogUpdate(func() { _, inner = resolveDispositionGate(f.store, f.older, "gate-g") })
 	mustOpenDispositionGate(t, f.store, f.newer, testGate("gate-g", 7))
 	assertEpochRefusal(t, inner, f.newer.Epoch())
-	if gateIntentGone(t, f.store, "gate-g") {
+	if gateIntentRecord(t, f.store, "gate-g").Deleted {
 		t.Fatal("a fenced predecessor tombstoned the successor's intent")
 	}
 	due := mustListDueGates(t, f.store, catalogDeadline)
