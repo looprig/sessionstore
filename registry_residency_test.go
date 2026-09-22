@@ -80,6 +80,14 @@ func TestPutHostRegistrationRefusesAGrantItCannotVouchFor(t *testing.T) {
 	createDispositionCatalog(t, other)
 	foreign := acquireTestResidency(t, other)
 
+	// A grant its holder has released proves nothing about who publishes: a Host
+	// on the grant path publishes its final `releasing` observation BEFORE it
+	// releases the grant.
+	released := acquireTestResidency(t, f.store)
+	if err := released.Release(context.Background()); err != nil {
+		t.Fatalf("Release: %v", err)
+	}
+
 	bothSet := grantRegistrationRequest(f.newer)
 	bothSet.LeaseEpoch = uint64(f.newer.Epoch())
 	wrongSession := grantRegistrationRequest(f.newer)
@@ -93,6 +101,7 @@ func TestPutHostRegistrationRefusesAGrantItCannotVouchFor(t *testing.T) {
 		{"grant and a named epoch", bothSet, "lease_epoch"},
 		{"a grant another store issued", grantRegistrationRequest(foreign), "residency"},
 		{"a grant for another session", wrongSession, "residency"},
+		{"a released grant", grantRegistrationRequest(released), "residency"},
 		// Zero is "no mark" to every fence here; a grant carrying it is
 		// refused with the grant, not as the record's missing epoch.
 		{"a grant at epoch zero", grantRegistrationRequest(

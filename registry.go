@@ -510,7 +510,10 @@ type ClearHostRegistrationRequest struct {
 // monotonic bound on future callers, unbounded above, outliving the state that
 // carried it (see ClaimDispositionCommandRequest) — and it is the value every
 // released Host already publishes as a bare number. As everywhere, the grant is
-// proof of provenance and NOT of a live lease.
+// proof of provenance and NOT of a live lease — but a RELEASED grant is refused
+// (registry invalid (residency)), so a Host on this path must publish its final
+// `releasing` observation before it releases the grant, and must not treat that
+// refusal as fatal during a drain.
 //
 // The bare LeaseEpoch path is kept, unchanged, because every released Host up
 // to v0.5.0 publishes through it, and it is the only path a LEGACY session has
