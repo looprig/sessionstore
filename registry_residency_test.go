@@ -93,6 +93,10 @@ func TestPutHostRegistrationRefusesAGrantItCannotVouchFor(t *testing.T) {
 		{"grant and a named epoch", bothSet, "lease_epoch"},
 		{"a grant another store issued", grantRegistrationRequest(foreign), "residency"},
 		{"a grant for another session", wrongSession, "residency"},
+		// Zero is "no mark" to every fence here; a grant carrying it is
+		// refused with the grant, not as the record's missing epoch.
+		{"a grant at epoch zero", grantRegistrationRequest(
+			&ResidencyGrant{store: f.store, tenant: catalogTenant, session: catalogSession, epoch: 0}), "residency"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := f.store.PutHostRegistration(context.Background(), tt.req)

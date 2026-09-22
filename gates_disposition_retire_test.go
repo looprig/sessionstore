@@ -404,8 +404,57 @@ func TestAResolvedDispositionGateIsNotReopenedByItsResolver(t *testing.T) {
 	}
 	_, err := openDispositionGate(f.store, f.newer, testGate("gate-g", 7))
 	assertCatalogCode(t, err, CatalogErrorDeleted)
-	// A repeat resolve is still idempotent.
+	// A repeat resolve is still idempotent, and writes nothing.
+	before := gateIntentRecord(t, f.store, "gate-g").Revision
 	mustResolveDispositionGate(t, f.store, f.newer, "gate-g")
+	if after := gateIntentRecord(t, f.store, "gate-g").Revision; after != before {
+		t.Fatalf("a repeat resolve rewrote the retired intent: revision %d -> %d", before, after)
+	}
+}
+
+// A successor whose open crashed after its intent and before its projection
+// leaves the catalog mark below it; a predecessor's open of the same gate then
+// passes the catalog fence, and is refused at the intent. It must never lower
+// the intent's residency, which is a bound on every later writer of the row.
+func TestAPredecessorsOpenCannotLowerASuccessorsIntent(t *testing.T) {
+	f := newDispositionRetireFixture(t)
+	f.crashBeforeProjection(t, f.newer, testGate("gate-g", 7))
+	_, err := openDispositionGate(f.store, f.older, testGate("gate-g", 7))
+	assertEpochRefusal(t, err, f.newer.Epoch())
+	if got := storedGateIntentRecord(t, f.store, "gate-g").Residency; got != f.newer.Epoch() {
+		t.Fatalf("the intent's residency is %d, want the successor's %d", got, f.newer.Epoch())
+	}
+	if entry := mustGetCatalog(t, f.store); len(entry.Record.OpenGates) != 0 {
+		t.Fatalf("the refused open projected the gate: %+v", entry.Record.OpenGates)
+	}
+}
+
+// Version 1 has no member for the disposition fields, so an intent naming one
+// is refused rather than silently stored without it.
+func TestAVersionOneIntentCannotCarryDispositionMembers(t *testing.T) {
+	base := gateIntent{
+		TenantID: catalogTenant, SessionID: catalogSession, GateID: "gate-a",
+		OpenedEventID: "event-gate-a", OpenedJournalSeq: 5,
+		Deadline: catalogDeadline, RecordedAt: catalogActiveAt,
+	}
+	for _, version := range []uint8{0, GateIntentRecordVersion} {
+		withResidency, retired := base, base
+		withResidency.Version, retired.Version = version, version
+		withResidency.Residency = 3
+		retired.Retired = true
+		for _, intent := range []gateIntent{withResidency, retired} {
+			if _, _, err := encodeGateIntent(intent); err == nil {
+				t.Fatalf("version %d intent %+v encoded", version, intent)
+			} else if got := assertCatalogCode(t, err, CatalogErrorInvalid); got.Field != "gate_intent.record_version" {
+				t.Fatalf("field = %q", got.Field)
+			}
+		}
+	}
+	unknown := base
+	unknown.Version = 3
+	if _, _, err := encodeGateIntent(unknown); err == nil {
+		t.Fatal("a version-3 intent encoded")
+	}
 }
 
 // gateIntentGone reports whether a gate's deadline intent no longer indexes
