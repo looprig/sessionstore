@@ -73,6 +73,38 @@ type catalogBindingWire struct {
 // the catalog. Legacy records retain CatalogRecordVersion and their bytes.
 const CatalogBindingRecordVersion uint8 = 2
 
+// boundProtocolMode READS the session's protocol witness and never writes one.
+// It reports whether a witness exists and, if so, which mode it pins; a witness
+// whose bytes name neither mode for this session is a collision, as
+// bindProtocolMode reports it. The legacy single-tenant layout has no witness
+// and is legacy by construction.
+//
+// It exists for the one mutation whose protocol is decided by the witness rather
+// than proposed or taken from a catalog: RetireGateDeadlineIntent, which must
+// work on a session whose catalog is gone.
+func (s *Store) boundProtocolMode(ctx context.Context, scope sessionScope) (ProtocolMode, bool, error) {
+	if err := s.validateSessionScope(scope); err != nil {
+		return "", false, err
+	}
+	if scope.layout == layoutLegacySingleTenantV1 {
+		return ProtocolModeLegacy, true, nil
+	}
+	key := scope.SessionNamespace + "/protocol"
+	got, _, err := s.keys.kv.Get(ctx, key)
+	if err != nil {
+		if isKeyNotFound(err, key) {
+			return "", false, nil
+		}
+		return "", false, catalogErr(CatalogErrorBackend, "binding.protocol_mode", err)
+	}
+	for _, mode := range []ProtocolMode{ProtocolModeLegacy, ProtocolModeDisposition} {
+		if bytes.Equal(got, encodeWitness(1, scope.sessionWitness, []byte(mode))) {
+			return mode, true, nil
+		}
+	}
+	return "", false, &KeyspaceError{Code: KeyspaceHashCollision}
+}
+
 // bindProtocolMode is a create-only race fence, NOT a storage binding. Its
 // bytes contain only the collision identity and protocol. The catalog's one
 // OrderedIndex.Create still chooses the entire winning SessionBinding. A crash

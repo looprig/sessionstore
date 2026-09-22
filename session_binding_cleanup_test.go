@@ -50,7 +50,14 @@ func TestSessionBindingRefusesReconciliationReleaseOnWitnessDisagreement(t *test
 	}
 }
 
-func TestSessionBindingRefusesLegacyGateIntentRetirement(t *testing.T) {
+// Until v0.13.0 this pinned a REFUSAL: retirement reserved the legacy protocol,
+// so a disposition session's remnant could never be retired. Since host v0.4.0
+// every Host-published gate lives on a disposition session, so the refusal
+// left every such remnant in the due view for good (tests lane, I1.3). What
+// still holds is the property the refusal was protecting: retirement never
+// runs the LEGACY mutation on a disposition session — it pins no legacy mode
+// and deletes nothing; it retires the row in place.
+func TestSessionBindingRetiresDispositionGateIntentInPlace(t *testing.T) {
 	clock := newMovableClock(catalogActiveAt)
 	s := openStore(t, memstore.New(), WithClock(clock))
 	ctx := context.Background()
@@ -61,10 +68,19 @@ func TestSessionBindingRefusesLegacyGateIntentRetirement(t *testing.T) {
 	}
 	revision := seedRemnantOfACrashBeforeGateOpened(t, s, "gate-old")
 	clock.set(catalogActiveAt.Add(MinGateIntentRemnantAge))
-	err := s.RetireGateDeadlineIntent(ctx, retireRequest("gate-old", revision))
-	assertCatalogCode(t, err, CatalogErrorConflict)
+	if err := s.RetireGateDeadlineIntent(ctx, retireRequest("gate-old", revision)); err != nil {
+		t.Fatalf("RetireGateDeadlineIntent: %v", err)
+	}
 	after := storedGateIntent(t, s, "gate-old")
-	if after.Deleted || after.Revision != revision {
-		t.Fatal("legacy cleanup retired disposition gate intent")
+	if after.Deleted {
+		t.Fatal("a disposition remnant was tombstoned, so no successor could re-publish its gate")
+	}
+	assertIntentRetired(t, s, "gate-old")
+	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode, bound, err := s.boundProtocolMode(ctx, scope); err != nil || !bound || mode != ProtocolModeDisposition {
+		t.Fatalf("protocol witness = %q bound=%v err=%v, want disposition", mode, bound, err)
 	}
 }

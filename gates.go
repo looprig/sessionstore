@@ -115,6 +115,14 @@ const (
 	// guessing which members a future encoder meant.
 	GateIntentRecordVersion uint8 = 1
 
+	// GateIntentDispositionRecordVersion is the deadline intent of a gate on
+	// a DISPOSITION session, written from v0.13.0. It adds the residency the
+	// intent was last written under and whether it has been retired in place;
+	// see gateIntent.Residency and gateIntent.Retired. Legacy sessions keep
+	// writing version 1, byte for byte. A reader older than v0.13.0 refuses a
+	// version-2 row, which is the rollout rule stated in the release notes.
+	GateIntentDispositionRecordVersion uint8 = 2
+
 	// MaxGateIntentBytes bounds an encoded deadline intent. An intent holds
 	// identities and one timestamp, never a prompt, so this is far above what a
 	// legitimate record needs and far below the provider's own value bound.
@@ -135,9 +143,11 @@ const _ = uint(storage.MaxOrderedValueBytes - MaxGateIntentBytes)
 // its worst JSON escaping — a sessionwire id accepts control bytes, and
 // encoding/json spells those as six-character \u00XX escapes — is 6144 bytes.
 // The scaffolding around them, member names and punctuation, the widest uint64,
-// and the two widest RFC 3339 instants, measures 230 bytes. That is 6374
-// against the 6656 below, so the +512 term is 230 bytes of real content and 282
-// bytes of headroom. It is not slack to spend: it does not hold one more id.
+// and the two widest RFC 3339 instants, measures 230 bytes in version 1. The
+// version-2 (disposition) members — a second widest uint64 and a boolean —
+// add 55, so the widest record is 6429 against the 6656 below: the +512 term
+// is 285 bytes of real content and 227 bytes of headroom. It is not slack to
+// spend: it does not hold one more id.
 //
 // The +256 term this constant used to carry was re-measured, not widened on
 // suspicion, when RecordedAt was added: one more instant is 52 bytes of member
@@ -429,6 +439,17 @@ func (s *Store) OpenGate(ctx context.Context, req OpenGateRequest) (CatalogEntry
 	mark, err := gateEpochFence(current.Record, auth)
 	if err != nil {
 		return CatalogEntry{}, err
+	}
+	// A disposition intent carries the residency that wrote it, so a stale
+	// resolver can be told apart from the successor it would otherwise undo.
+	// The mark is known only after the fence, so the intent is re-encoded here;
+	// the encode above still refused an invalid intent before any provider work.
+	if current.Record.Binding.ProtocolMode == ProtocolModeDisposition {
+		intent.Version = GateIntentDispositionRecordVersion
+		intent.Residency = ResidencyEpoch(mark)
+		if value, intent, err = encodeGateIntent(intent); err != nil {
+			return CatalogEntry{}, err
+		}
 	}
 	// The gate must name an event the journal has durably committed. This is
 	// the write-side half of "a reader validates its matching durable open
@@ -894,7 +915,7 @@ func verifyGateIntentFiling(stored storage.OrderedRecord, intent gateIntent, sco
 	if stored.Deleted {
 		return catalogErr(CatalogErrorDeleted, "gate_intent", nil)
 	}
-	return checkFiledScope(stored, scope.SessionNamespace, gateDue(intent.Deadline), catalogIdentity)
+	return checkFiledScope(stored, scope.SessionNamespace, gateIntentDue(intent), catalogIdentity)
 }
 
 // dueSessionKey is the identity a due page caches a catalog record under. It is
@@ -1001,6 +1022,9 @@ func (s *Store) commitGateIntent(
 	if !existing.matches(gate) {
 		return catalogErr(CatalogErrorConflict, "gate_intent", nil)
 	}
+	if intent.Version == GateIntentDispositionRecordVersion {
+		return s.recommitDispositionGateIntent(ctx, id, stored, existing, intent)
+	}
 	// THE STORED INSTANT IS A MAXIMUM OVER ATTEMPTS, NOT A LAST WRITER'S VALUE.
 	// An attempt whose own reading is not later than the stored one has nothing
 	// to add and must not write, and the direction is what matters: this
@@ -1024,6 +1048,52 @@ func (s *Store) commitGateIntent(
 	// against, and gateDue is that single derivation.
 	if _, err := s.backend.OrderedIndex.Update(
 		ctx, id, stored.Revision, value, storage.Rank{}, gateDue(gate.Deadline)); err != nil {
+		return classifyCatalogOrderedError(err, "gate_intent")
+	}
+	return nil
+}
+
+// recommitDispositionGateIntent is commitGateIntent's answer to an existing
+// intent on a DISPOSITION session. It keeps the legacy path's forward-only
+// window rule and adds the residency rules:
+//
+//   - An intent written under a HIGHER residency than this writer's belongs to
+//     a successor that has not yet raised the catalog's mark, and this writer
+//     is refused as superseded — the catalog fence's refusal, reached one
+//     record earlier.
+//   - A RETIRED intent is revived only by a strictly higher residency: a
+//     successor whose restored runtime holds the gate. The writer that retired
+//     it, or any earlier one, is refused as the tombstone would refuse it.
+//   - Otherwise the row is raised to this writer's residency and to the later
+//     of the two instants, and nothing is written when neither moves.
+func (s *Store) recommitDispositionGateIntent(
+	ctx context.Context,
+	id storage.OrderedID,
+	stored storage.OrderedRecord,
+	existing, intent gateIntent,
+) error {
+	if existing.Residency > intent.Residency {
+		return catalogEpochRefusal(uint64(existing.Residency))
+	}
+	if existing.Retired && existing.Residency == intent.Residency {
+		return catalogErr(CatalogErrorDeleted, "gate_intent", nil)
+	}
+	next := intent
+	if !intent.RecordedAt.After(existing.RecordedAt) {
+		next.RecordedAt = existing.RecordedAt
+	}
+	// matches already held every identity member equal, so these are the only
+	// members that can move.
+	if existing.Version == next.Version && existing.Residency == next.Residency &&
+		!existing.Retired && existing.RecordedAt.Equal(next.RecordedAt) {
+		return nil
+	}
+	value, next, err := encodeGateIntent(next)
+	if err != nil {
+		return err
+	}
+	if _, err := s.backend.OrderedIndex.Update(
+		ctx, id, stored.Revision, value, storage.Rank{}, gateIntentDue(next)); err != nil {
 		return classifyCatalogOrderedError(err, "gate_intent")
 	}
 	return nil
@@ -1148,6 +1218,40 @@ type gateIntent struct {
 	// overlapping. See commitGateIntent, which holds the rule and argues the
 	// trade.
 	RecordedAt time.Time
+
+	// Version is the record version the intent is stored in:
+	// GateIntentRecordVersion on a legacy session, and
+	// GateIntentDispositionRecordVersion on a disposition session once a
+	// v0.13.0 writer has touched it. Zero is read as version 1, so a legacy
+	// writer that never names it keeps v0.12.0's bytes.
+	Version uint8
+
+	// Residency is the highest residency epoch that has written this intent —
+	// the opener's grant, raised by a successor's re-publish and by a resolve.
+	// It is a MONOTONIC BOUND ON LATER WRITERS of the row, so it is only ever
+	// taken from a store-issued grant: an intent whose Residency is above a
+	// resolver's grant was written by a successor, and the resolver is refused
+	// rather than allowed to retire it (see retireDispositionGateIntent). Zero
+	// is "unknown", which is what a version-1 row written by v0.12.0 carries.
+	Residency ResidencyEpoch
+
+	// Retired reports that the intent has been retired IN PLACE: it is not due,
+	// so no sweep reports it, and it indexes no open gate. A disposition intent
+	// is retired this way rather than tombstoned because a tombstone is
+	// terminal, and a successor whose restored runtime still holds the gate must
+	// be able to publish it again. Only a STRICTLY HIGHER residency than
+	// Residency may revive it; the writer that retired it, or any earlier one,
+	// is refused exactly as a tombstone refuses it.
+	Retired bool
+}
+
+// gateIntentDue is the due state an intent is filed under: its deadline while
+// it is live, and not due at all once it is retired.
+func gateIntentDue(intent gateIntent) storage.Due {
+	if intent.Retired {
+		return storage.Due{}
+	}
+	return gateDue(intent.Deadline)
 }
 
 // matches reports whether a projection is the open gate this intent indexes.
@@ -1167,6 +1271,14 @@ type gateIntentWire struct {
 	OpenedJournalSeq uint64                `json:"opened_journal_seq"`
 	Deadline         time.Time             `json:"deadline"`
 	RecordedAt       time.Time             `json:"recorded_at"`
+}
+
+// gateIntentDispositionWire is GateIntentDispositionRecordVersion's wire: the
+// version-1 members, unchanged, and the two a disposition intent adds.
+type gateIntentDispositionWire struct {
+	gateIntentWire
+	Residency uint64 `json:"residency_epoch"`
+	Retired   bool   `json:"retired"`
 }
 
 // encodeGateIntent validates and encodes one deadline intent.
@@ -1192,8 +1304,8 @@ func encodeGateIntent(intent gateIntent) ([]byte, gateIntent, error) {
 	if err != nil {
 		return nil, gateIntent{}, err
 	}
-	encoded, err := json.Marshal(gateIntentWire{
-		RecordVersion:    GateIntentRecordVersion,
+	base := gateIntentWire{
+		RecordVersion:    intent.Version,
 		TenantID:         intent.TenantID,
 		SessionID:        intent.SessionID,
 		GateID:           intent.GateID,
@@ -1201,7 +1313,12 @@ func encodeGateIntent(intent gateIntent) ([]byte, gateIntent, error) {
 		OpenedJournalSeq: intent.OpenedJournalSeq,
 		Deadline:         intent.Deadline,
 		RecordedAt:       intent.RecordedAt,
-	})
+	}
+	var wire any = base
+	if intent.Version == GateIntentDispositionRecordVersion {
+		wire = gateIntentDispositionWire{gateIntentWire: base, Residency: uint64(intent.Residency), Retired: intent.Retired}
+	}
+	encoded, err := json.Marshal(wire)
 	if err != nil {
 		return nil, gateIntent{}, catalogErr(CatalogErrorInvalid, "gate_intent", err)
 	}
@@ -1211,9 +1328,25 @@ func encodeGateIntent(intent gateIntent) ([]byte, gateIntent, error) {
 // decodeGateIntent strictly decodes one stored deadline intent and re-validates
 // it, so an intent corrupted in place cannot be handed to a reader.
 func decodeGateIntent(value []byte) (gateIntent, error) {
-	wire, err := decodeVersionedRecord[gateIntentWire](
-		value, MaxGateIntentBytes, GateIntentRecordVersion,
-		versionedRecordFields{Record: "gate_intent", Version: "gate_intent.record_version"}, catalogRecordFailure)
+	fields := versionedRecordFields{Record: "gate_intent", Version: "gate_intent.record_version"}
+	// The probe only CHOOSES the wire; the strict decoder below re-checks the
+	// version and classifies every malformed input, exactly as the catalog's
+	// two-version decode does.
+	var probe struct {
+		RecordVersion uint8 `json:"record_version"`
+	}
+	if len(value) <= MaxGateIntentBytes {
+		_ = json.Unmarshal(value, &probe)
+	}
+	var wire gateIntentDispositionWire
+	var err error
+	if probe.RecordVersion == GateIntentDispositionRecordVersion {
+		wire, err = decodeVersionedRecord[gateIntentDispositionWire](
+			value, MaxGateIntentBytes, GateIntentDispositionRecordVersion, fields, catalogRecordFailure)
+	} else {
+		wire.gateIntentWire, err = decodeVersionedRecord[gateIntentWire](
+			value, MaxGateIntentBytes, GateIntentRecordVersion, fields, catalogRecordFailure)
+	}
 	if err != nil {
 		return gateIntent{}, err
 	}
@@ -1225,6 +1358,9 @@ func decodeGateIntent(value []byte) (gateIntent, error) {
 		OpenedJournalSeq: wire.OpenedJournalSeq,
 		Deadline:         wire.Deadline,
 		RecordedAt:       wire.RecordedAt,
+		Version:          wire.RecordVersion,
+		Residency:        ResidencyEpoch(wire.Residency),
+		Retired:          wire.Retired,
 	})
 }
 
@@ -1232,6 +1368,20 @@ func decodeGateIntent(value []byte) (gateIntent, error) {
 // spelling. Encoding and decoding both end here, so an intent read back is
 // byte-identical to the intent written.
 func canonicalGateIntent(intent gateIntent) (gateIntent, error) {
+	switch intent.Version {
+	case 0:
+		intent.Version = GateIntentRecordVersion
+		fallthrough
+	case GateIntentRecordVersion:
+		// Version 1 has no member for either; a value here would be silently
+		// dropped by the encoder, so it is refused instead.
+		if intent.Residency != 0 || intent.Retired {
+			return gateIntent{}, catalogErr(CatalogErrorInvalid, "gate_intent.record_version", nil)
+		}
+	case GateIntentDispositionRecordVersion:
+	default:
+		return gateIntent{}, catalogErr(CatalogErrorInvalid, "gate_intent.record_version", nil)
+	}
 	if err := intent.TenantID.Validate(); err != nil {
 		return gateIntent{}, catalogErr(CatalogErrorInvalid, "gate_intent.tenant_id", err)
 	}

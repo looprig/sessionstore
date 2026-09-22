@@ -625,6 +625,23 @@ type RetireGateDeadlineIntentRequest struct {
 //     permitted, subject to the age below. This is the ordinary remnant.
 //   - The GATE IS OPEN: refused as a conflict. Retiring a live gate's deadline
 //     is the one outcome this operation must never produce.
+//   - The INTENT IS RETIRED IN PLACE (a disposition row, below): success, and
+//     nothing is written — the tombstone's repeat case in the other spelling.
+//
+// WHAT "RETIRE" WRITES DEPENDS ON THE SESSION'S PROTOCOL, read from its witness:
+//
+//   - LEGACY (or no witness at all): the legacy protocol is reserved and the
+//     row is tombstoned, exactly as v0.12.0 did.
+//   - DISPOSITION (from v0.13.0; v0.12.0 refused it as catalog conflict
+//     (binding.protocol_mode), forever): the row is RETIRED IN PLACE — rewritten
+//     as a not-due version-2 intent under a compare-and-swap onto Revision,
+//     keeping the residency it carries. It leaves the due view as a tombstone
+//     would, but a successor holding a STRICTLY HIGHER residency may re-publish
+//     the gate over it, because a Host that crashed between its intent and its
+//     projection leaves the gate open in its runtime's journal and its successor
+//     restores it. The writer that left the remnant cannot revive it. This call
+//     needs no grant: what makes it safe is the age window and the projection
+//     check, both unchanged, and the revival rule, not an authority.
 //
 // And the age: an intent younger than MinGateIntentRemnantAge is refused with
 // TooSoon, because inside that window "remnant" and "in flight" are the same
@@ -681,6 +698,11 @@ func (s *Store) RetireGateDeadlineIntent(ctx context.Context, req RetireGateDead
 	if err := verifyGateIntentFiling(stored, intent, scope); err != nil {
 		return err
 	}
+	// A disposition intent retired in place is this store's own record that the
+	// work is done, exactly as a tombstone is: the repeat case.
+	if intent.Retired {
+		return nil
+	}
 	// The age is checked BEFORE the projection is read, so an in-flight open is
 	// refused without a second round trip and without this operation's answer
 	// depending on which of two racing reads landed first.
@@ -690,6 +712,17 @@ func (s *Store) RetireGateDeadlineIntent(ctx context.Context, req RetireGateDead
 	if err := s.refuseIfGateIsStillOpen(opCtx, scope, req); err != nil {
 		return err
 	}
+	// A DISPOSITION session's remnant is retired in place: see
+	// retireDispositionRemnant. Its protocol is read from the witness, never
+	// proposed, because a disposition session always has one — the catalog
+	// create pins the mode before anything can write an intent.
+	mode, bound, err := s.boundProtocolMode(opCtx, scope)
+	if err != nil {
+		return err
+	}
+	if bound && mode == ProtocolModeDisposition {
+		return s.retireDispositionRemnant(opCtx, scope, req, intent)
+	}
 	// Retirement mutates legacy gate state even when the catalog is absent.
 	// Reserve/check the legacy protocol without requiring collision witnesses
 	// or a catalog, preserving retirement of orphaned crash remnants.
@@ -697,6 +730,37 @@ func (s *Store) RetireGateDeadlineIntent(ctx context.Context, req RetireGateDead
 		return err
 	}
 	if _, err := s.backend.OrderedIndex.Delete(opCtx, gateIntentID(scope, req.GateID), req.Revision); err != nil {
+		return classifyCatalogOrderedError(err, "gate_intent")
+	}
+	return nil
+}
+
+// retireDispositionRemnant retires a disposition session's remnant intent IN
+// PLACE: the row is rewritten, under a compare-and-swap onto the revision the
+// sweep observed, as a retired version-2 intent that is not due. It keeps the
+// residency the row already carries — a sweep holds no grant and raises nothing
+// — so a successor with a strictly higher residency can still re-publish the
+// gate over it (see gateIntent.Retired), while the writer that left the
+// remnant cannot.
+//
+// A tombstone would be wrong here, not merely stricter. A Host that crashed
+// between the intent and the projection leaves its runtime's gate open in its
+// journal; the successor restoring that runtime re-publishes it, and a
+// tombstoned id could never be published again.
+func (s *Store) retireDispositionRemnant(
+	ctx context.Context,
+	scope sessionScope,
+	req RetireGateDeadlineIntentRequest,
+	intent gateIntent,
+) error {
+	intent.Version = GateIntentDispositionRecordVersion
+	intent.Retired = true
+	value, intent, err := encodeGateIntent(intent)
+	if err != nil {
+		return err
+	}
+	if _, err := s.backend.OrderedIndex.Update(
+		ctx, gateIntentID(scope, req.GateID), req.Revision, value, storage.Rank{}, gateIntentDue(intent)); err != nil {
 		return classifyCatalogOrderedError(err, "gate_intent")
 	}
 	return nil
