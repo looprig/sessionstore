@@ -19,6 +19,42 @@ block and fails on anything else, and fails as vacuous if it found no files.
 here is vendored, so `GOWORK=off go test ./...` verifies the module against the
 versions it actually pins.
 
+## Status
+
+Released and consumed in production by `harness`, `host`, `factory` and
+`controller`. Implemented: the tenant-scoped and legacy single-tenant layouts,
+immutable session bindings, residency grants, the disposition command lifecycle
+(admission, claim, attempt, evidence-based settlement, rejection), the
+per-session command stream and consumption cursor, public-create admission,
+catalog, gate and placement records, placement-termination outcomes, the Host
+registry and target directory, reconciliation claims, control shards, fenced
+pointers, and session-scoped objects with metadata lookup.
+
+Known limits, each described in its section below: gate continuation is
+deliberately not implemented; there is no caller-facing object garbage
+collector, orphan reclamation, or retention/reaping of permanent rows; the
+bare-`LeaseEpoch` Host registry path is still accepted on disposition sessions;
+there is no export/import tool or online layout migration; and `Open` requires a
+Blobs provider with Storage's `BlobReaderLifecycle` capability, so raw `fsstore`
+is refused.
+
+## Install
+
+```sh
+go get github.com/looprig/sessionstore@latest
+```
+
+The single importable package is `github.com/looprig/sessionstore`; the
+`internal/` packages hold path helpers and a module-file checker used by tests.
+
+## Where it sits
+
+Tier 1.5 in the Looprig dependency graph: direct dependencies `github.com/looprig/core`
+and `github.com/looprig/storage` only, below `harness`. `harness` names
+SessionStore types in its public API and writes its journal in SessionStore's
+envelope format, so a SessionStore major version is a breaking change for every
+harness consumer too.
+
 ## Composing a Store
 
 A composition root picks one provider, hands its complete Storage composite to
@@ -268,9 +304,10 @@ advertise a positive close bound. This lets Store shutdown stop an outstanding
 object read before an explicitly owned provider is closed. The reader close bound
 and `WithShutdownTimeout` cover separate shutdown phases and are not compared.
 
-Storage v0.6.0's memory backend and natsstore v0.5.1 satisfy the requirement.
-fsstore v0.5.1 intentionally does not claim bounded reader shutdown and is
-rejected with `*InvalidBackendError` naming `BlobReaderLifecycle`. Any other
+Storage's `memstore`, natsstore and s3store Blobs satisfy the requirement.
+fsstore intentionally does not claim bounded reader shutdown and is
+rejected with `*InvalidBackendError` naming `BlobReaderLifecycle`; pgstore's
+Blobs and rclonestore do not implement the capability either. Any other
 provider is compatible only after it implements the capability and its
 provider-specific blocked-I/O proof. Capability rejection happens before layout
 marker or other provider I/O; a provider passed to a failed `Open` remains
@@ -284,11 +321,12 @@ modules' own sources.
 
 Carbon's filesystem composition is a product-specific exception to the raw
 fsstore rejection: it replaces the composite's `Blobs` field with its
-`boundedBlobs` adapter before calling `sessionstore.Open`. That adapter gives
+`boundedBlobs` adapter before calling `sessionstore.Open` (the `client` and
+`policy53` products carry ports of the same adapter). That adapter gives
 the consumer a pipe-backed reader whose `Read` is released by `Close`; a
 blocked underlying filesystem read may leave its pump goroutine and file
-descriptor alive until the provider returns. Carbon accepts that tradeoff for
-its local directory. Passing `fsstore.Backend()` directly to `Open` still
+descriptor alive until the provider returns. Those products accept that
+tradeoff for a local directory. Passing `fsstore.Backend()` directly to `Open` still
 fails; the adapter is not a capability of fsstore itself.
 
 ## Layout compatibility
@@ -1312,7 +1350,7 @@ a released one, or one combined with a nonzero `LeaseEpoch` is refused
 `registry invalid` (`residency` / `lease_epoch`) before any write — so a Host on
 this path publishes its final `releasing` observation before it releases the
 grant. The bare
-`LeaseEpoch` path is unchanged — every released Host (≤ v0.5.0) uses it and a
+`LeaseEpoch` path is unchanged — the Hosts released so far use it and a
 legacy session has no grant — so a caller can still assert an arbitrary first
 epoch through it; refusing it on disposition sessions is a breaking change booked
 for when every Host passes a grant. `ClearHostRegistration` still takes a bare
@@ -1764,3 +1802,19 @@ These rows are permanent, one per role per session that has ever had one, and
 the registry's carry-forward contract applies here word for word: the only safe
 reaper is one that removes a session's whole scope at once, because deleting a
 pointer row alone destroys a fence while leaving the role writable at any epoch.
+
+## Development
+
+Go 1.26.8 baseline. Verify standalone, without a workspace:
+
+```sh
+GOWORK=off go test ./...
+make check   # fmt-check, vet, staticcheck, gosec, govulncheck, race tests, fuzz smoke, build
+```
+
+`make fuzz` runs every `Fuzz*` target in the root package briefly. See
+`CONTRIBUTING.md`.
+
+## License
+
+Apache License 2.0; see `LICENSE`.
