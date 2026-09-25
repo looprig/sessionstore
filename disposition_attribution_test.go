@@ -381,17 +381,28 @@ func TestDispositionAttributionIsCopiedAndNormalized(t *testing.T) {
 	createDispositionCatalog(t, s)
 	req := dispositionRequest()
 	req.Principal, req.Metadata = testPrincipal(), testMetadata()
+	direct, err := dispositionDescriptor(req)
+	if err != nil {
+		t.Fatal(err)
+	}
 	entry, _, err := s.AdmitDispositionCommand(ctx, req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	req.Principal.Subject = "user/mallory"
 	req.Metadata["space"] = "work"
+	if direct.Principal == nil || direct.Principal.Subject != "user/alex" || direct.Metadata["space"] != "family" {
+		t.Fatalf("descriptor construction aliases request: %+v", direct)
+	}
 	if entry.Record.Descriptor.Principal == nil || entry.Record.Descriptor.Principal.Subject != "user/alex" || entry.Record.Descriptor.Metadata["space"] != "family" {
 		t.Fatalf("returned descriptor aliases request: %+v", entry.Record.Descriptor)
 	}
 	empty := dispositionRequest()
 	empty.CommandID, empty.Kind, empty.Metadata = "public/command:empty", "interrupt", sessionwire.MessageMetadata{}
+	emptyDirect, err := dispositionDescriptor(empty)
+	if err != nil || emptyDirect.Metadata != nil {
+		t.Fatalf("empty metadata was not normalized at construction: %#v %v", emptyDirect.Metadata, err)
+	}
 	got, _, err := s.AdmitDispositionCommand(ctx, empty)
 	if err != nil {
 		t.Fatalf("empty bag on non-message kind should be absent: %v", err)
