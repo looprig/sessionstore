@@ -597,6 +597,59 @@ func TestASessionCommandThisReaderCannotDecodeFailsThePage(t *testing.T) {
 	}
 }
 
+func TestASessionCommandFromANewerCodecFailsThePage(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := consumptionFixture(t, memstore.New())
+	admitted := admitSessionCommands(t, store, catalogTenant, catalogSession, "mine", 3)
+	scope, err := store.deriveSessionScope(catalogTenant, catalogSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walkExactly(t, store, catalogTenant, catalogSession, 0, 100, 3)
+	id := dispositionInboxID(scope, admitted[1])
+	stored, err := store.backend.OrderedIndex.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	future := bytes.Replace(stored.Value, []byte(`"record_version":2`), []byte(`"record_version":4`), 1)
+	if bytes.Equal(future, stored.Value) {
+		t.Fatal("vacuous version mutation")
+	}
+	if _, err := store.backend.OrderedIndex.Update(ctx, id, stored.Revision, future, stored.Rank, stored.Due); err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.ListSessionDispositionCommands(ctx, ListSessionDispositionCommandsRequest{TenantID: catalogTenant, SessionID: catalogSession, Limit: 100})
+	if e := assertInboxCode(t, err, InboxErrorVersion); e.Field != "record_version" {
+		t.Fatalf("field = %q", e.Field)
+	}
+	_, err = store.GetDispositionCommand(ctx, GetDispositionCommandRequest{TenantID: catalogTenant, SessionID: catalogSession, CommandID: admitted[1]})
+	assertInboxCode(t, err, InboxErrorVersion)
+	due, err := store.ListDueDispositionCommands(ctx, ListDueDispositionCommandsRequest{Shard: int(scope.ControlShard), DueAtOrBefore: inboxDeadline.Add(time.Hour), Limit: 100})
+	if err != nil || due.Unreadable != 1 || len(due.Commands) != 2 {
+		t.Fatalf("due view: %+v %v", due, err)
+	}
+}
+
+func TestSessionCommandStreamCarriesAttribution(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store := consumptionFixture(t, memstore.New())
+	req := dispositionRequest()
+	req.Principal, req.Metadata = testPrincipal(), testMetadata()
+	if _, _, err := store.AdmitDispositionCommand(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	page, err := store.ListSessionDispositionCommands(ctx, ListSessionDispositionCommandsRequest{TenantID: catalogTenant, SessionID: catalogSession, Limit: 10})
+	if err != nil || len(page.Commands) != 1 {
+		t.Fatalf("page: %+v %v", page, err)
+	}
+	d := page.Commands[0].Record.Descriptor
+	if d.Principal == nil || *d.Principal != *req.Principal || d.Metadata["space"] != "family" {
+		t.Fatalf("stream dropped attribution: %+v", d)
+	}
+}
+
 // TestListSessionCommandsRefusesAnUnusableLimit keeps the request's one numeric
 // bound at this package's boundary rather than the provider's, and pins that a
 // zero limit means the store's page size rather than an empty page.
