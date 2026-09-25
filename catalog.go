@@ -1104,6 +1104,16 @@ func decodeVersionedRecord[T any](
 	fields versionedRecordFields,
 	fail func(failure versionedRecordFailure, field string, cause error) error,
 ) (T, error) {
+	return decodeVersionedRecordOf[T](value, maxBytes, []uint8{wantVersion}, fields, fail)
+}
+
+func decodeVersionedRecordOf[T any](
+	value []byte,
+	maxBytes int,
+	versions []uint8,
+	fields versionedRecordFields,
+	fail func(failure versionedRecordFailure, field string, cause error) error,
+) (T, error) {
 	var wire T
 	if len(value) > maxBytes {
 		return wire, fail(versionedRecordTooLarge, fields.Record, nil)
@@ -1117,7 +1127,7 @@ func decodeVersionedRecord[T any](
 	if err := json.Unmarshal(value, &probe); err != nil {
 		return wire, fail(versionedRecordMalformed, fields.Record, err)
 	}
-	if probe.RecordVersion != wantVersion {
+	if !slices.Contains(versions, probe.RecordVersion) {
 		return wire, fail(versionedRecordVersion, fields.Version, nil)
 	}
 	decoder := json.NewDecoder(bytes.NewReader(value))

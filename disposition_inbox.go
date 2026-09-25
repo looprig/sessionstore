@@ -24,6 +24,18 @@ import (
 // demands exact canonical re-encoding.
 const DispositionInboxRecordVersion uint8 = 2
 
+// DispositionInboxRecordVersionAttributed is used only when the descriptor
+// carries a principal or nonempty metadata. Older readers refuse v3 as an
+// upgrade, so readers must be upgraded before writers create attributed rows.
+const DispositionInboxRecordVersionAttributed uint8 = 3
+
+func dispositionInboxRecordVersionFor(d DispositionCommandDescriptor) uint8 {
+	if d.Principal != nil || len(d.Metadata) != 0 {
+		return DispositionInboxRecordVersionAttributed
+	}
+	return DispositionInboxRecordVersion
+}
+
 // A separate sharded namespace keeps legacy due sweepers away from disposition
 // commands. Updated legacy mutations also check the session mode witness. Old
 // binaries unaware of that witness must still be excluded operationally.
@@ -531,7 +543,7 @@ func encodeDispositionInboxRecord(r DispositionInboxRecord) ([]byte, Disposition
 	if err != nil {
 		return nil, DispositionInboxRecord{}, err
 	}
-	value, err := json.Marshal(dispositionInboxWire{RecordVersion: DispositionInboxRecordVersion, dispositionInboxRecordWire: dispositionInboxToWire(r)})
+	value, err := json.Marshal(dispositionInboxWire{RecordVersion: dispositionInboxRecordVersionFor(r.Descriptor), dispositionInboxRecordWire: dispositionInboxToWire(r)})
 	if err != nil {
 		return nil, DispositionInboxRecord{}, inboxInvalid("record", err)
 	}
@@ -542,7 +554,7 @@ func encodeDispositionInboxRecord(r DispositionInboxRecord) ([]byte, Disposition
 }
 
 func decodeDispositionInboxRecord(value []byte) (DispositionInboxRecord, error) {
-	wire, err := decodeVersionedRecord[dispositionInboxWire](value, MaxInboxRecordBytes, DispositionInboxRecordVersion, versionedRecordFields{Record: "record", Version: "record_version"}, inboxRecordFailure)
+	wire, err := decodeVersionedRecordOf[dispositionInboxWire](value, MaxInboxRecordBytes, []uint8{DispositionInboxRecordVersion, DispositionInboxRecordVersionAttributed}, versionedRecordFields{Record: "record", Version: "record_version"}, inboxRecordFailure)
 	if err != nil {
 		return DispositionInboxRecord{}, err
 	}
