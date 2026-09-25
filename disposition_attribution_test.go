@@ -86,6 +86,63 @@ func TestDispositionAdmissionSelectsRecordVersion(t *testing.T) {
 	}
 }
 
+func TestDispositionCodecVersionAgreesWithAttribution(t *testing.T) {
+	t.Parallel()
+	req := dispositionRequest()
+	descriptor, err := dispositionDescriptor(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := DispositionInboxRecord{Descriptor: descriptor, AcceptedAt: req.AcceptedAt, ApplyDeadline: req.ApplyDeadline, State: InboxStatePending}
+	plain, _, err := encodeDispositionInboxRecord(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attributedRecord := base
+	attributedRecord.Descriptor.Principal, attributedRecord.Descriptor.Metadata = testPrincipal(), testMetadata()
+	attributed, _, err := encodeDispositionInboxRecord(attributedRecord)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principalOnly := base
+	principalOnly.Descriptor.Principal = testPrincipal()
+	principalRow, _, err := encodeDispositionInboxRecord(principalOnly)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replace := func(v []byte, old, new string) []byte {
+		out := bytes.Replace(bytes.Clone(v), []byte(old), []byte(new), 1)
+		if bytes.Equal(out, v) {
+			t.Fatalf("vacuous mutation: %q not found in %s", old, v)
+		}
+		return out
+	}
+	for _, tc := range []struct {
+		name  string
+		value []byte
+		code  InboxErrorCode
+		field string
+	}{
+		{"v4 plain", replace(plain, `"record_version":2`, `"record_version":4`), InboxErrorVersion, "record_version"},
+		{"v4 attributed", replace(attributed, `"record_version":3`, `"record_version":4`), InboxErrorVersion, "record_version"},
+		{"v3 plain", replace(plain, `"record_version":2`, `"record_version":3`), InboxErrorMalformed, "record_version"},
+		{"v2 attributed", replace(attributed, `"record_version":3`, `"record_version":2`), InboxErrorMalformed, "record_version"},
+		{"v3 empty bag", replace(replace(plain, `"record_version":2`, `"record_version":3`), `,"payload":`, `,"metadata":{},"payload":`), InboxErrorMalformed, "record_version"},
+		{"unknown principal member", replace(principalRow, `"kind":"actor"}`, `"kind":"actor","name":"Alex"}`), InboxErrorMalformed, "record"},
+		{"non-string metadata", replace(attributed, `"space":"family"`, `"space":7`), InboxErrorMalformed, "record"},
+		{"invalid principal kind", replace(principalRow, `"kind":"actor"`, `"kind":"admin"`), InboxErrorMalformed, "record"},
+		{"metadata on interrupt", replace(attributed, `"kind":"input"`, `"kind":"interrupt"`), InboxErrorInvalid, "metadata"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := decodeDispositionInboxRecord(tc.value)
+			if got := assertInboxCode(t, err, tc.code); got.Field != tc.field {
+				t.Fatalf("field = %q, want %q (%v)", got.Field, tc.field, err)
+			}
+		})
+	}
+}
+
 func testPrincipal() *sessionwire.Principal {
 	return &sessionwire.Principal{Tenant: catalogTenant, Subject: "user/alex", Kind: sessionwire.PrincipalKindActor}
 }

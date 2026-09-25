@@ -30,7 +30,7 @@ func TestDispositionCodecRejectsCorruptionAndLegacy(t *testing.T) {
 	}
 	for name, mutate := range map[string]func([]byte) []byte{
 		"future version": func(v []byte) []byte {
-			return bytes.Replace(v, []byte(`"record_version":2`), []byte(`"record_version":3`), 1)
+			return bytes.Replace(v, []byte(`"record_version":2`), []byte(`"record_version":4`), 1)
 		},
 		"nonpending": func(v []byte) []byte {
 			return bytes.Replace(v, []byte(`"state":"pending"`), []byte(`"state":"applying"`), 1)

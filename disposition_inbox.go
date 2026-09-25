@@ -558,11 +558,15 @@ func decodeDispositionInboxRecord(value []byte) (DispositionInboxRecord, error) 
 	if err != nil {
 		return DispositionInboxRecord{}, err
 	}
-	canonical, record, err := encodeDispositionInboxRecord(wire.record())
+	decoded := wire.record()
+	if wire.RecordVersion != dispositionInboxRecordVersionFor(decoded.Descriptor) {
+		return DispositionInboxRecord{}, inboxErr(InboxErrorMalformed, "record_version", nil)
+	}
+	canonical, record, err := encodeDispositionInboxRecord(decoded)
 	if err != nil {
 		return DispositionInboxRecord{}, err
 	}
-	// V2 is a canonical stored codec, not a user JSON input format. Exact
+	// V2 and V3 are canonical stored codecs, not user JSON input formats. Exact
 	// re-encoding rejects duplicate members and nested unknown fields (including
 	// fields dropped by additive Core projection decoders), not just top-level
 	// unknowns. Noncanonical spellings require an explicit offline conversion.
