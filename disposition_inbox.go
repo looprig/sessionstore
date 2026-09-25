@@ -54,6 +54,12 @@ type DispositionCommandDescriptor struct {
 	PayloadSize      uint64                      `json:"payload_size"`
 	Payload          []byte                      `json:"payload,omitempty"`
 	PayloadObject    *sessionwire.ObjectMetadata `json:"payload_object,omitempty"`
+	// Principal is a caller-asserted sender, validated for shape only.
+	// It may be present on every command kind.
+	Principal *sessionwire.Principal `json:"principal,omitempty"`
+	// Metadata is client-defined and permitted only on create and input.
+	// An empty bag is normalized to nil.
+	Metadata sessionwire.MessageMetadata `json:"metadata,omitempty"`
 }
 
 // DispositionInboxRecord is one disposition command's authoritative record.
@@ -106,6 +112,8 @@ type AdmitDispositionCommandRequest struct {
 	PayloadObject            *sessionwire.ObjectMetadata
 	AcceptedAt               time.Time
 	ApplyDeadline            time.Time
+	Principal                *sessionwire.Principal
+	Metadata                 sessionwire.MessageMetadata
 }
 
 // PutCommandPayloadRequest declares exact content for an orchestration inbox
@@ -384,6 +392,8 @@ type dispositionDescriptorWire struct {
 	PayloadSize      uint64                      `json:"payload_size"`
 	Payload          []byte                      `json:"payload,omitempty"`
 	PayloadObject    *sessionwire.ObjectMetadata `json:"payload_object,omitempty"`
+	Principal        *sessionwire.Principal      `json:"principal,omitempty"`
+	Metadata         sessionwire.MessageMetadata `json:"metadata,omitempty"`
 }
 
 // staticcheck's S1016 advice — replace both composite literals with a whole
@@ -406,6 +416,7 @@ func dispositionInboxToWire(r DispositionInboxRecord) dispositionInboxRecordWire
 			PublicCreate: d.PublicCreate, TenantID: d.TenantID, SessionID: d.SessionID, CommandID: d.CommandID,
 			Binding: d.Binding, RuntimeCommandID: d.RuntimeCommandID, Kind: d.Kind,
 			PayloadDigest: d.PayloadDigest, PayloadSize: d.PayloadSize, Payload: d.Payload, PayloadObject: d.PayloadObject,
+			Principal: d.Principal, Metadata: d.Metadata,
 		},
 		AcceptedAt: r.AcceptedAt, ApplyDeadline: r.ApplyDeadline, State: r.State,
 		Claim: claimToWire(r.Claim), Attempt: attemptToWire(r.Attempt), Outcome: outcomeToWire(r.Outcome),
@@ -470,6 +481,7 @@ func (w dispositionInboxRecordWire) record() DispositionInboxRecord {
 			PublicCreate: d.PublicCreate, TenantID: d.TenantID, SessionID: d.SessionID, CommandID: d.CommandID,
 			Binding: d.Binding, RuntimeCommandID: d.RuntimeCommandID, Kind: d.Kind,
 			PayloadDigest: d.PayloadDigest, PayloadSize: d.PayloadSize, Payload: d.Payload, PayloadObject: d.PayloadObject,
+			Principal: d.Principal, Metadata: d.Metadata,
 		},
 		AcceptedAt: w.AcceptedAt, ApplyDeadline: w.ApplyDeadline, State: w.State,
 		Claim: w.Claim.claim(), Attempt: w.Attempt.attempt(), Outcome: w.Outcome.outcome(),

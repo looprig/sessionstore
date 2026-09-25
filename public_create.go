@@ -72,6 +72,8 @@ type AdmitPublicCreateRequest struct {
 	Identity      PublicCreateIdentity
 	Payload       []byte
 	PayloadObject *sessionwire.ObjectMetadata
+	Principal     *sessionwire.Principal
+	Metadata      sessionwire.MessageMetadata
 }
 
 type publicCreateWire struct {

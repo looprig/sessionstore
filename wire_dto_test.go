@@ -116,6 +116,14 @@ func fillProbeMembers(t *testing.T, value reflect.Value, path string) {
 		filled := reflect.MakeSlice(value.Type(), 1, 1)
 		fillProbeMembers(t, filled.Index(0), path+"[0]")
 		value.Set(filled)
+	case value.Kind() == reflect.Map:
+		filled := reflect.MakeMapWithSize(value.Type(), 1)
+		key := reflect.New(value.Type().Key()).Elem()
+		fillProbeMembers(t, key, path+"{key}")
+		elem := reflect.New(value.Type().Elem()).Elem()
+		fillProbeMembers(t, elem, path+"{value}")
+		filled.SetMapIndex(key, elem)
+		value.Set(filled)
 	case value.Kind() == reflect.Pointer:
 		pointer := reflect.New(value.Type().Elem())
 		fillProbeMembers(t, pointer.Elem(), path+"->")
