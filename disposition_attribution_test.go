@@ -143,6 +143,29 @@ func TestDispositionCodecVersionAgreesWithAttribution(t *testing.T) {
 	}
 }
 
+func TestDispositionTransitionsKeepAttribution(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openTestStore(t)
+	createDispositionCatalog(t, s)
+	req := dispositionRequest()
+	req.Principal, req.Metadata = testPrincipal(), testMetadata()
+	admitted, _, err := s.AdmitDispositionCommand(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejected, ok, err := s.RejectDispositionCommand(ctx, rejectRequest(admitted, 0))
+	if err != nil || !ok || rejected.Record.State != InboxStateRejected {
+		t.Fatalf("reject: %+v %v %v", rejected, ok, err)
+	}
+	if !reflect.DeepEqual(rejected.Record.Descriptor, admitted.Record.Descriptor) {
+		t.Fatalf("transition rewrote descriptor: %+v", rejected.Record.Descriptor)
+	}
+	if raw := rawDispositionRow(t, s, req.CommandID); !bytes.HasPrefix(raw, []byte(`{"record_version":3,`)) {
+		t.Fatalf("rejected row left v3: %s", raw)
+	}
+}
+
 func testPrincipal() *sessionwire.Principal {
 	return &sessionwire.Principal{Tenant: catalogTenant, Subject: "user/alex", Kind: sessionwire.PrincipalKindActor}
 }
