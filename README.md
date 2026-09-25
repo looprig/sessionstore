@@ -26,6 +26,8 @@ Released and consumed in production by `harness`, `host`, `factory` and
 immutable session bindings, residency grants, the disposition command lifecycle
 (admission, claim, attempt, evidence-based settlement, rejection), the
 per-session command stream and consumption cursor, public-create admission,
+command attribution (a recorded principal on every kind, client metadata on
+create/input),
 catalog, gate and placement records, placement-termination outcomes, the Host
 registry and target directory, reconciliation claims, control shards, fenced
 pointers, and session-scoped objects with metadata lookup.
@@ -264,6 +266,40 @@ replaying a pre-dispatch rejection gets the idempotent success rather than
 and telling a superseded caller "this was already rejected" is both true and
 final. The claim edge's replay arm sits *after* its fence because that edge can
 go on to write.
+
+### Command attribution: principal and metadata (v0.14.0)
+
+`AdmitDispositionCommandRequest` and `AdmitPublicCreateRequest` carry two optional
+members that become columns of the immutable `DispositionCommandDescriptor`:
+
+| Member | Type | Allowed on | Meaning |
+|---|---|---|---|
+| `Principal` | `*sessionwire.Principal` | every kind | the sender as the admitting caller (Factory) recorded it |
+| `Metadata` | `sessionwire.MessageMetadata` | `create`, `input` only | the client's app-defined string bag |
+
+- **Shape only.** Both are validated with Core's rules, and a failure is `InboxErrorInvalid`
+  with field `principal` or `metadata`. Metadata on any other kind (including an opaque
+  one) is refused before any I/O. **The store proves nothing about who the principal is**:
+  it is a recorded, caller-asserted value, like `PlacementTermination.Kind`, and the store
+  does not check it against the command's tenant.
+- **Record versions.** A command with neither member is stored at record version **2**
+  with bytes identical to v0.13.1's. A command with either member is stored at **3**. The
+  reader accepts {2, 3}. A 4 is `InboxErrorVersion` (upgrade), and so is a v3 row in the
+  eyes of sessionstore ≤ v0.13.1. A version that disagrees with the members (v2 carrying
+  one, v3 carrying none) is `InboxErrorMalformed`.
+- **Retries compare by value.** The same `CommandID` admitted again with a different
+  principal or metadata is `InboxErrorCommandMismatch` (field `principal` / `metadata`),
+  even when the payload is equal. A by-reference payload is identified by digest alone,
+  so without the column compare a different sender could re-attribute a command.
+- **Public create.** The members are not part of the reservation identity (its record is
+  unchanged). A caller whose payload canonically includes them binds them through
+  `PayloadDigest`, as Factory does, and the inbox compares them on retry.
+- **Consumers.** `ListSessionDispositionCommands` and `GetDispositionCommand` return both
+  members, and fail closed on a row from a newer codec. The due view steps over one and
+  counts it `Unreadable`.
+- **One-way.** Once any v3 row is stored, every Factory and Host reading that store must be
+  on sessionstore ≥ v0.14.0. An older reader refuses the row, and a rollback wedges every
+  session holding an attributed command.
 
 ## Residency-only grants
 
