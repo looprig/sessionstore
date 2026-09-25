@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"testing"
+
+	sessionwire "github.com/looprig/core/sessionwire/v1"
 )
 
 func TestDispositionCodecRejectsCorruptionAndLegacy(t *testing.T) {
@@ -116,6 +118,16 @@ func FuzzDispositionInboxCodec(f *testing.F) {
 		}
 		f.Add(v)
 	}
+	attributed := r
+	attributed.State, attributed.Claim, attributed.Attempt, attributed.Outcome = InboxStatePending, nil, nil, nil
+	attributed.Descriptor.Principal = &sessionwire.Principal{Tenant: req.TenantID, Subject: "user/A:B", Kind: sessionwire.PrincipalKindActor}
+	attributed.Descriptor.Metadata = sessionwire.MessageMetadata{"space": "family"}
+	v, _, err = encodeDispositionInboxRecord(attributed)
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(v)
+	f.Add(bytes.Replace(v, []byte(`"record_version":3`), []byte(`"record_version":4`), 1))
 	f.Fuzz(func(t *testing.T, value []byte) {
 		r, err := decodeDispositionInboxRecord(value)
 		if err != nil {
@@ -146,6 +158,13 @@ func FuzzDispositionInboxCodec(f *testing.F) {
 		}
 		if r.State == InboxStatePending && (r.Claim != nil || r.Attempt != nil || r.Outcome != nil) {
 			t.Fatal("codec grants progress")
+		}
+		wantV3 := r.Descriptor.Principal != nil || len(r.Descriptor.Metadata) != 0
+		if bytes.HasPrefix(value, []byte(`{"record_version":3,`)) != wantV3 {
+			t.Fatal("record version disagrees with attribution")
+		}
+		if len(r.Descriptor.Metadata) != 0 && !commandKindCarriesMessage(r.Descriptor.Kind) {
+			t.Fatal("metadata decoded on non-message kind")
 		}
 	})
 }
