@@ -6,8 +6,10 @@ import (
 	"maps"
 	"reflect"
 	"testing"
+	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
+	"github.com/looprig/storage/memstore"
 )
 
 func TestDispositionInboxWireGoldenAttributed(t *testing.T) {
@@ -227,6 +229,77 @@ func TestDispositionRetryComparesAttributionByValue(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestPublicCreateCarriesAttribution(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t, memstore.New())
+	prep := publicCreateRequest()
+	if _, err := s.PreparePublicCreate(ctx, prep); err != nil {
+		t.Fatal(err)
+	}
+	admit := AdmitPublicCreateRequest{Identity: prep.Identity, Payload: bytes.Clone(inboxPayload), Principal: testPrincipal(), Metadata: testMetadata()}
+	entry, created, err := s.AdmitPublicCreate(ctx, admit)
+	if err != nil || !created {
+		t.Fatalf("admit: %v %v", created, err)
+	}
+	d := entry.Record.Descriptor
+	if !d.PublicCreate || !reflect.DeepEqual(d.Principal, admit.Principal) || !maps.Equal(d.Metadata, admit.Metadata) {
+		t.Fatalf("public create dropped attribution: %+v", d)
+	}
+	if raw := rawDispositionRow(t, s, prep.Identity.CommandID); !bytes.HasPrefix(raw, []byte(`{"record_version":3,`)) {
+		t.Fatalf("public create is not v3: %s", raw)
+	}
+	again, created, err := s.AdmitPublicCreate(ctx, admit)
+	if err != nil || created || !reflect.DeepEqual(again, entry) {
+		t.Fatalf("idempotent retry: %+v %v %v", again, created, err)
+	}
+	spoof := admit
+	p := testPrincipal()
+	p.Subject = "user/sam"
+	spoof.Principal = p
+	_, _, err = s.AdmitPublicCreate(ctx, spoof)
+	if e := assertInboxCode(t, err, InboxErrorCommandMismatch); e.Field != "principal" {
+		t.Fatalf("field = %q", e.Field)
+	}
+}
+
+func TestPublicCreateAttributionIsVisibleToTheDueView(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := openStore(t, memstore.New())
+	prep := publicCreateRequest()
+	if _, err := s.PreparePublicCreate(ctx, prep); err != nil {
+		t.Fatal(err)
+	}
+	admit := AdmitPublicCreateRequest{Identity: prep.Identity, Payload: bytes.Clone(inboxPayload), Principal: testPrincipal(), Metadata: testMetadata()}
+	if _, _, err := s.AdmitPublicCreate(ctx, admit); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := s.deriveSessionScope(prep.Identity.TenantID, prep.Identity.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	due, err := s.ListDueDispositionCommands(ctx, ListDueDispositionCommandsRequest{Shard: int(scope.ControlShard), DueAtOrBefore: inboxDeadline.Add(time.Hour), Limit: 10})
+	if err != nil || due.Unreadable != 0 || len(due.Commands) != 1 {
+		t.Fatalf("due view: %+v %v", due, err)
+	}
+	d := due.Commands[0].Record.Descriptor
+	if !d.PublicCreate || d.Principal == nil || *d.Principal != *admit.Principal || !maps.Equal(d.Metadata, admit.Metadata) {
+		t.Fatalf("due view lost attribution: %+v", d)
+	}
+}
+
+func TestPublicCreateRefusesMetadataBeforeIO(t *testing.T) {
+	t.Parallel()
+	s := openStore(t, memstore.New())
+	identity := publicCreateRequest().Identity
+	identity.Kind = "interrupt"
+	_, _, err := s.AdmitPublicCreate(context.Background(), AdmitPublicCreateRequest{Identity: identity, Payload: bytes.Clone(inboxPayload), Metadata: testMetadata()})
+	if e := assertInboxCode(t, err, InboxErrorInvalid); e.Field != "metadata" {
+		t.Fatalf("field = %q", e.Field)
 	}
 }
 

@@ -333,12 +333,12 @@ func (s *Store) AdmitPublicCreate(ctx context.Context, req AdmitPublicCreateRequ
 	if err := validatePublicCreateIdentity(i); err != nil {
 		return DispositionInboxEntry{}, false, err
 	}
-	scope, err := s.deriveSessionScope(i.TenantID, i.SessionID)
+	// Validate payload shape and declared identity before provider I/O.
+	d, err := dispositionDescriptor(AdmitDispositionCommandRequest{TenantID: i.TenantID, SessionID: i.SessionID, CommandID: i.CommandID, Binding: i.Binding, Kind: i.Kind, Payload: req.Payload, PayloadObject: req.PayloadObject, Principal: req.Principal, Metadata: req.Metadata})
 	if err != nil {
 		return DispositionInboxEntry{}, false, err
 	}
-	// Validate payload shape and declared identity before provider I/O.
-	d, err := dispositionDescriptor(AdmitDispositionCommandRequest{TenantID: i.TenantID, SessionID: i.SessionID, CommandID: i.CommandID, Binding: i.Binding, Kind: i.Kind, Payload: req.Payload, PayloadObject: req.PayloadObject})
+	scope, err := s.deriveSessionScope(i.TenantID, i.SessionID)
 	if err != nil {
 		return DispositionInboxEntry{}, false, err
 	}
@@ -364,7 +364,7 @@ func (s *Store) AdmitPublicCreate(ctx context.Context, req AdmitPublicCreateRequ
 	if err != nil {
 		return DispositionInboxEntry{}, false, err
 	}
-	entry, created, err := s.admitDispositionCommand(opCtx, AdmitDispositionCommandRequest{TenantID: i.TenantID, SessionID: i.SessionID, CommandID: i.CommandID, Binding: i.Binding, ProposedRuntimeCommandID: r.RuntimeCommandID, Kind: i.Kind, Payload: req.Payload, PayloadObject: req.PayloadObject, AcceptedAt: r.AcceptedAt, ApplyDeadline: r.ApplyDeadline}, &r)
+	entry, created, err := s.admitDispositionCommand(opCtx, AdmitDispositionCommandRequest{TenantID: i.TenantID, SessionID: i.SessionID, CommandID: i.CommandID, Binding: i.Binding, ProposedRuntimeCommandID: r.RuntimeCommandID, Kind: i.Kind, Payload: req.Payload, PayloadObject: req.PayloadObject, Principal: req.Principal, Metadata: req.Metadata, AcceptedAt: r.AcceptedAt, ApplyDeadline: r.ApplyDeadline}, &r)
 	if err != nil {
 		return DispositionInboxEntry{}, false, err
 	}
