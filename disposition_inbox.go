@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"maps"
 	"time"
 
 	sessionwire "github.com/looprig/core/sessionwire/v1"
@@ -159,7 +160,10 @@ func (s *Store) AdmitDispositionCommand(ctx context.Context, req AdmitDispositio
 }
 
 func dispositionDescriptor(req AdmitDispositionCommandRequest) (DispositionCommandDescriptor, error) {
-	d := DispositionCommandDescriptor{TenantID: req.TenantID, SessionID: req.SessionID, CommandID: req.CommandID, Binding: req.Binding, RuntimeCommandID: req.ProposedRuntimeCommandID, Kind: req.Kind, Payload: req.Payload, PayloadObject: req.PayloadObject}
+	d := DispositionCommandDescriptor{TenantID: req.TenantID, SessionID: req.SessionID, CommandID: req.CommandID, Binding: req.Binding, RuntimeCommandID: req.ProposedRuntimeCommandID, Kind: req.Kind, Payload: req.Payload, PayloadObject: req.PayloadObject, Principal: req.Principal, Metadata: req.Metadata}
+	if err := validateDispositionAttribution(&d); err != nil {
+		return DispositionCommandDescriptor{}, err
+	}
 	if d.PayloadObject == nil {
 		digest := sha256.Sum256(d.Payload)
 		d.PayloadDigest, d.PayloadSize = hex.EncodeToString(digest[:]), uint64(len(d.Payload))
@@ -174,6 +178,40 @@ func dispositionDescriptor(req AdmitDispositionCommandRequest) (DispositionComma
 		d.PayloadDigest, d.PayloadSize = hex.EncodeToString(parsed.digest[:]), d.PayloadObject.SizeBytes
 	}
 	return d, nil
+}
+
+const (
+	commandKindCreate CommandKind = "create"
+	commandKindInput  CommandKind = "input"
+)
+
+func commandKindCarriesMessage(kind CommandKind) bool {
+	return kind == commandKindCreate || kind == commandKindInput
+}
+
+// Attribution is a caller assertion. The store checks shape and kind, then
+// copies both values so admission and subsequent encoding cannot observe a
+// caller mutation.
+func validateDispositionAttribution(d *DispositionCommandDescriptor) error {
+	if d.Principal != nil {
+		if err := d.Principal.Validate(); err != nil {
+			return inboxInvalid("principal", err)
+		}
+		principal := *d.Principal
+		d.Principal = &principal
+	}
+	if len(d.Metadata) == 0 {
+		d.Metadata = nil
+		return nil
+	}
+	if !commandKindCarriesMessage(d.Kind) {
+		return inboxInvalid("metadata", nil)
+	}
+	if err := d.Metadata.Validate(); err != nil {
+		return inboxInvalid("metadata", err)
+	}
+	d.Metadata = maps.Clone(d.Metadata)
+	return nil
 }
 
 func (s *Store) admitDispositionCommand(ctx context.Context, req AdmitDispositionCommandRequest, public *PublicCreateReservation) (DispositionInboxEntry, bool, error) {
@@ -561,6 +599,9 @@ func canonicalDispositionInboxRecord(r DispositionInboxRecord) (DispositionInbox
 	d.Payload = bytes.Clone(d.Payload)
 	if len(d.Payload) == 0 {
 		d.Payload = nil
+	}
+	if err := validateDispositionAttribution(d); err != nil {
+		return DispositionInboxRecord{}, err
 	}
 	r.AcceptedAt, r.ApplyDeadline = base.AcceptedAt, base.ApplyDeadline
 	return r, nil
