@@ -226,6 +226,13 @@ func validateDispositionAttribution(d *DispositionCommandDescriptor) error {
 	return nil
 }
 
+func samePrincipal(a, b *sessionwire.Principal) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return *a == *b
+}
+
 func (s *Store) admitDispositionCommand(ctx context.Context, req AdmitDispositionCommandRequest, public *PublicCreateReservation) (DispositionInboxEntry, bool, error) {
 	scope, err := s.deriveSessionScope(req.TenantID, req.SessionID)
 	if err != nil {
@@ -289,6 +296,12 @@ func (s *Store) admitDispositionCommand(ctx context.Context, req AdmitDispositio
 	winner := entry.Record.Descriptor
 	if winner.PublicCreate != d.PublicCreate || winner.Kind != d.Kind || winner.PayloadDigest != d.PayloadDigest || winner.PayloadSize != d.PayloadSize {
 		return DispositionInboxEntry{}, false, inboxErr(InboxErrorCommandMismatch, "command", nil)
+	}
+	if !samePrincipal(winner.Principal, d.Principal) {
+		return DispositionInboxEntry{}, false, inboxErr(InboxErrorCommandMismatch, "principal", nil)
+	}
+	if !maps.Equal(winner.Metadata, d.Metadata) {
+		return DispositionInboxEntry{}, false, inboxErr(InboxErrorCommandMismatch, "metadata", nil)
 	}
 	if public != nil && (winner.RuntimeCommandID != public.RuntimeCommandID || !entry.Record.AcceptedAt.Equal(public.AcceptedAt) || !entry.Record.ApplyDeadline.Equal(public.ApplyDeadline)) {
 		return DispositionInboxEntry{}, false, inboxErr(InboxErrorCommandMismatch, "public_create", nil)

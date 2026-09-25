@@ -166,6 +166,70 @@ func TestDispositionTransitionsKeepAttribution(t *testing.T) {
 	}
 }
 
+func TestDispositionRetryComparesAttributionByValue(t *testing.T) {
+	t.Parallel()
+	none := func(*AdmitDispositionCommandRequest) {}
+	principal := func(r *AdmitDispositionCommandRequest) { r.Principal = testPrincipal() }
+	metadata := func(r *AdmitDispositionCommandRequest) { r.Metadata = testMetadata() }
+	both := func(r *AdmitDispositionCommandRequest) { principal(r); metadata(r) }
+	for _, representation := range []string{"inline", "by reference"} {
+		for _, tc := range []struct {
+			name         string
+			first, retry func(*AdmitDispositionCommandRequest)
+			field        string
+		}{
+			{"same", both, both, ""},
+			{"principal added", none, principal, "principal"},
+			{"principal dropped", principal, none, "principal"},
+			{"different subject", principal, func(r *AdmitDispositionCommandRequest) { p := testPrincipal(); p.Subject = "user/sam"; r.Principal = p }, "principal"},
+			{"different kind", principal, func(r *AdmitDispositionCommandRequest) {
+				p := testPrincipal()
+				p.Kind = sessionwire.PrincipalKindService
+				r.Principal = p
+			}, "principal"},
+			{"metadata added", principal, both, "metadata"},
+			{"metadata dropped", both, principal, "metadata"},
+			{"metadata changed", metadata, func(r *AdmitDispositionCommandRequest) { m := testMetadata(); m["space"] = "work"; r.Metadata = m }, "metadata"},
+		} {
+			t.Run(representation+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				ctx := context.Background()
+				s := openTestStore(t)
+				createDispositionCatalog(t, s)
+				first, retry := dispositionRequest(), dispositionRequest()
+				if representation == "by reference" {
+					one, two := uploadCommandPayload(t, s, inboxPayload), uploadCommandPayload(t, s, inboxPayload)
+					first.Payload, first.PayloadObject = nil, &one
+					retry.Payload, retry.PayloadObject = nil, &two
+				}
+				tc.first(&first)
+				tc.retry(&retry)
+				want, created, err := s.AdmitDispositionCommand(ctx, first)
+				if err != nil || !created {
+					t.Fatalf("first: %v %v", created, err)
+				}
+				got, created, err := s.AdmitDispositionCommand(ctx, retry)
+				if tc.field == "" {
+					if err != nil || created || !reflect.DeepEqual(got, want) {
+						t.Fatalf("idempotent retry: %+v %v %v; want %+v", got, created, err, want)
+					}
+					return
+				}
+				if e := assertInboxCode(t, err, InboxErrorCommandMismatch); e.Field != tc.field {
+					t.Fatalf("field = %q, want %q", e.Field, tc.field)
+				}
+				if created {
+					t.Fatal("mismatched retry reported created")
+				}
+				stored, err := s.GetDispositionCommand(ctx, GetDispositionCommandRequest{TenantID: first.TenantID, SessionID: first.SessionID, CommandID: first.CommandID})
+				if err != nil || !reflect.DeepEqual(stored, want) {
+					t.Fatalf("winner moved: %+v %v", stored, err)
+				}
+			})
+		}
+	}
+}
+
 func testPrincipal() *sessionwire.Principal {
 	return &sessionwire.Principal{Tenant: catalogTenant, Subject: "user/alex", Kind: sessionwire.PrincipalKindActor}
 }
