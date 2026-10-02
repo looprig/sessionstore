@@ -27,6 +27,19 @@ type ReadPublicJournalRequest struct {
 	// its continuation cursor remains pinned to the same captured tip.
 	Tail bool
 
+	// TipOnly answers the journal tip and nothing else: the page carries the
+	// CapturedTip this read captured, no events, CoveredThrough zero and no
+	// cursor. No journal record is read and no body is resolved, so a record a
+	// page read would refuse -- an offloaded public body above
+	// MaxInlineBodyBytes at the tip, say -- cannot hide how far the journal has
+	// got. The session binding is verified exactly as for a page read.
+	//
+	// It is refused with a Cursor or a nonzero FromSeq. Tail, Limit and
+	// ScanLimit are validated as usual and otherwise ignored, so a caller may
+	// keep a bounded tail read beside it as the request an implementation
+	// predating TipOnly answers instead.
+	TipOnly bool
+
 	// ScanLimit bounds examined journal records, including withheld private
 	// records. Zero preserves the unbounded-by-records legacy scan; a positive
 	// value must not exceed storage.MaxOrderedPageLimit. Exhaustion may return
@@ -91,11 +104,20 @@ type RuntimePage struct {
 // it. A public body held in an object is resolved through the same verified
 // object path a caller would use; a private runtime object is never fetched.
 func (s *Store) ReadPublicJournal(ctx context.Context, req ReadPublicJournalRequest) (sessionwire.JournalPage, error) {
+	if req.TipOnly && (req.Cursor != "" || req.FromSeq != 0) {
+		return sessionwire.JournalPage{}, journalErr(JournalErrorInvalid, "tip_only", nil)
+	}
 	scan, release, err := s.planJournalRead(ctx, journalCursorPublic, req.TenantID, req.SessionID, req.FromSeq, req.Cursor, req.Limit, req.Tail, req.ScanLimit)
 	if err != nil {
 		return sessionwire.JournalPage{}, err
 	}
 	defer release()
+	if req.TipOnly {
+		// The tip planJournalRead captured, after verifying the binding, and
+		// nothing else: no record is read, so no body is resolved and nothing
+		// is covered.
+		return sessionwire.JournalPage{CapturedTip: scan.capturedTip}, nil
+	}
 
 	events, err := walkJournal(scan,
 		func(env Envelope) bool { return env.Kind == EnvelopeKindPublicEvent },

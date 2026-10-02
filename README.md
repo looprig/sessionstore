@@ -678,6 +678,19 @@ sessions, and an inflated captured tip cannot widen the snapshot a walk covers.
 `ReadRuntimeJournal` is the privileged counterpart and returns every record as
 stored, leaving object-backed bodies unresolved for the caller to fetch.
 
+`ReadPublicJournalRequest.TipOnly` answers the captured tip and nothing else:
+the binding is verified as for a page, but no record is read and no body is
+resolved, so the page has no events, `covered_through` zero and no cursor. A
+caller that wants only "how far has this journal got" must use it rather than a
+one-record `Tail` read, because the tail read resolves the tip record's body:
+an offloaded public body above `MaxInlineBodyBytes` (every public body Harness
+offloads under its default 512 KiB threshold) is refused `too_large`, and so is
+the tip. `TipOnly` is refused with a `Cursor` or nonzero `FromSeq`; `Tail`,
+`Limit` and `ScanLimit` are validated and otherwise ignored, so a caller may keep
+a bounded tail read beside it for an implementation that predates the field.
+Such a body remains unreadable through a page read; `TipOnly` only stops it
+hiding the tip.
+
 ## Catalog ownership: a Host epoch and a Factory revision
 
 The session catalog is one authoritative `OrderedIndex` record per session,
