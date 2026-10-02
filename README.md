@@ -21,6 +21,19 @@ versions it actually pins.
 
 ## Status
 
+### v0.15.0: tip-only reads and larger public object bodies
+
+This minor release adds `ReadPublicJournalRequest.TipOnly` and exports
+`MaxObjectPublicBodyBytes` (16 MiB). Public reads resolve object-backed bodies
+up to that limit; an event exceeding the page byte budget is returned alone
+with a continuation cursor. A declared-size/object mismatch returns
+`JournalErrorIntegrity` with field `public_object`.
+
+Callers that only need the journal tip should use `TipOnly`. Upgrade Factory
+readers first: readers older than v0.15.0 still fail an entire page on an
+offloaded public body above 512 KiB. There is no durable-format change or
+one-way compatibility floor.
+
 Released and consumed in production by `harness`, `host`, `factory` and
 `controller`. Implemented: the tenant-scoped and legacy single-tenant layouts,
 immutable session bindings, residency grants, the disposition command lifecycle
