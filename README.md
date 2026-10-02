@@ -678,18 +678,36 @@ sessions, and an inflated captured tip cannot widen the snapshot a walk covers.
 `ReadRuntimeJournal` is the privileged counterpart and returns every record as
 stored, leaving object-backed bodies unresolved for the caller to fetch.
 
+An object-backed public body is served up to `MaxObjectPublicBodyBytes`
+(16 MiB, Harness's event codec ceiling), so every public body Harness can commit
+— including each one it offloads above `MaxInlineBodyBytes` under its default
+512 KiB threshold — is readable byte-identically. That ceiling bounds the size a
+stored reference may DECLARE, checked before its object is opened; a reference
+declaring more is refused `too_large`. It is fixed, not a setting, and it is not
+a writer rule: `JournalWriter.Append` still caps a public body at
+`MaxInlineBodyBytes`. The object read is bounded by the declared size and
+verified against it and the digest, so a reference whose declared size
+understates or overstates its object fails the page `integrity` rather than
+returning a truncated or extended body. Readers before v0.15.0 refused every
+public reference above `MaxInlineBodyBytes` `too_large`, failing the whole page.
+
+The page byte budget (`DefaultJournalPageBytes`, 1 MiB) bounds a page's
+aggregate, not a single event. The first event of a page is always admitted, so
+an event whose body alone exceeds the budget comes back on a page of its own
+with a cursor to the next, and a later event that does not fit is deferred to
+the next page. A page can therefore exceed the budget by one event, up to the
+object ceiling; it never fails to make progress.
+
 `ReadPublicJournalRequest.TipOnly` answers the captured tip and nothing else:
 the binding is verified as for a page, but no record is read and no body is
 resolved, so the page has no events, `covered_through` zero and no cursor. A
-caller that wants only "how far has this journal got" must use it rather than a
-one-record `Tail` read, because the tail read resolves the tip record's body:
-an offloaded public body above `MaxInlineBodyBytes` (every public body Harness
-offloads under its default 512 KiB threshold) is refused `too_large`, and so is
-the tip. `TipOnly` is refused with a `Cursor` or nonzero `FromSeq`; `Tail`,
-`Limit` and `ScanLimit` are validated and otherwise ignored, so a caller may keep
-a bounded tail read beside it for an implementation that predates the field.
-Such a body remains unreadable through a page read; `TipOnly` only stops it
-hiding the tip.
+caller that wants only "how far has this journal got" should use it rather than
+a one-record `Tail` read, because the tail read resolves the tip record's body —
+up to 16 MiB of it, and before v0.15.0 an offloaded public body above
+`MaxInlineBodyBytes` there was refused `too_large`, and so was the tip.
+`TipOnly` is refused with a `Cursor` or nonzero `FromSeq`; `Tail`, `Limit` and
+`ScanLimit` are validated and otherwise ignored, so a caller may keep a bounded
+tail read beside it for an implementation that predates the field.
 
 ## Catalog ownership: a Host epoch and a Factory revision
 

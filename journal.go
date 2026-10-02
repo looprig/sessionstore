@@ -18,9 +18,12 @@ import (
 // ledger read.
 const DefaultJournalOverflowThresholdBytes = 64 << 10
 
-// DefaultJournalPageBytes bounds the resolved bytes one journal page may
-// return. It exceeds MaxInlineBodyBytes, so a page always makes progress: the
-// largest single public body a writer can commit still fits in one page.
+// DefaultJournalPageBytes bounds the aggregate resolved bytes of one journal
+// page. It is not a bound on any single event: the first event of a page is
+// always admitted, so an event whose body alone exceeds the budget -- an
+// object-backed public body, up to MaxObjectPublicBodyBytes -- is returned on
+// a page of its own with a cursor to the next, and a page always makes
+// progress.
 const DefaultJournalPageBytes = 1 << 20
 
 // OpenJournalRequest names the session whose stream a writer wants to own.

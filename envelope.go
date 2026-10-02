@@ -18,6 +18,20 @@ const (
 	MaxEnvelopeBytes = 1 << 20
 	// MaxInlineBodyBytes is the maximum size of either independent inline body.
 	MaxInlineBodyBytes = 512 << 10
+	// MaxObjectPublicBodyBytes is the largest declared size of an
+	// object-backed public body a public journal read will resolve. It matches
+	// Harness's event codec ceiling (harness pkg/event maxEventBytes, 16 MiB),
+	// which bounds every public body Harness can commit: a public body is a
+	// projection of a runtime event body no larger than it.
+	//
+	// It is a bound on forged or corrupted stored metadata -- what a reference
+	// may make a reader allocate -- not on page bytes, and not a writer's
+	// admission rule: JournalWriter.Append still caps a public body at
+	// MaxInlineBodyBytes. A reference declaring more is refused too_large
+	// before its object is opened. It is fixed, not configurable, because a
+	// reader that resolved less than a writer may commit would leave a durable
+	// record no public read can ever pass.
+	MaxObjectPublicBodyBytes = 16 << 20
 )
 
 var envelopeMagic = [4]byte{'L', 'R', 'J', 'E'}

@@ -621,8 +621,8 @@ func TestPublicPageCursorPinsTheCapturedSnapshot(t *testing.T) {
 }
 
 // TestPublicPageRejectsForgedOversizedPublicReference forges the record itself,
-// not the cursor: a reference whose declared size exceeds what a writer may
-// commit must be refused before the object stream is opened.
+// not the cursor: a reference whose declared size exceeds the object ceiling
+// must be refused before the object stream is opened.
 func TestPublicPageRejectsForgedOversizedPublicReference(t *testing.T) {
 	backend := memstore.New()
 	blobs := &countingBlobs{lifecycleBlobs: lifecycleBlobs{backend.Blobs}}
@@ -635,7 +635,7 @@ func TestPublicPageRejectsForgedOversizedPublicReference(t *testing.T) {
 	records := readLedger(t, backend, journalName(t, store))
 	forged := records[1]
 	reference := *forged.Public.Reference
-	reference.SizeBytes = MaxInlineBodyBytes + 1
+	reference.SizeBytes = MaxObjectPublicBodyBytes + 1
 	forged.Public = BodySlot{Reference: &reference}
 	frame, err := EncodeEnvelope(forged)
 	if err != nil {

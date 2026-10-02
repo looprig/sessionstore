@@ -2,10 +2,7 @@
 package sessionstore
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"strings"
 	"testing"
 
 	"github.com/looprig/storage/memstore"
@@ -14,55 +11,33 @@ import (
 // appendOffloadedPublicTip commits, at the tip, a public event whose body is
 // object-backed and LARGER than MaxInlineBodyBytes -- the record Harness's
 // journal writes for every public body over its default 512 KiB offload
-// threshold (harness pkg/sessionstore effectiveOffloadPlan/durableBodySlot):
-// PutObject the body, reference it, append the envelope. It returns the tip.
+// threshold. It returns the tip.
 func appendOffloadedPublicTip(t *testing.T, store *Store, backend interface {
 	Append(ctx context.Context, name string, expected uint64, payload []byte) error
 }) uint64 {
 	t.Helper()
-	body := []byte(`{"body":"` + strings.Repeat("x", MaxInlineBodyBytes+1024) + `"}`)
-	metadata, err := store.PutObject(context.Background(), PutObjectRequest{
-		TenantID: testTenant, SessionID: testSession, Kind: ObjectKindJournalPublic,
-		SizeBytes: uint64(len(body)), SHA256: sha256.Sum256(body), Body: bytes.NewReader(body),
-	})
-	if err != nil {
-		t.Fatalf("PutObject: %v", err)
-	}
-	reference, err := BodyReferenceFromObjectMetadata(metadata)
-	if err != nil {
-		t.Fatalf("BodyReferenceFromObjectMetadata: %v", err)
-	}
-	frame, err := EncodeEnvelope(Envelope{
-		Kind: EnvelopeKindPublicEvent, EventID: "event-large", Public: BodySlot{Reference: &reference},
-	})
-	if err != nil {
-		t.Fatalf("EncodeEnvelope: %v", err)
-	}
-	tip, err := store.backend.Ledger.Tip(context.Background(), journalName(t, store))
-	if err != nil {
-		t.Fatalf("Tip: %v", err)
-	}
-	if err := backend.Append(context.Background(), journalName(t, store), tip, frame); err != nil {
-		t.Fatalf("Append: %v", err)
-	}
-	return tip + 1
+	tip, _ := appendOffloadedPublic(t, store, backend, "event-large", offloadedPublicBody(t, MaxInlineBodyBytes+1024))
+	return tip
 }
 
-// TestTailReadFailsClosedOnAnOffloadedPublicEventAtTheTip pins the defect the
-// tip-only read exists for: a one-record tail read -- what a caller wanting
-// only the tip asked for before TipOnly -- resolves the tip record's body, and
-// an offloaded public body above MaxInlineBodyBytes is refused, so the tip
-// cannot be learned at all.
-func TestTailReadFailsClosedOnAnOffloadedPublicEventAtTheTip(t *testing.T) {
+// TestTailReadServesAnOffloadedPublicEventAtTheTip: a one-record tail read --
+// what a caller wanting only the tip asked for before TipOnly -- resolves the
+// tip record's body, and an offloaded public body above MaxInlineBodyBytes is
+// now served rather than refused, so the tail read answers the tip too.
+// TipOnly remains the read that answers the tip without resolving a body.
+func TestTailReadServesAnOffloadedPublicEventAtTheTip(t *testing.T) {
 	backend := memstore.New()
 	store := openJournalStore(t, backend)
 	mixedSession(t, store)
-	appendOffloadedPublicTip(t, store, backend.Ledger)
+	tip := appendOffloadedPublicTip(t, store, backend.Ledger)
 
-	_, err := store.ReadPublicJournal(context.Background(), ReadPublicJournalRequest{
-		TenantID: testTenant, SessionID: testSession, Tail: true, Limit: 1, ScanLimit: 1,
-	})
-	requireJournalCode(t, err, JournalErrorTooLarge)
+	page := readPublic(t, store, ReadPublicJournalRequest{Tail: true, Limit: 1, ScanLimit: 1})
+	if page.CapturedTip != tip || len(page.Events) != 1 || page.Events[0].EventID != "event-large" {
+		t.Fatalf("tail page = tip %d events %v, want event-large at %d", page.CapturedTip, eventIDs(page), tip)
+	}
+	if got, want := len(page.Events[0].Body), MaxInlineBodyBytes+1024; got != want {
+		t.Fatalf("body = %d bytes, want %d", got, want)
+	}
 }
 
 // TestTipOnlyReadAnswersTheTipWithoutResolvingABody is the fix: TipOnly

@@ -29,10 +29,12 @@ type ReadPublicJournalRequest struct {
 
 	// TipOnly answers the journal tip and nothing else: the page carries the
 	// CapturedTip this read captured, no events, CoveredThrough zero and no
-	// cursor. No journal record is read and no body is resolved, so a record a
-	// page read would refuse -- an offloaded public body above
-	// MaxInlineBodyBytes at the tip, say -- cannot hide how far the journal has
-	// got. The session binding is verified exactly as for a page read.
+	// cursor. No journal record is read and no body is resolved, so learning
+	// how far the journal has got never costs resolving the tip record's body
+	// (up to MaxObjectPublicBodyBytes), and a record a page read would refuse
+	// -- a corrupt one, or before v0.15.0 an offloaded public body above
+	// MaxInlineBodyBytes -- cannot hide the tip. The session binding is
+	// verified exactly as for a page read.
 	//
 	// It is refused with a Cursor or a nonzero FromSeq. Tail, Limit and
 	// ScanLimit are validated as usual and otherwise ignored, so a caller may
@@ -171,11 +173,19 @@ func (s *Store) ReadRuntimeJournal(ctx context.Context, req ReadRuntimeJournalRe
 
 // resolvePublicBody returns the canonical public body of one public event.
 //
-// The declared size of an object-backed body is checked against the same
-// ceiling the writer enforces before the object is opened. That is a bound on
-// untrusted stored metadata, not a restatement of the writer's admission rule:
-// the writer's ceiling governs what may be created, this one governs what a
+// The declared size of an object-backed body is checked against
+// MaxObjectPublicBodyBytes before the object is opened. That is a bound on
+// untrusted stored metadata, not a restatement of any writer's admission rule:
+// a writer's ceiling governs what may be created, this one governs what a
 // forged or corrupted reference may make this reader allocate.
+//
+// The read itself is bounded by GetObject's exact verifier, which hands back
+// at most the declared size, probes one byte past it, and accepts terminal EOF
+// only when both the length and the digest match. So the declared size bounds
+// what is read, and a reference whose declared size understates or overstates
+// its object -- or an object whose bytes no longer hash to its identity -- is
+// reported here as an integrity fault on the journal record, not as a
+// truncated or extended body.
 func (s *Store) resolvePublicBody(
 	ctx context.Context,
 	tenant sessionwire.TenantID,
@@ -196,7 +206,7 @@ func (s *Store) resolvePublicBody(
 	if slot.Reference == nil {
 		return nil, journalErr(JournalErrorIntegrity, "public_body", nil)
 	}
-	if slot.Reference.SizeBytes > MaxInlineBodyBytes {
+	if slot.Reference.SizeBytes > MaxObjectPublicBodyBytes {
 		return nil, journalErr(JournalErrorTooLarge, "public_reference", nil)
 	}
 	metadata, err := slot.Reference.ObjectMetadata()
@@ -215,12 +225,24 @@ func (s *Store) resolvePublicBody(
 	body, readErr := io.ReadAll(reader)
 	closeErr := reader.Close()
 	if readErr != nil {
-		return nil, readErr
+		return nil, publicObjectReadErr(readErr)
 	}
 	if closeErr != nil {
-		return nil, closeErr
+		return nil, publicObjectReadErr(closeErr)
 	}
 	return body, nil
+}
+
+// publicObjectReadErr classifies a failed public object stream. A length or
+// content mismatch against the reference the journal record carries is an
+// integrity fault on that record; every other failure (backend, cancellation)
+// keeps its own classification.
+func publicObjectReadErr(err error) error {
+	var objectErr *ObjectError
+	if errors.As(err, &objectErr) && (objectErr.Code == ObjectErrorSize || objectErr.Code == ObjectErrorIntegrity) {
+		return journalErr(JournalErrorIntegrity, "public_object", err)
+	}
+	return err
 }
 
 // journalScan is one bounded walk over a session's journal.
@@ -337,10 +359,13 @@ func (s *Store) planJournalRead(
 // The walk stops at the event limit, byte budget, scan limit, or captured
 // tip — and at nothing else: a walk that ends anywhere else has not observed
 // every sequence through the tip it captured, and is refused rather than
-// returned. The first selected record of a page is always admitted, so a page
-// can never fail to make progress; a record that does not fit the remaining
-// budget is deferred to the next page, which means its body may be resolved
-// twice.
+// returned. The byte budget bounds the page's AGGREGATE, not any one item: the
+// first selected record of a page is always admitted, whatever its cost, so a
+// page can never fail to make progress, and a public event whose body alone
+// exceeds the budget (an object-backed body, up to MaxObjectPublicBodyBytes)
+// comes back alone on its page with a cursor to the next. A later record that
+// does not fit the remaining budget is deferred to the next page, which means
+// its body may be resolved twice.
 func walkJournal[T any](
 	scan *journalScan,
 	selects func(Envelope) bool,
