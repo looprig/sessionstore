@@ -1885,7 +1885,7 @@ pointer row alone destroys a fence while leaving the role writable at any epoch.
 
 ## Development
 
-Go 1.26.8 baseline. Verify standalone, without a workspace:
+Go 1.26.9 baseline. Verify standalone, without a workspace:
 
 ```sh
 GOWORK=off go test ./...

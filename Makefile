@@ -42,7 +42,7 @@ gosec:
 
 vuln:
 	GOWORK=off go mod verify
-	GOWORK=off go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...
+	GOWORK=off go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
 # Fuzz targets are shaped correctly but only ever executed their seed corpus
 # under `go test`, so a reachable panic could sit behind a green check. Run each
