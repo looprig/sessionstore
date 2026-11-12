@@ -1,4 +1,4 @@
-github.com/looprig/core v0.13.2 h1:ecxrhXSd9FL7lja5CtUF0elRdoKpiWufjsqZKRo7x08=
-github.com/looprig/core v0.13.2/go.mod h1:QOmKNPPzrjMyt8kWMVH5j6nTrQ3FPsfjKP3xKRCkQxM=
-github.com/looprig/storage v0.9.1 h1:oQThNB51xNgqhqZCeqzlJqLctfzDWcd/LvOoCJTz9CM=
-github.com/looprig/storage v0.9.1/go.mod h1:N2507XgVrYt2MeLGZrWEpUcXHnYg4w7rVPnaVb0ABcc=
+github.com/looprig/core v0.13.3 h1:U61IIO0ohGBYcU99L9vO+lrwisakw0VNKB8l8nEPe1w=
+github.com/looprig/core v0.13.3/go.mod h1:HuOG5Y6c4wn4CLjcbLzLohBH/g5vpxYO32ZimsFqeqM=
+github.com/looprig/storage v0.9.2 h1:7CUajtz42tKQA4K/LeKSldO9DdQtxe8d+tJYzk5RJCg=
+github.com/looprig/storage v0.9.2/go.mod h1:N77f9MXGC+xxB73uIBKS0OdZAxBgOnnJYV8FKNvBrXk=
